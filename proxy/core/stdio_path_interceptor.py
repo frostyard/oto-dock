@@ -231,15 +231,19 @@ def _hook_post(endpoint: str, body: dict, timeout: float = 10.0) -> dict:
 
 
 def _pop_ci(env: dict, name: str) -> str | None:
-    """Case-insensitive pop (Windows env var names are case-insensitive, but a
-    plain ``dict(os.environ)`` copy compares case-sensitively)."""
-    if name in env:
-        return env.pop(name)
+    """Remove every case variant, returning the exact-name value if present.
+
+    Windows names are case-insensitive; POSIX can contain multiple variants.
+    Removing just one would leave a credential in the child environment.
+    """
+    value = env.get(name)
     lower = name.lower()
     for key in list(env):
         if key.lower() == lower:
-            return env.pop(key)
-    return None
+            removed = env.pop(key)
+            if value is None:
+                value = removed
+    return value
 
 
 def _fetch_mcp_credentials(
@@ -299,12 +303,16 @@ def _apply_broker_credentials(child_env: dict) -> None:
     we couldn't fetch is never injected. ``OTO_STRIP_KEYS`` (env_injection creds
     now broker-sourced) + ``OTO_BEARER_*`` are stripped case-insensitively; both
     are dormant until later phases inject them."""
+    # Capture the launcher's policy before merging tool credentials. Broker
+    # bundles may supply arbitrary env names, but cannot replace the strip list
+    # or reintroduce a capability token into the eventual child.
+    strip_csv = _pop_ci(child_env, "OTO_STRIP_KEYS") or ""
     token = _pop_ci(child_env, "OTO_MCP_FETCH_TOKEN")
     if token:
         creds = _fetch_mcp_credentials(token)
         if creds and isinstance(creds.get("env"), dict):
-            child_env.update({str(k): str(v) for k, v in creds["env"].items()})
-    strip_csv = _pop_ci(child_env, "OTO_STRIP_KEYS") or ""
+            child_env.update({str(k): str(v) for k, v in creds["env"].items()
+                              if str(k).upper() not in {"OTO_STRIP_KEYS", "OTO_MCP_FETCH_TOKEN"}})
     for name in (s.strip() for s in strip_csv.split(",") if s.strip()):
         _pop_ci(child_env, name)
     for key in [k for k in child_env if k.upper().startswith("OTO_BEARER_")]:

@@ -1,0 +1,22 @@
+{
+  "result": "passed",
+  "sdk_version": "1.0.13",
+  "cli_version": "1.0.83",
+  "live": true,
+  "sandboxed": false,
+  "sequential_writer_ownership": true,
+  "sdk_initial_turn": true,
+  "initial_sdk_cleanup": "passed",
+  "native_history_recalled_sdk_marker": true,
+  "native_pty_output_bytes": 5527,
+  "native_ansi_observed": true,
+  "native_resize_sent": true,
+  "native_exit_code": 0,
+  "native_tool_executions": 0,
+  "native_cleanup": "passed",
+  "native_live_descendants_after_cleanup": [],
+  "sdk_resumed_native_history": true,
+  "resumed_sdk_cleanup": "passed",
+  "total_tool_executions": 0,
+  "elapsed_seconds": 20.152
+}

@@ -1,0 +1,103 @@
+{
+  "result": "passed",
+  "scenario": "interrupt",
+  "sandboxed": false,
+  "sdk_version": "1.0.13",
+  "runtime_version": "1.0.83",
+  "tasks_while_callback_held": [
+    {
+      "type": "client",
+      "status": "running",
+      "sequence": 0
+    }
+  ],
+  "interrupted": true,
+  "idle_before_release": false,
+  "callback_finished_before_release": false,
+  "callback_cancelled_before_release": false,
+  "tasks_after_control_ack": [
+    {
+      "type": "client",
+      "status": "running",
+      "sequence": 0
+    }
+  ],
+  "background_survived_interrupt": true,
+  "session_idle_after_release": false,
+  "processing_after_background_retired": false,
+  "tasks_after_background_retired": [],
+  "followup_delivered": true,
+  "followup_marker_received": true,
+  "tasks_after_idle": [],
+  "callback_calls": 1,
+  "callback_cancelled": false,
+  "permissions": {
+    "approved": 1
+  },
+  "timeline": [
+    "initial.accepted",
+    "user.delivered",
+    "assistant.turn_start",
+    "tool.execution_start",
+    "permission.requested",
+    "permission.completed",
+    "callback.started",
+    "control.acknowledged",
+    "agent.interrupted",
+    "assistant.turn_end",
+    "abort",
+    "controller.released",
+    "callback.returned",
+    "background.retired",
+    "followup.accepted",
+    "followup.delivered",
+    "assistant.turn_start",
+    "marker.received",
+    "assistant.turn_end",
+    "session.idle"
+  ],
+  "event_counts": {
+    "session.start": 1,
+    "session.skills_loaded": 1,
+    "session.info": 2,
+    "session.tools_updated": 3,
+    "pending_messages.modified": 5,
+    "session.title_changed": 1,
+    "session.mcp_server_status_changed": 2,
+    "session.mcp_servers_loaded": 2,
+    "user.message": 2,
+    "system.message": 2,
+    "model.turn_started": 2,
+    "assistant.turn_start": 2,
+    "session.usage_info": 2,
+    "model.call_start": 2,
+    "model.model_call_started": 2,
+    "model.captured_assignment_context": 2,
+    "assistant.usage": 2,
+    "model.model_call_success": 2,
+    "model.call_finished": 2,
+    "model.message": 2,
+    "assistant.message": 2,
+    "tool.execution_start": 1,
+    "permission.requested": 1,
+    "permission.completed": 1,
+    "external_tool.requested": 1,
+    "session.background_tasks_changed": 1,
+    "agent.interrupted": 1,
+    "model.turn_failed": 1,
+    "model.turn_ended": 2,
+    "assistant.turn_end": 2,
+    "abort": 1,
+    "session.usage_checkpoint": 2,
+    "assistant.idle": 2,
+    "assistant.reasoning": 1,
+    "model.response": 1,
+    "model.messages_snapshot": 1,
+    "session.idle": 1
+  },
+  "idle_aborted_flags": [
+    null
+  ],
+  "sdk_cleanup": "passed",
+  "tracked_descendants_reaped": true
+}
