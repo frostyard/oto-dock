@@ -32,6 +32,12 @@
 # step 5, each documented in its own short script).
 set -euo pipefail
 
+# This inherited installer fetches upstream manifests and images. Until the
+# Frostyard release channel is qualified, fail before downloads or host changes.
+echo "install.sh: Frostyard binary installation is not available yet." >&2
+echo "Build this fork from source with scripts/compose.sh; see docs/development/frostyard-releases.md." >&2
+exit 1
+
 # Where files are fetched from. OTODOCK_REF selects a branch or tag — the
 # default `main` pins the release current at the time you run this, exactly
 # like downloading docker-compose.yml by hand.

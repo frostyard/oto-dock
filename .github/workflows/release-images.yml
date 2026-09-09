@@ -1,12 +1,12 @@
 name: release-images
 
-# Build the platform images and push them to GHCR. Self-hosted installs on the
-# Docker-Compose topology PULL these tags (docker-compose.yml pins
-# ghcr.io/otodock/otodock-proxy + otodock-file-tools at OTODOCK_VERSION);
-# contributors build from source via docker-compose.build.yml instead.
+# Build experimental Frostyard platform images. Publishing stays disabled until
+# a maintainer sets the repository variable FROSTYARD_PUBLISH_IMAGES=true.
+# These are not the upstream images used by the base pull-only Compose files.
+# See docs/development/frostyard-releases.md before enabling distribution.
 #
 # The version tag is read from VERSIONS.md (OTODOCK_VERSION) — the single
-# source of truth — so bumping it there is what drives a new release tag.
+# source of truth — a Frostyard suffix and commit SHA distinguish fork artifacts.
 # Triggers: manual dispatch, or pushing a release tag (v*).
 #
 # FIRST-RUN, ONE-TIME (per package): after the first successful push, open
@@ -25,8 +25,8 @@ permissions:
 
 jobs:
   build:
-    # Images publish only from the official repo (never mirrors or forks).
-    if: github.repository == 'OtoDock/oto-dock'
+    # Explicit opt-in in this fork; other forks and upstream cannot publish here.
+    if: github.repository == 'frostyard/oto-dock' && vars.FROSTYARD_PUBLISH_IMAGES == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -47,10 +47,11 @@ jobs:
       - name: Resolve pinned versions from VERSIONS.md
         id: meta
         run: |
-          version=$(bash scripts/versions.sh OTODOCK_VERSION)
+          platform_version=$(bash scripts/versions.sh OTODOCK_VERSION)
+          version="${platform_version}-frostyard.${GITHUB_SHA:0:12}"
           python_image=$(bash scripts/versions.sh PYTHON_IMAGE)
           node_image=$(bash scripts/versions.sh NODE_IMAGE)
-          for v in version python_image node_image; do
+          for v in platform_version python_image node_image; do
             if [ -z "${!v}" ]; then
               echo "::error::${v} missing from VERSIONS.md"; exit 1
             fi
@@ -60,7 +61,7 @@ jobs:
             echo "python_image=$python_image"
             echo "node_image=$node_image"
           } >> "$GITHUB_OUTPUT"
-          echo "::notice::building ${{ matrix.image }} -> ghcr.io/otodock/${{ matrix.image }}:$version"
+          echo "::notice::building ${{ matrix.image }} -> ghcr.io/frostyard/${{ matrix.image }}:$version"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -85,7 +86,6 @@ jobs:
             PYTHON_IMAGE=${{ steps.meta.outputs.python_image }}
             NODE_IMAGE=${{ steps.meta.outputs.node_image }}
           tags: |
-            ghcr.io/otodock/${{ matrix.image }}:${{ steps.meta.outputs.version }}
-            ghcr.io/otodock/${{ matrix.image }}:latest
+            ghcr.io/frostyard/${{ matrix.image }}:${{ steps.meta.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
