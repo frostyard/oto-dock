@@ -15,6 +15,7 @@
 
 services:
   otodock-proxy:
+    image: ghcr.io/frostyard/otodock-proxy:source
     # Never pull the GHCR tag in the source flow — always build (a fresh
     # machine has no local image and the GHCR release may not exist or may
     # not match this tree).
@@ -32,6 +33,7 @@ services:
   # source install). Declaring the same build resolves it to the image the
   # proxy service just built (pure cache hit, built once).
   otodock-agents-init:
+    image: ghcr.io/frostyard/otodock-proxy:source
     pull_policy: build
     build:
       context: .
@@ -41,6 +43,7 @@ services:
         - NODE_IMAGE
 
   file-tools:
+    image: ghcr.io/frostyard/otodock-file-tools:source
     pull_policy: build
     build:
       context: ./mcps/custom/file-tools-mcp

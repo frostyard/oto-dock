@@ -61,6 +61,7 @@ fi
 _files=(-f "$_root/docker-compose.yml" -f "$_root/docker-compose.build.yml")
 if [ -f "$_root/docker-compose.phone.yml" ] && [ "${OTODOCK_PHONE:-1}" != "0" ]; then
     _files+=(-f "$_root/docker-compose.phone.yml")
+    _files+=(-f "$_root/docker-compose.phone.build.yml")
 fi
 
 # --- Ubuntu 24.04+ unprivileged-userns restriction --------------------------

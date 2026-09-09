@@ -97,7 +97,13 @@ class TestCodexSessionStart:
     @pytest.mark.asyncio
     async def test_creates_config_files(self, tmp_agent_dir, codex_config, sat_config):
         session = CodexSession("sess-1", tmp_agent_dir, codex_config, sat_config)
-        await session.start()
+        mock_client = AsyncMock()
+        mock_client.proc = None
+        mock_client.request.return_value = {"thread": {"id": "config-test"}}
+        c1, c2, c3 = _patch_daemon(session, mock_client)
+        with c1, c2, c3:
+            await session.start()
+            await session.close()
 
         codex_dir = tmp_agent_dir / "users" / "alice" / ".codex"
         assert codex_dir.is_dir()
@@ -120,7 +126,13 @@ class TestCodexSessionStart:
             "auth_json": {"auth_mode": "chatgpt", "tokens": {"id_token": "tok-123"}},
         }
         session = CodexSession("sess-1", tmp_agent_dir, config, sat_config)
-        await session.start()
+        mock_client = AsyncMock()
+        mock_client.proc = None
+        mock_client.request.return_value = {"thread": {"id": "auth-test"}}
+        c1, c2, c3 = _patch_daemon(session, mock_client)
+        with c1, c2, c3:
+            await session.start()
+            await session.close()
 
         codex_dir = tmp_agent_dir / "users" / "alice" / ".codex"
         auth = json.loads((codex_dir / "auth.json").read_text())

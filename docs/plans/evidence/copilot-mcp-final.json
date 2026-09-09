@@ -1,0 +1,69 @@
+{
+  "result": "passed",
+  "sandboxed": false,
+  "live_turn_limit": 1,
+  "runtime_version": "1.0.83",
+  "sdk_version": "1.0.13",
+  "permission_shapes": [
+    {
+      "kind_is_mcp": true,
+      "server_matches": true,
+      "tool_is_bare_marker": false,
+      "tool_is_namespaced_marker": true,
+      "args_empty_object": true,
+      "args_missing": false,
+      "args_empty_json": false
+    }
+  ],
+  "fixture_call_count": 1,
+  "inference_token_present_in_mcp_env": {
+    "COPILOT_SDK_AUTH_TOKEN": true,
+    "COPILOT_CONNECTION_TOKEN": false,
+    "COPILOT_GITHUB_TOKEN": false,
+    "GH_TOKEN": false,
+    "GITHUB_TOKEN": false
+  },
+  "returned_marker": "OTO_MCP_FIXTURE_OK",
+  "sdk_cleanup": "passed",
+  "tracked_descendants_reaped": true,
+  "permission_counts": {
+    "fixture_approved": 1
+  },
+  "event_counts": {
+    "assistant.idle": 1,
+    "assistant.message": 2,
+    "assistant.reasoning": 1,
+    "assistant.turn_end": 2,
+    "assistant.turn_start": 2,
+    "assistant.usage": 2,
+    "model.call_finished": 2,
+    "model.call_start": 2,
+    "model.captured_assignment_context": 2,
+    "model.message": 3,
+    "model.messages_snapshot": 1,
+    "model.model_call_started": 2,
+    "model.model_call_success": 2,
+    "model.response": 1,
+    "model.tool_execution": 1,
+    "model.turn_ended": 2,
+    "model.turn_started": 2,
+    "pending_messages.modified": 2,
+    "permission.completed": 1,
+    "permission.requested": 1,
+    "session.idle": 1,
+    "session.info": 1,
+    "session.mcp_server_status_changed": 4,
+    "session.mcp_servers_loaded": 1,
+    "session.shutdown": 1,
+    "session.skills_loaded": 1,
+    "session.start": 1,
+    "session.title_changed": 1,
+    "session.tools_updated": 2,
+    "session.usage_checkpoint": 1,
+    "session.usage_info": 2,
+    "system.message": 1,
+    "tool.execution_complete": 1,
+    "tool.execution_start": 1,
+    "user.message": 1
+  }
+}

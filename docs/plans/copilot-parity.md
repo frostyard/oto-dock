@@ -1,6 +1,12 @@
 # GitHub Copilot execution engine: full parity plan
 
-Status: proposed; implementation and live Copilot verification have not started.
+Status: implementation started. C0 is complete; C1 is in progress. The engine is
+not registered or available to users yet.
+
+Progress: [C0 baseline](copilot-ci-baseline.md),
+[C1 compatibility inventory](copilot-compatibility.md),
+[C1 SDK results](copilot-spike-results.md), and
+[C1 sandbox results](copilot-sandbox-results.md).
 
 Tracking issue: [Copilot: full Claude Code and Codex parity](https://github.com/frostyard/oto-dock/issues/1).
 

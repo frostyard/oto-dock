@@ -1,0 +1,6 @@
+# Source-only override, applied after docker-compose.phone.yml by compose.sh.
+# Keep local Frostyard builds distinct from upstream's published phone image.
+services:
+  otodock-phone:
+    image: ghcr.io/frostyard/otodock-phone:source
+    pull_policy: build

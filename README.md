@@ -241,6 +241,11 @@ See all features at [otodock.io/features](https://otodock.io/features).
 
 ## Quick start
 
+**Frostyard fork:** Copilot support is under development. Use the
+[Frostyard source-build instructions](docs/development/frostyard-releases.md).
+The installer in this fork is disabled pending release qualification. The quick
+start below installs **upstream OtoDock**, without Frostyard changes.
+
 A Linux server with Docker is all you need (4 GB RAM minimum, see the
 [sizing guide](https://docs.otodock.io/getting-started/installation#how-much-ram)).
 Create a folder for the install, then run the script in it:

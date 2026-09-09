@@ -1,0 +1,27 @@
+{
+  "live": false,
+  "sandboxed": false,
+  "result": "passed",
+  "sdk_version": "1.0.13",
+  "runtime_version": "1.0.83",
+  "protocol_version": 3,
+  "ping": "passed",
+  "authenticated": false,
+  "session_create": "passed",
+  "cold_resume": "not_tested_without_inference",
+  "sampled_idle_cpu_cores": 0.0,
+  "sdk_cleanup": "passed",
+  "tracked_descendants_reaped": true,
+  "event_counts": {
+    "session.info": 1,
+    "session.shutdown": 1,
+    "session.skills_loaded": 1,
+    "session.start": 1,
+    "session.tools_updated": 1
+  },
+  "common_event_counts": {
+    "system": 5
+  },
+  "translation_errors": [],
+  "denied_permission_kinds": {}
+}

@@ -77,6 +77,17 @@ npx tsc --noEmit && npm run build   # type-check + production build
 npx vitest run                      # unit tests
 ```
 
+**Satellite** (from the repository root; no PostgreSQL required):
+
+```bash
+python -m pip install -r satellite/requirements.txt -r proxy/requirements-test.txt
+python -m pytest satellite/tests -q --timeout=120
+```
+
+CI currently exercises the satellite suite on Linux with Python 3.13. This
+does not establish macOS or Windows runtime compatibility; those platforms
+also need their own integration checks before a new engine is released.
+
 ## Code style
 
 - Match the code around you — naming, comment density, idiom. Both codebases
@@ -91,9 +102,10 @@ npx vitest run                      # unit tests
 ## Pull requests
 
 - Keep PRs focused — one concern per PR reviews quickly.
-- CI runs automatically on every PR (proxy + audio suites against a
-  disposable Postgres, dashboard type-check/build/tests) and must be green —
-  merging is blocked until it is.
+- CI runs automatically on every PR in `OtoDock/oto-dock` and
+  `frostyard/oto-dock` (proxy + audio suites against a disposable Postgres,
+  dashboard type-check/build/tests, and the standalone satellite suite) and
+  must be green — merging is blocked until it is.
 - If you're planning something large, open an issue first so we can agree on
   the shape before you invest the time.
 - **AI-assisted contributions** are welcome — much of OtoDock is built that
