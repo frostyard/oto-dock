@@ -317,9 +317,13 @@ class MicrosoftOAuthProvider(OAuthProvider):
         """Decode the response's id_token and inject identity claims into raw.
 
         Signature verification is disabled (decision 21): the token comes
-        from a TLS-verified endpoint (``login.microsoftonline.com``), so
-        a JWKS round-trip is redundant defense-in-depth. We only read the
-        identity claims; trust is anchored at the TLS layer.
+        straight from the TLS-verified token endpoint
+        (``login.microsoftonline.com``) in the authorization-code exchange,
+        the case where OpenID Connect Core 3.1.3.7 step 6 allows TLS server
+        validation in place of the signature check. We only read identity
+        claims that are stored as template variables; nothing authorizes on
+        them. Reviewed 2026-09-08 for the release gate (semgrep
+        unverified-jwt-decode): accepted, not a defect.
 
         The injected keys (``tenant_id``, ``object_id``, ``preferred_username``)
         flow into the persisted token file's ``extra`` block via
@@ -333,7 +337,7 @@ class MicrosoftOAuthProvider(OAuthProvider):
         try:
             claims = jwt.decode(
                 id_token,
-                options={"verify_signature": False, "verify_aud": False},
+                options={"verify_signature": False, "verify_aud": False},  # nosemgrep: python.jwt.security.unverified-jwt-decode.unverified-jwt-decode
             )
         except jwt.PyJWTError as e:
             logger.warning(

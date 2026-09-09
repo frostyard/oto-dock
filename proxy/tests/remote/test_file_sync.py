@@ -904,3 +904,27 @@ class TestManifestCapAndHashCache:
         entries = compute_manifest(d)
         assert [e.hash for e in entries] == [expected]
         assert calls["n"] == 0  # primed — never re-hashed
+
+
+def test_real_venv_and_dependency_dirs_never_enter_the_manifest(tmp_path):
+    """The in-workspace virtualenv is the sanctioned persistent package home
+    (SANDBOX.md "Persistent packages — the workspace venv"): a real venv
+    (pyvenv.cfg) under ANY name, plus ``.venv`` / ``node_modules`` by name,
+    stay platform-local — the satellite skips the same set — while a dir
+    merely NAMED ``venv`` still syncs."""
+    agent_dir = tmp_path / "agent"
+    ws = agent_dir / "workspace"
+    real = ws / "tools" / "pylibs"
+    (real / "lib").mkdir(parents=True)
+    (real / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    (real / "lib" / "six.py").write_text("x")
+    (ws / ".venv" / "bin").mkdir(parents=True)
+    (ws / ".venv" / "bin" / "python").write_text("x")
+    (ws / "app" / "node_modules" / "left-pad").mkdir(parents=True)
+    (ws / "app" / "node_modules" / "left-pad" / "index.js").write_text("x")
+    (ws / "app" / "index.js").write_text("x")
+    (ws / "venv").mkdir()
+    (ws / "venv" / "notes.md").write_text("just a folder")
+
+    paths = {e.path for e in compute_manifest(agent_dir, target_role="manager")}
+    assert paths == {"workspace/app/index.js", "workspace/venv/notes.md"}

@@ -648,7 +648,7 @@ async def test_pump_persists_ui_block_and_roundtrips_fields(temp_db):
         blk = pump._turn_blocks[-1]
         assert blk["type"] == "ui" and blk["ui_url"] == "/v1/ui/tok-1"
 
-        pump._save_turn_blocks()
+        await pump._save_turn_blocks()  # an off-loop writer job
         rows = [m for m in task_store.get_chat_messages("ui-chat-1")
                 if m.get("event_type") == "ui"]
         assert len(rows) == 1

@@ -79,6 +79,42 @@ boundary may return one "browser was closed — retry" error; just retry it.
 On Firefox/WebKit (no shared attach) the profile is exclusive to one session
 at a time — if it reports busy, finish or close the other session and retry.
 
+## Own-browser mode (when the machine opted in)
+
+A machine owner can switch this MCP from the dedicated profile to **their own
+browser**: your tabs then live inside the Chrome/Edge/Brave they are signed
+into, in a tab group named after you ("Playwright · <your name> (OtoDock)"),
+through the Playwright Extension. You will not be told which mode is active —
+the tell is that the first snapshot shows the extension's connect page, or a
+page the user was already on. What changes:
+
+- **You are working in the user's window.** Connecting brings your tab to the
+  front, and every tab you open appears in front of them. Reuse ONE tab for a
+  task, keep tabs few, and never close a tab you did not open. The user may
+  drag your group into its own window to keep working; that is fine.
+- **You see only your group.** Tabs the user has open are invisible to you.
+  When the user wants you to work on a page they already have open, ask them
+  to drag that tab into your tab group (or pick it on the connect page); do
+  not go looking for it.
+- **If the first snapshot shows a page the user was already on** (not the
+  extension's connect page), the user handed you that tab on purpose: work on
+  it if the task is about that page, otherwise open your own tab first —
+  navigating away destroys what they had there.
+- **The user is already signed in everywhere.** Never ask them to log in "in
+  the agent window" — there is none; a login wall means they are not signed
+  in to that site in their own browser either.
+- **Connection errors are actionable.** "did not connect" / "nobody approved"
+  means the extension is missing, its token is stale, or the user must click
+  Allow in their browser — tell them exactly that (install from the Chrome
+  Web Store; regenerate the token on the extension's page and save it in the
+  machine settings; click Allow). Unattended sessions (scheduled tasks, calls,
+  meetings) need the saved token; without it they cannot use the browser.
+- **A "Welcome" tab in your group is the extension's own connect page** —
+  you cannot see or drive it; ignore it and never try to close it.
+- `browser_close` disconnects your group; your tabs stay open in the user's
+  browser (close the ones you opened yourself with `browser_tabs` when a task
+  is done, never the user's). The next browser action reconnects.
+
 ## When it's unavailable
 
 This tool only attaches on a **remote machine** whose owner granted **Browser

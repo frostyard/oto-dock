@@ -63,11 +63,30 @@ def _headers() -> dict:
     }
 
 
-async def _post(path: str, body: dict) -> dict:
-    async with httpx.AsyncClient(timeout=30.0) as client:
+async def _post(path: str, body: dict, *, timeout: float = 30.0) -> dict:
+    async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(f"{PROXY_URL}{path}", json=body, headers=_headers())
         resp.raise_for_status()
         return resp.json()
+
+
+def _send_files_failure(target_agent: str, e: httpx.HTTPStatusError) -> str:
+    """A send_files error must never read as partial success: name the
+    outcome first, then the platform's reason verbatim."""
+    status = e.response.status_code
+    try:
+        detail = e.response.json().get("detail") or e.response.text
+    except Exception:
+        detail = e.response.text
+    if status in (400, 403, 404, 413):
+        # Pre-copy refusals: validation, roster/access, a missing source
+        # (incl. "the remote machine could not provide it"), caps.
+        return f"send_files FAILED — 0 files delivered to '{target_agent}'. {detail}"
+    # 507 (quota mid-batch) / 500 say how far the copy got — don't contradict them.
+    return (
+        f"send_files FAILED (HTTP {status}) — delivery to '{target_agent}' "
+        f"may be partial: {detail}"
+    )
 
 
 async def _get(path: str, params: dict | None = None) -> dict:
@@ -90,7 +109,9 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="delegate",
             description=(
-                "Delegate work to a parallel worker session and always get the result back.\n\n"
+                "Delegate work to a parallel worker session and always get the result back. "
+                "The skill `delegation-guide` (Skill tool) has the full reference: surfaces, "
+                "callbacks, monitoring, project mode with the board file, send_files.\n\n"
                 "This tool returns immediately — the worker runs asynchronously. When its "
                 "turn completes, the result is automatically delivered back into THIS "
                 "session (including anything the user said to the worker in the meantime). "
@@ -223,7 +244,9 @@ async def list_tools() -> list[Tool]:
                         "description": (
                             "Files or directories to send, relative to your "
                             "workspace/ directory (e.g. 'reports/q3.md', "
-                            "'research/AAPL'). Directories copy recursively."
+                            "'research/AAPL'). Directories copy recursively. "
+                            "Files you wrote or changed in this turn are "
+                            "sendable right away, also on a remote machine."
                         ),
                     },
                     "dest_dir": {
@@ -459,14 +482,20 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 if err:
                     return [TextContent(type="text", text=f"Invalid dest_dir '{dest_dir}': {err}")]
 
-            result = await _post("/v1/delegation/send_files", {
-                "target_agent": target_agent,
-                "paths": paths,
-                "dest_dir": dest_dir,
-                "note": arguments.get("note") or "",
-                "source_agent": AGENT,
-                "scope": PARENT_SCOPE,
-            })
+            try:
+                result = await _post("/v1/delegation/send_files", {
+                    "target_agent": target_agent,
+                    "paths": paths,
+                    "dest_dir": dest_dir,
+                    "note": arguments.get("note") or "",
+                    "source_agent": AGENT,
+                    "scope": PARENT_SCOPE,
+                    # On a remote machine the platform reads the sources
+                    # through from the satellite first (a directory = one
+                    # manifest + per-file pulls) — well past the 30 s default.
+                }, timeout=300.0)
+            except httpx.HTTPStatusError as e:
+                return [TextContent(type="text", text=_send_files_failure(target_agent, e))]
 
             files = result.get("files") or []
             mb = (result.get("total_bytes") or 0) / (1024 * 1024)

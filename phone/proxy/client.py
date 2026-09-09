@@ -42,7 +42,8 @@ class ProxyClient:
                  phone_route_id: str = "",
                  caller_phone: str = "",
                  caller_did: str = "",
-                 dial_event: dict | None = None):
+                 dial_event: dict | None = None,
+                 pin_verified: bool = False):
         self.model = model
         self.llm_mode = llm_mode
         self.phone_mode = phone_mode
@@ -61,6 +62,11 @@ class ProxyClient:
         self.caller_phone = caller_phone
         self.caller_did = caller_did
         self.dial_event = dial_event or {}
+        # The daemon's PIN gate passed before this client was created. The
+        # proxy honours it only on routes that actually have a PIN — it
+        # upgrades the caller's identity label (call log) and marks the
+        # caller's private tree as verified.
+        self.pin_verified = bool(pin_verified)
         self.session_id: str | None = None
         self.messages: list[dict[str, str]] = []
         self._ws: websockets.ClientConnection | None = None
@@ -183,6 +189,7 @@ class ProxyClient:
                 "caller_phone": self.caller_phone,
                 "caller_did": self.caller_did,
                 "dial_event": self.dial_event,
+                "pin_verified": self.pin_verified,
             }
             if self.session_id:
                 # Include pre-warmed session_id so proxy can reuse existing session
@@ -225,6 +232,7 @@ class ProxyClient:
                 "caller_phone": self.caller_phone,
                 "caller_did": self.caller_did,
                 "dial_event": self.dial_event,
+                "pin_verified": self.pin_verified,
             }
             resp = await self._http.post(
                 "/v1/sessions/warmup",

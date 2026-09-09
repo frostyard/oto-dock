@@ -224,6 +224,7 @@ export default function AgentChat() {
     compressingActive, setCompressingActive,
     activeAgents,
     totalCost, setTotalCost,
+    costBilled,
     contextUsed, setContextUsed,
     contextMax, setContextMax,
     cacheStats,
@@ -1953,7 +1954,7 @@ export default function AgentChat() {
         {!workspace.state.open && (
           <div className="absolute top-14 right-3 z-10 flex flex-col gap-2 items-end">
             {/* Task chats keep the pinned run-info popup (name, status, cost). */}
-            {isTaskChat && taskRun && <TaskMetadata run={taskRun} />}
+            {isTaskChat && taskRun && <TaskMetadata run={taskRun} costBilled={costBilled} />}
             <PlanPanel plans={sessionPlans} />
             <GoalPanel goal={currentGoal} />
           </div>
@@ -2198,6 +2199,7 @@ export default function AgentChat() {
                 ? `${pendingEngineSwitch.layer}::${pendingEngineSwitch.model}`
                 : modelCompound}
               costUsd={totalCost}
+              costBilled={costBilled}
               contextUsed={contextUsed}
               contextMax={contextMax}
               cacheStats={cacheStats}

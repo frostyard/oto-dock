@@ -79,13 +79,18 @@ def _resolve_template(
     return Path(s)
 
 
-def _session_workspace(session_id: str, agent_name: str, username: str) -> Path:
+def _session_workspace(
+    session_id: str, agent_name: str, username: str, external_home: str = "",
+) -> Path:
     """Derive the workspace dir for a session.
 
+    External caller with a private tree → <external_home>/workspace.
     User-scoped sessions → users/{username}/workspace.
     Agent-scoped (no username) → workspace.
     """
     import config
+    if external_home:
+        return Path(external_home) / "workspace"
     if username:
         return config.AGENTS_DIR / agent_name / "users" / username / "workspace"
     return config.AGENTS_DIR / agent_name / "workspace"
@@ -245,7 +250,12 @@ def relocate_for_tool(
 
     st = _state.get(session_id)
     start_ts = st.started_at.get(mcp_name, 0.0) if st else 0.0
-    workspace = _session_workspace(session_id, ctx.agent, ctx.username)
+    from core.session.external_identity import external_home_of
+    _ext_home = external_home_of(ctx)
+    workspace = (
+        _session_workspace(session_id, ctx.agent, ctx.username, _ext_home)
+        if _ext_home else _session_workspace(session_id, ctx.agent, ctx.username)
+    )
     names = _parse_output_names(result_text)
     is_t2 = deployment.current_mode() == deployment.MANAGED_SOCKPROX
 
@@ -327,7 +337,9 @@ async def relocate_and_push_for_tool(
     return moved
 
 
-def cleanup_session(session_id: str, agent_name: str, username: str) -> None:
+def cleanup_session(
+    session_id: str, agent_name: str, username: str, external_home: str = "",
+) -> None:
     """Purge per-session subdirs declared with `gc_after: "session_close"`.
 
     Modern outputs (camoufox) bound their dest with `keep_recent` instead and set
@@ -338,7 +350,10 @@ def cleanup_session(session_id: str, agent_name: str, username: str) -> None:
     from services.mcp import mcp_registry
 
     _state.pop(session_id, None)
-    workspace = _session_workspace(session_id, agent_name, username)
+    workspace = (
+        _session_workspace(session_id, agent_name, username, external_home)
+        if external_home else _session_workspace(session_id, agent_name, username)
+    )
     for _name, manifest in mcp_registry.get_all_manifests().items():
         for out in manifest.outputs:
             if out.gc_after != "session_close":

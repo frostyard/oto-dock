@@ -15,6 +15,7 @@ import json
 import logging
 import time
 import uuid
+from pathlib import Path
 
 from fastapi import WebSocket, WebSocketDisconnect, Query
 from websockets.exceptions import ConnectionClosed
@@ -26,11 +27,46 @@ from storage import phone_route_store
 from core.events.common_events import (
     CommonEvent, ERROR, PRODUCER_DONE,
 )
+from core.session import external_identity
 from core.session.session_manager import get_execution_layer
 from core.events.stream_pump import ChatStreamPump, _active_pumps
 from core.config.phone_config_builder import build_phone_agent_config, resolve_phone_execution_target
+from services.phone.phone_identity import (
+    RouteIdentity, resolve_route_identity,
+    remember_call_identity, pop_call_identity,  # noqa: F401 — re-exported for the handler + tests
+)
 
 logger = logging.getLogger("claude-proxy")
+
+
+def _validated_reuse_sid(existing_sid, agent_name: str) -> str:
+    """A pre-warmed session id the daemon asks to reuse is honoured ONLY when
+    it is a UUID that names a phone chat of THIS agent — the daemon holds the
+    master key, but it must not be able to attach a call to an arbitrary live
+    session (a dashboard chat, another agent's call)."""
+    if not existing_sid:
+        return ""
+    try:
+        sid = str(uuid.UUID(str(existing_sid)))
+    except ValueError:
+        logger.warning("WS warmup: ignoring non-UUID session_id in reuse request")
+        return ""
+    chat = task_store.get_chat_by_session(sid)
+    if not chat or chat.get("source_type") != "phone" or chat.get("agent") != agent_name:
+        logger.warning(
+            "WS warmup: ignoring reuse of session %s — not a phone chat of agent %s",
+            sid[:8], agent_name,
+        )
+        return ""
+    return sid
+
+
+def _external_home_for(identity: RouteIdentity | None, agent_name: str) -> str:
+    """Host path of the call's caller tree ("" when the identity has none)."""
+    if identity is None or identity.external is None or not identity.external.has_tree:
+        return ""
+    home = external_identity.external_home(config.get_agent_dir(agent_name), identity.external)
+    return str(home) if home is not None else ""
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +256,10 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
     phone_context_override: str = ""
     phone_mode = False
     trigger_payload: dict | None = None
+    # Who the caller IS on this call (services/phone/phone_identity.py) — the
+    # heal rebuilds the same identity; the teardown prunes an ephemeral tree.
+    route_identity: RouteIdentity | None = None
+    ephemeral_home: str = ""
 
     # Turns stream from tasks so this receive loop stays responsive to
     # "abort" (barge-in) and follow-up "chat" while a turn is in flight.
@@ -280,6 +320,7 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                     )
                     can_resume = await layer.can_resume_session(
                         session_id, agent_name=model_name, username="",
+                        external_home=_external_home_for(route_identity, model_name),
                     )
                     await layer.prepare_resume(session_id)
                     heal_cfg = await build_phone_agent_config(
@@ -288,6 +329,8 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                         phone_context_override=phone_context_override,
                         phone_mode=phone_mode,
                         trigger_payload=trigger_payload,
+                        route_identity=route_identity,
+                        session_id=session_id,
                     )
                     heal_cfg.resume = can_resume
                     await layer.start_session(session_id, heal_cfg)
@@ -438,21 +481,55 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                 caller_phone = msg.get("caller_phone") or msg.get("caller_id", "")
                 caller_did = msg.get("caller_did", "")
                 dial_event = msg.get("dial_event") or {}
+                # The daemon's PIN gate ran before this warmup; the resolver
+                # honours the flag only on routes that actually have a PIN.
+                pin_verified = bool(msg.get("pin_verified", False))
 
                 try:
+                    # Identity FIRST (services/phone/phone_identity.py): the
+                    # route decides who the caller is, which decides the role,
+                    # the target and the layer. A reuse request is honoured
+                    # only for a phone chat of this agent; an ephemeral caller
+                    # tree is keyed by the session id, so the id is settled
+                    # before the identity resolves.
+                    route = (
+                        await asyncio.to_thread(phone_route_store.get_route, phone_route_id)
+                        if phone_route_id else None
+                    )
+                    reuse_sid = await asyncio.to_thread(
+                        _validated_reuse_sid, existing_sid, model_name,
+                    )
+                    fresh_sid = str(uuid.uuid4())
+                    route_identity = await asyncio.to_thread(
+                        resolve_route_identity, route, agent=model_name,
+                        caller_phone=caller_phone, session_id=reuse_sid or fresh_sid,
+                        pin_verified=pin_verified,
+                    )
+                    if route_identity.mode == "user":
+                        _target_role = route_identity.user_role
+                        _target_sub = (route_identity.user or {}).get("sub")
+                    else:
+                        _target_role, _target_sub = route_identity.role, None
                     # Resolve the target up front (shared helper → same result
                     # as build_phone_agent_config) so the layer matches where
                     # the (pre-warmed or new) session actually runs.
                     phone_target = await asyncio.to_thread(
                         resolve_phone_execution_target, model_name,
+                        role=_target_role, user_sub=_target_sub,
                     )
                     layer = get_execution_layer(
                         model_name, execution_target=phone_target,
                     )
 
                     # Reuse pre-warmed session if provided and still alive
-                    if existing_sid and await layer.is_session_alive(existing_sid):
-                        session_id = existing_sid
+                    if reuse_sid and await layer.is_session_alive(reuse_sid):
+                        session_id = reuse_sid
+                        ephemeral_home = (
+                            _external_home_for(route_identity, model_name)
+                            if route_identity.external is not None
+                            and route_identity.external.ephemeral else ""
+                        )
+                        remember_call_identity(session_id, route_identity.label)
                         # Recover this session's chat_id — the reused connection
                         # needs it for chat turns (this branch runs on a NEW ws
                         # connection after a daemon reconnect, so chat_id is
@@ -473,6 +550,7 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                                 agent_name=model_name, call_type=call_type,
                                 phone_context_override=phone_context_override,
                                 phone_mode=phone_mode, trigger_payload=None,
+                                route_identity=route_identity, session_id=session_id,
                             )
                             chat_id = str(uuid.uuid4())
                             first_turn = True
@@ -485,7 +563,7 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                             task_store.update_chat(chat_id, session_id=session_id)
                         logger.info(
                             f"WS warmup: reusing pre-warmed session={session_id}, "
-                            f"chat={chat_id} "
+                            f"chat={chat_id}, identity={route_identity.label} "
                             f"({(time.monotonic() - t_warm) * 1000:.0f}ms)"
                         )
                         await _send({
@@ -493,6 +571,14 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                             "data": {"session_id": session_id, "llm_mode": llm_mode},
                         })
                         continue
+                    if reuse_sid:
+                        # The pre-warmed session is gone: a fresh session, and
+                        # (for an ephemeral caller) a tree keyed by ITS id.
+                        route_identity = await asyncio.to_thread(
+                            resolve_route_identity, route, agent=model_name,
+                            caller_phone=caller_phone, session_id=fresh_sid,
+                            pin_verified=pin_verified,
+                        )
 
                     # Resolve route → trigger → payload. Best-effort: any
                     # miss (no route_id/UUID, no route, no trigger_slug, no
@@ -507,7 +593,7 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                         dial_event=dial_event,
                     )
 
-                    session_id = str(uuid.uuid4())
+                    session_id = fresh_sid
                     chat_id = str(uuid.uuid4())
                     first_turn = True
 
@@ -517,6 +603,13 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                         phone_context_override=phone_context_override,
                         phone_mode=phone_mode,
                         trigger_payload=trigger_payload,
+                        route_identity=route_identity,
+                        session_id=session_id,
+                    )
+                    ephemeral_home = (
+                        _external_home_for(route_identity, model_name)
+                        if route_identity.external is not None
+                        and route_identity.external.ephemeral else ""
                     )
 
                     # Check concurrency limit before spawning session. Phone can
@@ -534,6 +627,13 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                         continue
 
                     await layer.start_session(session_id, agent_cfg)
+                    remember_call_identity(session_id, route_identity.label)
+                    # A read-only call is activity too (the retention sweep
+                    # keys on the tree's newest mtime).
+                    _home = _external_home_for(route_identity, model_name)
+                    if _home:
+                        with contextlib.suppress(OSError):
+                            Path(_home).touch()
 
                     # Create chat row for persistence. ``"phone"`` is the
                     # sentinel owner (a call has no real user) + the source_type
@@ -554,7 +654,9 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
 
                     logger.info(
                         f"WS warmup: session={session_id}, chat={chat_id}, "
-                        f"agent={model_name}, "
+                        f"agent={model_name}, identity={route_identity.label} "
+                        f"(mode={route_identity.mode}"
+                        f"{', fallback: ' + route_identity.fallback_reason if route_identity.fallback_reason else ''}), "
                         f"trigger={'yes' if trigger_payload else 'no'} "
                         f"({(time.monotonic() - t_warm) * 1000:.0f}ms)"
                     )
@@ -662,3 +764,7 @@ async def ws_phone_handler(websocket: WebSocket, key: str = Query(default="")):
                 logger.error(f"WS session cleanup failed: {e}")
             from core.concurrency import release_chat_slot
             release_chat_slot(session_id)
+            # A caller with no durable identity leaves nothing behind.
+            if ephemeral_home:
+                if external_identity.prune_ephemeral(Path(ephemeral_home)):
+                    logger.info(f"WS session {session_id[:8]}: ephemeral caller tree pruned")

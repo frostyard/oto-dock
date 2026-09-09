@@ -199,6 +199,31 @@ def pytest_sessionfinish(session, exitstatus):
     Best-effort — a worker whose pool hasn't closed yet makes its DROP fail
     (skipped); the next run's age-gated startup sweep reaps any leftovers.
     """
+    # Loop-guard inventory (OTODOCK_DB_LOOP_GUARD=count): every store call
+    # issued from an event-loop thread during the run, as file:line — the
+    # explicit backlog of loop-side DB calls still to convert (see
+    # docs/TESTING.md). Written per worker so xdist runs merge.
+    try:
+        from storage import pg as _pg
+        _hits = _pg.loop_guard_hits()
+        if _hits:
+            _out = os.environ.get("OTODOCK_DB_LOOP_GUARD_OUT", "")
+            _lines = [f"{n:6d}  {f}:{ln}  {fn}" for (f, ln, fn), n in
+                      sorted(_hits.items(), key=lambda kv: -kv[1])]
+            if _out:
+                with open(_out, "a", encoding="utf-8") as fh:
+                    fh.write("\n".join(_lines) + "\n")
+            else:
+                print("\n[db-loop-guard] loop-side store calls:\n" + "\n".join(_lines))
+    except Exception:
+        pass
+    # Stop the dedicated DB executor before the pool's own atexit close so
+    # its idle worker threads never delay interpreter exit.
+    try:
+        from storage import pg as _pg
+        _pg.shutdown_db_executor()
+    except Exception:
+        pass
     if _xdist_worker:
         return
     import re
@@ -275,6 +300,15 @@ def temp_db():
     except Exception:
         pass
 
+    # The per-chat writer lanes are module-global and hold flusher tasks
+    # bound to whichever loop ran the previous test (the WS suites use a
+    # fresh asyncio.run per scenario) — a leftover lane would never flush.
+    try:
+        from core.events import chat_writer as _chat_writer
+        _chat_writer.reset_for_tests()
+    except Exception:
+        pass
+
     # Also wipe any agent directories left behind on the filesystem by
     # tests that exercise the real install path. Test AGENTS_DIR was
     # redirected to a tempdir at module import; we just clear its contents.
@@ -298,6 +332,29 @@ def temp_db():
     yield db
 
     # No teardown needed — next test truncates
+
+
+class _LoopDbGuard:
+    """Handle returned by the ``loop_db_guard`` fixture. ``active()`` arms the
+    guard for the CURRENT thread (the pytest-asyncio loop thread) for the
+    duration of the block: any ``storage.pg.get_conn()`` issued on that thread
+    raises ``LoopGuardViolation``. Wrap ONLY the exercised call — store reads
+    the test body needs for its own assertions go through ``run_db`` /
+    ``asyncio.to_thread``."""
+
+    def active(self):
+        from storage import pg
+        return pg.loop_guard()
+
+
+@pytest.fixture
+def loop_db_guard():
+    """Opt-in, function-scoped, never autouse: the regression fence for the
+    paths converted to off-loop DB access (docs/TESTING.md, "Event-loop DB
+    guard"). Disarmed on teardown no matter how the test exits."""
+    from storage import pg
+    yield _LoopDbGuard()
+    pg.disarm_loop_guard()
 
 
 def _seed_users():

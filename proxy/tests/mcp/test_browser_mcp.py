@@ -132,6 +132,97 @@ def test_apply_allowed_origins_creates_env_when_absent():
     assert entry["env"] == {"PLAYWRIGHT_MCP_ALLOWED_ORIGINS": "https://only.com"}
 
 
+# ---------------------------------------------------------------------------
+# Own-browser mode: the framework owns the browser env keys on the entry
+# ---------------------------------------------------------------------------
+
+def _own(token=None):
+    from storage.remote_store import BrowserTargetSettings
+    return BrowserTargetSettings(mode="own", extension_token=token)
+
+
+def test_apply_browser_mode_dedicated_leaves_nothing_but_strips_poison():
+    # Admin config values merge into the env unvalidated — every framework-
+    # owned key is dropped whatever the mode, so a DB value can never flip a
+    # machine into the user's real browser or repoint the profile dir.
+    from storage.remote_store import BrowserTargetSettings
+    poisoned = {
+        "OTO_BROWSER_CHANNEL": "chrome", "OTO_BROWSER_MODE": "own",
+        "PLAYWRIGHT_MCP_EXTENSION": "1", "PLAYWRIGHT_MCP_EXTENSION_TOKEN": "x",
+        "PLAYWRIGHT_MCP_USER_DATA_DIR": "/home/u/.config/google-chrome",
+        "PLAYWRIGHT_MCP_BROWSER": "chrome", "PLAYWRIGHT_MCP_EXECUTABLE_PATH": "/x",
+        "PLAYWRIGHT_MCP_CDP_ENDPOINT": "http://127.0.0.1:9222",
+    }
+    bundles = {}
+    for target in (None, BrowserTargetSettings()):
+        entry = {"type": "stdio", "command": "node", "env": dict(poisoned)}
+        reg._apply_browser_mode(entry, bundles, target, unattended=False)
+        assert entry["env"] == {"OTO_BROWSER_CHANNEL": "chrome"}
+        assert bundles == {}
+
+
+def test_apply_browser_mode_own_with_token_uses_the_bundle():
+    entry = {"type": "stdio", "command": "node", "env": {"OTO_BROWSER_CHANNEL": "auto"}}
+    bundles = {}
+    reg._apply_browser_mode(entry, bundles, _own("T" * 43), unattended=True)
+    assert entry["env"] == {
+        "OTO_BROWSER_CHANNEL": "auto", "OTO_BROWSER_MODE": "own",
+        "OTO_BROWSER_TOKEN_EXPECTED": "1",
+    }
+    # The token rides the broker bundle only — never the config env.
+    assert bundles["local"].env == {"PLAYWRIGHT_MCP_EXTENSION_TOKEN": "T" * 43}
+    assert "PLAYWRIGHT_MCP_EXTENSION_TOKEN" not in str(entry)
+
+
+def test_apply_browser_mode_own_without_token_flags_unattended():
+    entry = {"type": "stdio", "command": "node"}
+    bundles = {}
+    reg._apply_browser_mode(entry, bundles, _own(), unattended=False)
+    assert entry["env"] == {"OTO_BROWSER_MODE": "own"}
+    reg._apply_browser_mode(entry, bundles, _own(), unattended=True)
+    assert entry["env"] == {"OTO_BROWSER_MODE": "own", "OTO_BROWSER_UNATTENDED": "1"}
+    assert bundles == {}
+
+
+def test_apply_browser_mode_extends_an_existing_bundle():
+    from core.credentials.mcp_broker import SecretBundle
+    bundles = {"local": SecretBundle(env={"OTHER": "1"})}
+    entry = {"type": "stdio", "command": "node"}
+    reg._apply_browser_mode(entry, bundles, _own("U" * 43), unattended=False)
+    assert bundles["local"].env == {"OTHER": "1", "PLAYWRIGHT_MCP_EXTENSION_TOKEN": "U" * 43}
+
+
+def test_build_session_config_threads_target_browser(monkeypatch, tmp_path):
+    import json
+    from tests.mcp.test_mcp_broker_activation import _FakeManifest, _stub_assembly
+    _stub_assembly(
+        monkeypatch, [_FakeManifest("browser-control", server_name="local")],
+        env_by_mcp={}, tmp_path=tmp_path,
+        server_entries={"browser-control": {
+            "type": "stdio", "command": "node", "args": ["index.js"],
+            "env": {"PLAYWRIGHT_MCP_BLOCKED_ORIGINS": "http://localhost:*",
+                    "PLAYWRIGHT_MCP_EXTENSION": "1"},
+        }},
+    )
+    path, _env, _excl, bundles, _bash = reg.build_session_mcp_config(
+        "agent", None, is_remote=True, task_mode=True, target_browser=_own("V" * 43),
+    )
+    local = json.loads(path.read_text())["mcpServers"]["local"]
+    assert local["env"] == {
+        "PLAYWRIGHT_MCP_BLOCKED_ORIGINS": "http://localhost:*",
+        "OTO_BROWSER_MODE": "own", "OTO_BROWSER_TOKEN_EXPECTED": "1",
+    }
+    assert bundles["local"].env == {"PLAYWRIGHT_MCP_EXTENSION_TOKEN": "V" * 43}
+    # No target_browser (local builders never pass one): the entry keeps only
+    # what the framework allows, and no bundle is created.
+    path, _env, _excl, bundles, _bash = reg.build_session_mcp_config(
+        "agent", None, is_remote=True,
+    )
+    local = json.loads(path.read_text())["mcpServers"]["local"]
+    assert local["env"] == {"PLAYWRIGHT_MCP_BLOCKED_ORIGINS": "http://localhost:*"}
+    assert "local" not in bundles
+
+
 _LOOPBACK_BLOCKLIST = (
     "http://localhost:*;https://localhost:*;http://127.0.0.1:*;https://127.0.0.1:*"
 )

@@ -2,8 +2,8 @@
   "name": "browser-control",
   "server_name": "local",
   "label": "Local Browser",
-  "description": "Drive a real, logged-in Chrome/Edge on this machine (Playwright). The agent navigates, reads the page's accessibility tree, clicks, types, and fills forms on sites you're signed into \u2014 using a DEDICATED browser profile you log into once, never your everyday one.",
-  "version": "0.0.78",
+  "description": "Drive a real, logged-in Chrome/Edge/Brave on this machine (Playwright). The agent navigates, reads the page's accessibility tree, clicks, types, and fills forms on sites you're signed into \u2014 by default in a DEDICATED browser profile you log into once; a machine can opt into \"Use my own browser\" instead, where the agent works in a tab group inside the browser you are signed into (Playwright Extension).",
+  "version": "0.0.79",
   "category": "custom",
   "server": {
     "runtime": "node",
@@ -24,7 +24,7 @@
       "input_type": "text",
       "default": "auto",
       "user_overridable": true,
-      "help": "auto (default) = the wrapper detects an installed browser on EACH machine and uses it \u2014 Google Chrome or Microsoft Edge via their system channel, or a Chromium-family browser (Brave, Vivaldi, Opera, Chromium) via its executable. Set an explicit value to force one: chrome, msedge, chromium, firefox, or webkit. Note: firefox/webkit use Playwright's OWN downloaded builds (a one-time ~80MB install on that machine), not your system Firefox. The agent always uses a dedicated per-agent profile under ~/.oto-dock/browser-profiles/<agent>/, never your personal one."
+      "help": "auto (default) = the wrapper detects an installed browser on EACH machine and uses it \u2014 Google Chrome or Microsoft Edge via their system channel, or a Chromium-family browser (Brave, Vivaldi, Opera, Chromium) via its executable; with no Chromium browser but a system Firefox it falls back to Playwright's own Firefox build (downloaded once on the first browser call). Set an explicit value to force one: chrome, msedge, chromium, firefox, or webkit. Note: firefox/webkit use Playwright's OWN downloaded builds (a one-time ~80MB install on that machine), not your system Firefox. The dedicated per-agent profile lives under ~/.oto-dock/browser-profiles/<agent>/; a machine's \"Use my own browser\" opt-in (Chrome/Edge/Brave only) attaches to the signed-in browser instead."
     }
   ],
   "env": {
@@ -37,14 +37,14 @@
   "device_capability": "browser",
   "exclude_from": [],
   "system_requirements": {
-    "notes": "Requires Google Chrome or Microsoft Edge installed on the machine (Playwright drives the system browser via its channel \u2014 there is NO separate Playwright browser download). Node 18+ is required (the platform ships Node). The MCP launches a HEADED window on the user's display for the one-time sign-in, so the machine needs a reachable graphical session: on Linux an X11 or Wayland session must be present \u2014 a headless / linger-only `systemd --user` service has no display and the framework's requires_display gate withholds this MCP there; macOS and Windows per-user services have a display. The dedicated browser profile lives at ~/.oto-dock/browser-profiles/<agent>/ (outside this MCP's directory and outside the synced workspace, so logins survive MCP updates and never leave the machine). The capture-studio tool family (studio_*) is Linux-only and additionally needs Xvfb + xsetroot and ffmpeg/ffprobe (~/tools/bin or $FFMPEG); audio capture needs PulseAudio (pactl/parec/paplay). The studio runs on its OWN virtual display and profile (~/.oto-dock/capture-studio/<agent>/) \u2014 it never records or touches the everyday browser."
+    "notes": "Requires a Chromium browser (Google Chrome, Microsoft Edge or Brave) installed on the machine \u2014 Playwright drives the system browser via its channel, no separate browser download; a machine with only Firefox gets Playwright's Firefox build (see below). Node 18+ is required (the platform ships Node). The MCP launches a HEADED window on the user's display for the one-time sign-in, so the machine needs a reachable graphical session: on Linux an X11 or Wayland session must be present \u2014 a headless / linger-only `systemd --user` service has no display and the framework's requires_display gate withholds this MCP there; macOS and Windows per-user services have a display. The dedicated browser profile lives at ~/.oto-dock/browser-profiles/<agent>/ (outside this MCP's directory and outside the synced workspace, so logins survive MCP updates and never leave the machine). No Chrome/Edge/Brave but a system Firefox: the dedicated mode uses Playwright's own Firefox build, downloaded once on the first browser call. OWN-BROWSER MODE (per-machine opt-in next to the Browser control grant, Chrome/Edge/Brave only): the agent works in a tab group inside the browser the OS user is signed into — install the \"Playwright Extension\" from the Chrome Web Store in the profile that browser opens links in, and save its token (the extension's page, toolbar icon) in the machine settings so sessions connect without a click; without the token every interactive session asks for Allow in the browser and unattended sessions (tasks, calls, meetings) cannot use the browser at all. The capture-studio tool family (studio_*) is Linux-only and additionally needs Xvfb + xsetroot and ffmpeg/ffprobe (~/tools/bin or $FFMPEG); audio capture needs PulseAudio (pactl/parec/paplay). The studio runs on its OWN virtual display and profile (~/.oto-dock/capture-studio/<agent>/) \u2014 it never records or touches the everyday browser."
   },
   "skills": [
     {
       "id": "browser-control-usage",
       "loading": "always",
       "file": "skills/browser-control.md",
-      "description": "How to drive the logged-in browser: the snapshot-then-act loop, signing in once on the dedicated profile, the origin limits, the headed-on-your-display behavior, and the shared long-lived browser window sessions attach to.",
+      "description": "How to drive the logged-in browser: the snapshot-then-act loop, signing in once on the dedicated profile, the origin limits, the headed-on-your-display behavior, the shared long-lived browser window sessions attach to, and the own-browser mode where the agent works in a tab group inside the user's signed-in browser.",
       "default_exclude_from": []
     },
     {

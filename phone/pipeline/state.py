@@ -132,6 +132,9 @@ class CallState:
     # normally-answered call; the PIN gate and error paths overwrite.
     call_outcome: str = "completed"
     pin_attempts: int = 0
+    # True once the PIN gate passed — rides the proxy warmup (``pin_verified``)
+    # so the caller's identity counts as verified there.
+    pin_verified: bool = False
 
     # Utterance + session-warmup task handles
     _utterance_task: asyncio.Task | None = None

@@ -90,62 +90,6 @@ export function AddApiKeyForm({ layer, provider: defaultProvider, onDone }: { la
 }
 
 // ---------------------------------------------------------------------------
-// Add Local Endpoint Form
-// ---------------------------------------------------------------------------
-
-export function AddLocalEndpointForm({ layer, provider, onDone }: { layer: string; provider: string; onDone: () => void }) {
-  const [label, setLabel] = useState('')
-  const [url, setUrl] = useState(provider === 'ollama' ? 'http://localhost:11434' : 'http://localhost:1234')
-  const addMut = useAddSubscription()
-
-  const handleSubmit = () => {
-    if (!url.trim()) return
-    addMut.mutate(
-      { layer, provider, auth_type: 'local_endpoint', label: label.trim(), endpoint_url: url.trim() },
-      { onSuccess: () => { setLabel(''); setUrl(''); onDone() } },
-    )
-  }
-
-  return (
-    <div className="mt-3 p-3 bg-p-bg rounded-lg border border-p-border-light space-y-2">
-      <input
-        type="text"
-        placeholder="Label (optional)"
-        value={label}
-        onChange={(e) => setLabel(e.target.value)}
-        className="w-full px-3 py-1.5 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30"
-      />
-      <input
-        type="url"
-        placeholder="Endpoint URL"
-        value={url}
-        onChange={(e) => setUrl(e.target.value)}
-        className="w-full px-3 py-1.5 text-sm border border-p-border-light rounded-lg bg-white dark:bg-p-surface text-p-text focus:outline-hidden focus:ring-2 focus:ring-brand/30 font-mono"
-      />
-      <p className="text-[11px] text-p-text-secondary leading-snug">
-        On a containerized (Docker) install, use the host's LAN IP or
-        <span className="font-mono"> host.docker.internal</span> — not
-        <span className="font-mono"> localhost</span> (that resolves inside the
-        proxy container, not your machine).
-      </p>
-      <div className="flex gap-2">
-        <button
-          onClick={handleSubmit}
-          disabled={!url.trim() || addMut.isPending}
-          className="px-3 py-1.5 text-sm rounded-lg bg-brand text-white hover:bg-brand-hover transition-colors disabled:opacity-40"
-        >
-          {addMut.isPending ? 'Adding...' : 'Add'}
-        </button>
-        <button onClick={onDone} className="px-3 py-1.5 text-sm rounded-lg text-p-text-secondary hover:bg-p-bg-hover transition-colors">
-          Cancel
-        </button>
-      </div>
-      {addMut.isError && <p className="text-xs text-red-500">{(addMut.error as Error).message}</p>}
-    </div>
-  )
-}
-
-// ---------------------------------------------------------------------------
 // Connect Claude OAuth
 // ---------------------------------------------------------------------------
 
@@ -518,12 +462,16 @@ export function DiscoverModelsPanel({
   discoveredModels,
   existingModelIds,
   onDone,
+  layers,
 }: {
   layer: string
   provider: string
   discoveredModels: DiscoveredModel[]
   existingModelIds: Set<string>
   onDone: () => void
+  /** Engines the models are added to (a shared local endpoint adds to every
+   *  engine it is enabled for). Defaults to `layer`. */
+  layers?: string[]
 }) {
   const [selected, setSelected] = useState<Set<string>>(() => {
     // Pre-select models that aren't already added
@@ -578,7 +526,7 @@ export function DiscoverModelsPanel({
     )
     if (toAdd.length === 0) return
     bulkAdd.mutate(
-      { layer, models: toAdd, provider },
+      { layer, models: toAdd, provider, ...(layers?.length ? { layers } : {}) },
       { onSuccess: () => onDone() },
     )
   }

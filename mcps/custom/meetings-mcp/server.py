@@ -67,7 +67,8 @@ async def list_tools() -> list[Tool]:
                 "Start a multi-agent meeting. Invites the specified agents to a "
                 "collaborative discussion on the given topic. Use direct_to() during "
                 "the meeting to address specific agents — they will respond in parallel "
-                "if multiple are addressed."
+                "if multiple are addressed. Read the skill `meetings-guide` (Skill tool) "
+                "before your first meeting: the turn mechanics and the moderator rules."
             ),
             inputSchema={
                 "type": "object",
@@ -113,7 +114,12 @@ async def list_tools() -> list[Tool]:
                 "visible to everyone in the transcript regardless of routing. "
                 "Only the response TEXT you wrote before this call is relayed — "
                 "the other agents never see your tool results or thinking, so "
-                "write your findings out as text FIRST, then call this."
+                "write your findings out as text FIRST, then call this. "
+                "Calling it ENDS your turn: stop immediately after it (no more "
+                "tools, no more text). The addressed agents speak only after your "
+                "response ends, and their replies reach you in your NEXT turn — "
+                "never wait for them, poll for them, or look them up with other "
+                "tools; later tool calls in this turn are denied."
             ),
             inputSchema={
                 "type": "object",
@@ -138,8 +144,9 @@ async def list_tools() -> list[Tool]:
             name="end_meeting",
             description=(
                 "End the meeting. Only the moderator can use this. Your current "
-                "response will be the final message (use it for the summary). "
-                "No further turns will happen."
+                "response is the final message: write the summary as response "
+                "text BEFORE calling this, then stop (no more tools). No further "
+                "turns will happen; this session closes when your response ends."
             ),
             inputSchema={
                 "type": "object",
@@ -260,27 +267,45 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 except (json.JSONDecodeError, TypeError):
                     agents = [agents]  # treat as single agent slug
             # This tool is a signal — the orchestrator detects it from the event stream.
-            # No API call needed.
+            # No API call needed. The result text is what the model reads next,
+            # so it carries the turn rule: the orchestrator routes only when the
+            # turn ends, and the replies arrive in the NEXT turn.
             if agents:
-                return [TextContent(type="text", text=f"Response directed to: {', '.join(agents)}")]
+                return [TextContent(type="text", text=(
+                    f"Response directed to: {', '.join(agents)}. Your turn is over — "
+                    f"stop now (no more tools, no more text). They speak after your "
+                    f"response ends; their replies reach you in your next turn."
+                ))]
             else:
-                return [TextContent(type="text", text="Response directed to chat (no agents queued).")]
+                return [TextContent(type="text", text=(
+                    "Response directed to chat (no agents queued). Your turn is "
+                    "over — stop now."
+                ))]
 
         elif name == "end_meeting":
             meeting_id = arguments["meeting_id"]
             await _post(f"/v1/meetings/{meeting_id}/end", {})
-            return [TextContent(type="text", text=f"Meeting {meeting_id} ending. This is the final turn.")]
+            return [TextContent(type="text", text=(
+                f"Meeting {meeting_id} is ending; this is the final turn. If the "
+                f"meeting summary is not already written above, write it now as "
+                f"plain response text, then stop. No further tools."
+            ))]
 
         elif name == "propose_conclude":
             meeting_id = arguments["meeting_id"]
             await _post(f"/v1/meetings/{meeting_id}/propose-conclude", {})
-            return [TextContent(type="text", text=f"Conclusion proposed for meeting {meeting_id}. The moderator will decide.")]
+            return [TextContent(type="text", text=(
+                f"Conclusion proposed for meeting {meeting_id}. The moderator will "
+                f"decide in their turn. Your turn is over — stop now."
+            ))]
 
         elif name == "leave_meeting":
             meeting_id = arguments["meeting_id"]
             reason = arguments.get("reason", "")
             await _post(f"/v1/meetings/{meeting_id}/leave", {"reason": reason})
-            return [TextContent(type="text", text=f"You have left meeting {meeting_id}.")]
+            return [TextContent(type="text", text=(
+                f"You have left meeting {meeting_id}. Your turn is over — stop now."
+            ))]
 
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]

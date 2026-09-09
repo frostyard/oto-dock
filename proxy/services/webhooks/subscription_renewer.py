@@ -87,7 +87,10 @@ async def _renew_tick() -> None:
     """Find subscriptions due for renewal and process each."""
     now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     try:
-        rows = webhook_subscription_store.list_due_for_renewal(
+        # Periodic (300 s) store read → off the event loop (storage/pg.py rule).
+        from storage.pg import run_db
+        rows = await run_db(
+            webhook_subscription_store.list_due_for_renewal,
             now_iso, _RENEW_LEAD_TIME,
         )
     except Exception:

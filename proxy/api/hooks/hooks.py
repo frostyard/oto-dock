@@ -34,6 +34,7 @@ from pydantic import BaseModel
 import config
 from storage import database as task_store
 from auth.path_policy import (
+    EXTERNAL_DENIED_CLI_TOOLS,
     SecurityContext,
     check_tool_access,
     enforce_agent_tree_rbac,
@@ -59,6 +60,7 @@ from core.session.session_state import (
     push_pump_event,
     wait_for_location,
     get_meeting_session_info,
+    mark_meeting_turn_routed,
     get_subagent_registry,
     mark_subagent_done,
 )
@@ -302,6 +304,19 @@ async def resolve_path(req: ResolvePathRequest, authorization: str | None = Head
 # 403s on ANY denied resolution, so its sandbox-virtual carve-out is obsolete.)
 
 
+def _session_scope_root(ctx: SecurityContext, agent_dir: Path) -> Path:
+    """The session's own workspace on the host — the default save dir and
+    the anchor for relative paths: an external caller's tree, else the MOUNT
+    user's workspace, else the shared one."""
+    from core.session.external_identity import external_home_of
+    ext_home = external_home_of(ctx)
+    if ext_home:
+        return Path(ext_home) / "workspace"
+    if ctx.mount_username:
+        return agent_dir / "users" / ctx.mount_username / "workspace"
+    return agent_dir / "workspace"
+
+
 def _sandbox_to_host(sandbox_path: str, ctx: SecurityContext, agent_dir: Path) -> str:
     """Map a sandbox-internal path to a host-absolute path.
 
@@ -311,6 +326,27 @@ def _sandbox_to_host(sandbox_path: str, ctx: SecurityContext, agent_dir: Path) -
     username misdirected Shared-only sessions' paths into per-user dirs
     that their mode doesn't even mount (found live 2026-07-10)."""
     p = sandbox_path
+
+    # External caller with a private tree (SecurityContext.external_home):
+    # /caller, /.claude, /.codex and /context ARE that tree, and a viewer's
+    # /workspace redirects there too (the same asymmetry as the user viewer
+    # below). RBAC re-gates every result (check_host_path_access), so an
+    # editor/manager caller's /workspace still lands in the shared one.
+    from core.session.external_identity import external_home_of
+    ext_home = external_home_of(ctx)
+    if ext_home:
+        home = Path(ext_home)
+        if p == "/caller" or p.startswith("/caller/"):
+            rest = p[len("/caller"):].lstrip("/")
+            return str(home / rest) if rest else str(home)
+        if p.startswith("/.claude/") or p == "/.claude":
+            return str(home / ".claude" / p[9:])
+        if p.startswith("/.codex/") or p == "/.codex":
+            return str(home / ".codex" / p[8:])
+        if p.startswith("/context/") or p == "/context":
+            return str(home / "context" / p[9:])
+        if ctx.role == "viewer" and (p.startswith("/workspace/") or p == "/workspace"):
+            return str(home / "workspace" / p[11:])
 
     # /.claude/ → session's .claude/ dir
     if p.startswith("/.claude/") or p == "/.claude":
@@ -633,6 +669,10 @@ class HookRoute:
     meeting_agent: str = ""
     parent_session_id: str = ""
     is_meeting: bool = False
+    is_moderator: bool = False
+    # The meeting routing tool this turn already passed ("" = none): the
+    # turn-end backstop in ``_decide_tool_permission`` denies what follows.
+    routed_tool: str = ""
 
 
 def resolve_hook_route(session_id: str) -> HookRoute:
@@ -654,8 +694,105 @@ def resolve_hook_route(session_id: str) -> HookRoute:
             meeting_agent=info["agent_slug"],
             parent_session_id=info["parent_session_id"],
             is_meeting=True,
+            is_moderator=bool(info.get("is_moderator")),
+            routed_tool=info.get("routed_tool") or "",
         )
     return HookRoute(queue_session_id=session_id)
+
+
+# ---------------------------------------------------------------------------
+# Meeting turn-end backstop
+# ---------------------------------------------------------------------------
+
+# The meeting tools whose call ends the participant's turn. The orchestrator
+# routes only at the turn boundary (it reads ``direct_to`` from the finished
+# turn), so a participant that keeps calling tools after routing stalls the
+# meeting: nobody else speaks until its turn ends. Observed live 2026-09-09:
+# a moderator called direct_to, then spent 304 s / 27 API turns on data
+# tools and peeking at the addressed agent's sessions for the reply it was
+# waiting for — the participant never got a turn and the meeting ended
+# with no summary. The prompt rule ("direct_to is your LAST action") is
+# reinforced here structurally: once the hook has allowed a routing tool,
+# every later tool call in the same turn is denied with a reason that says
+# when the replies arrive. Deliberately minimal (operator decision
+# 2026-09-09): one rule, no denial counting, no interrupt — the prompts and
+# tool results carry the contract, this is only the floor under them.
+MEETING_ROUTING_TOOLS = frozenset(
+    {"direct_to", "end_meeting", "propose_conclude", "leave_meeting"}
+)
+# Same threshold as the orchestrator's thin-turn rule: below it the
+# end_meeting summary is expected AFTER the call (and is kept).
+_MEETING_SUMMARY_MIN_CHARS = 300
+
+
+def _meeting_tool_short_name(tool_name: str) -> str:
+    """``mcp__meetings-mcp__direct_to`` → ``direct_to`` ("" for other tools)."""
+    prefix = "mcp__meetings-mcp__"
+    return tool_name[len(prefix):] if tool_name.startswith(prefix) else ""
+
+
+def _meeting_turn_over_reason(route: HookRoute, text_chars: int) -> str:
+    routed = route.routed_tool
+    if routed == "direct_to":
+        return (
+            "Your meeting turn ended when you called direct_to. The agents "
+            "you addressed speak only after your response ends, and their "
+            "replies reach you in your next turn. Stop now: no more tools, "
+            "no more text."
+        )
+    if routed == "end_meeting":
+        if text_chars < _MEETING_SUMMARY_MIN_CHARS:
+            return (
+                "The meeting is concluded and this session closes when your "
+                "response ends. Write the meeting summary now as plain "
+                "response text, then stop. No more tools."
+            )
+        return (
+            "The meeting is concluded: the summary you wrote above is "
+            "the final message and this session closes when your "
+            "response ends. Stop now: no more tools, no more text."
+        )
+    return (
+        f"Your meeting turn is over after {routed}. Stop now: no more "
+        "tools, no more text."
+    )
+
+
+def _meeting_turn_end_backstop(
+    session_id: str, route: HookRoute, tool_name: str, tool_input: dict,
+) -> dict | None:
+    """Deny a meeting participant's tool call once its turn has routed.
+
+    Returns the deny decision, or None when the call is allowed. Also
+    RECORDS the routing tool when it is the one being allowed: the hook is
+    the only path that is serialized with the deny (the orchestrator sees
+    the tool's close event only at the next content block, and on a
+    satellite the event stream and the hook travel separately), and it
+    fires only for calls the CLI actually executes.
+    """
+    short = _meeting_tool_short_name(tool_name)
+    if short:
+        # A participant's end_meeting is refused by the API (moderator
+        # only) and routes nothing — it must not end the caller's turn.
+        if short in MEETING_ROUTING_TOOLS and (
+                short != "end_meeting" or route.is_moderator):
+            mark_meeting_turn_routed(session_id, short)
+        return None
+    if not route.routed_tool:
+        return None
+    if tool_name == "ToolSearch" and "meeting" in str(tool_input.get("query", "")).lower():
+        return None  # loading end_meeting's schema after direct_to
+    if tool_name.startswith("mcp__memory-mcp__"):
+        # Persisting what the meeting taught is quick, harmless and often
+        # the last thing a participant does — never in the way of routing.
+        return None
+    info = get_meeting_session_info(session_id) or {}
+    reason = _meeting_turn_over_reason(route, int(info.get("turn_text_chars", 0)))
+    logger.info(
+        f"Hook denied (meeting turn over after {route.routed_tool}): "
+        f"session={session_id[:8]}, agent={route.meeting_agent}, tool={tool_name}"
+    )
+    return {"decision": "deny", "reason": reason}
 
 
 async def resolve_hook_chat_id(session_id: str) -> str:
@@ -866,6 +1003,12 @@ async def _decide_tool_permission(
     carries Pass-1 side data (currently ``updated_input``) back to the
     wrapper without threading it through every mode-branch return."""
     tool_input = tool_input or {}
+    # Codex's hook names MCP tools with a sanitized server key
+    # (``mcp__meetings_mcp__direct_to``); everything below keys on the
+    # manifest's server name.
+    if tool_name.startswith("mcp__"):
+        from services.mcp.mcp_permissions import canonical_tool_name
+        tool_name = canonical_tool_name(tool_name)
     mode = get_session_mode(session_id)
     client_type = get_session_client_type(session_id)
 
@@ -890,6 +1033,14 @@ async def _decide_tool_permission(
     # Track hook activity so settle mode knows agents are still working
     record_hook_activity(session_id)
     logger.info(f"Hook permission: session={session_id}, tool={tool_name}, mode={mode}, client={client_type}")
+
+    # Meeting participants: a routed turn is over — deny what follows (and
+    # record the routing tool itself). Ahead of every other branch: no mode,
+    # tier or allow-memory may lift it.
+    if route.is_meeting:
+        over = _meeting_turn_end_backstop(session_id, route, tool_name, tool_input)
+        if over is not None:
+            return over
 
     # EnterPlanMode: always auto-approve (it's just a mode transition)
     if tool_name == "EnterPlanMode":
@@ -1007,6 +1158,21 @@ async def _decide_tool_permission(
         return {
             "decision": "deny",
             "reason": "Session is no longer active. Send a new message to continue.",
+        }
+    # External sessions (a phone caller who is not a platform user) never
+    # get a shell — the hook floor of that rule (the CLI argv and the
+    # settings deny list are the other two layers). Before the path gate and
+    # before every mode branch: no role, mode or allow-memory can lift it.
+    # The web tools are not floored; WebFetch goes through the SSRF gate in
+    # check_tool_access below like every other session.
+    if getattr(security_ctx, "principal", None) == "external" and tool_name in EXTERNAL_DENIED_CLI_TOOLS:
+        logger.warning(
+            f"Hook denied (external session, no shell): session={session_id}, "
+            f"tool={tool_name}, agent={security_ctx.agent}"
+        )
+        return {
+            "decision": "deny",
+            "reason": f"{tool_name} is not available on external routes.",
         }
     # Per-tool target revocation check. If an admin unpaired
     # the satellite while the session was running, tear down cleanly
@@ -1306,7 +1472,8 @@ async def ask_user_question(
     # Belt-and-braces: only interactive dashboard chats have a human to answer.
     # The config flag already keeps request_user_input off for autonomous runs;
     # decline empty here too so a task/phone/meeting session never hangs a turn.
-    if get_session_client_type(session_id) in ("task", "phone", "meeting", "trigger", "internal"):
+    from core.execution_layer import UNATTENDED_CLIENT_TYPES
+    if get_session_client_type(session_id) in UNATTENDED_CLIENT_TYPES:
         return {}
     route = resolve_hook_route(session_id)
     request_id = str(uuid.uuid4())
@@ -1697,11 +1864,9 @@ async def hook_ui(req: HookUiRequest, authorization: str | None = Header(None)):
     # MOUNT identity, not attribution: a Shared-only human chat keeps
     # ctx.username for attribution but works in the AGENT scope — its
     # artifacts belong in the shared workspace (same rule as the MCP
-    # framework's OTO_WORKSPACE_DIR injection).
-    scope_root = (
-        agent_dir / "users" / ctx.mount_username / "workspace"
-        if ctx.mount_username else agent_dir / "workspace"
-    )
+    # framework's OTO_WORKSPACE_DIR injection). An external caller's
+    # artifacts belong in THEIR tree.
+    scope_root = _session_scope_root(ctx, agent_dir)
     raw = req.save_path.strip()
     if not raw:
         raw = f"generated-ui/{_ui_slug(title)}-{secrets.token_hex(4)}.html"
@@ -1990,6 +2155,23 @@ async def hook_app_pin(req: HookAppPinRequest, authorization: str | None = Heade
         raise HTTPException(status_code=400, detail="invalid slug")
     rel = target.relative_to(agent_dir).as_posix()
 
+    # Satellite-side edits reach the platform tree only at turn boundaries.
+    # An html-less pin — the slug-only refresh after a native edit of
+    # apps/<slug>.html, or a re-pin over a hard-unpinned file — must serve
+    # the satellite's CURRENT bytes, so read the file through first (the
+    # display hooks' path: probe + pull under the per-path lock; a failed
+    # pull leaves today's platform copy). A pin WITH html is authoritative
+    # and never pulls (it pushes instead, below).
+    if not req.html.strip():
+        from core.remote import remote_file_flow
+        if remote_file_flow.is_remote_session(req.session_id):
+            pulled = await remote_file_flow.pull_through(req.session_id, rel)
+            logger.info(
+                "Hook app pin: html-less pin on a remote session — read %s "
+                "through from the satellite (%s)",
+                rel, "ok" if pulled is not None else "platform copy kept",
+            )
+
     existing = await asyncio.to_thread(task_store.get_app_by_slug, ctx.agent, username, slug)
     if existing is not None:
         # Slugs share one namespace per (agent, caller scope): a slug held by
@@ -2252,10 +2434,7 @@ def _file_pin_candidates(ctx, path: str) -> list[str]:
     if not p or "\x00" in p:
         raise HTTPException(status_code=400, detail="path is required")
     candidates: list[str] = []
-    scope_root = (
-        agent_dir / "users" / ctx.mount_username / "workspace"
-        if ctx.mount_username else agent_dir / "workspace"
-    )
+    scope_root = _session_scope_root(ctx, agent_dir)
     for base in (scope_root, agent_dir):
         if base is agent_dir and p.split("/", 1)[0] not in (
                 "workspace", "users", "knowledge"):

@@ -128,6 +128,29 @@ class TestFailsafe:
             time.sleep(0.02)
         assert fired == [3]
 
+    @pytest.mark.parametrize("drained", [True, False])
+    def test_flushes_logging_only_when_the_log_writer_drained(self, monkeypatch,
+                                                              drained):
+        """A wedged writer holds the file handler's lock — logging.shutdown()
+        would block on it and the hard exit would never happen."""
+        from core import log_queue
+        calls: list[str] = []
+        monkeypatch.setattr(startup, "_ARM_EXIT_FAILSAFE", True)
+        monkeypatch.setattr(startup, "_EXIT_FAILSAFE_GRACE_S", 0.05)
+        monkeypatch.setattr(os, "_exit", lambda code: calls.append(f"exit:{code}"))
+        monkeypatch.setattr(startup.logging, "shutdown",
+                            lambda: calls.append("shutdown"))
+        monkeypatch.setattr(log_queue, "drain",
+                            lambda timeout_s: (calls.append(f"drain:{timeout_s}"),
+                                               drained)[1])
+
+        startup._arm_exit_failsafe()
+        deadline = time.monotonic() + 2.0
+        while not any(c.startswith("exit") for c in calls) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        expected = ["drain:2.0", "shutdown", "exit:3"] if drained else ["drain:2.0", "exit:3"]
+        assert calls == expected
+
     def test_flag_off_arms_nothing(self, monkeypatch):
         armed: list = []
         monkeypatch.setattr(startup, "_ARM_EXIT_FAILSAFE", False)

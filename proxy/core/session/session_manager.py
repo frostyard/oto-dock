@@ -47,6 +47,28 @@ def _get_remote_layer() -> "RemoteExecutionLayer":
     return _remote_layer
 
 
+def is_session_registered(session_id: str) -> bool:
+    """True while ``session_id`` is a LIVE session in some execution layer's
+    registry (cli / codex / direct / remote). This — not the persisted
+    security context — is the liveness a session-scoped token is checked
+    against (``middleware.external_session_confinement``): the registries
+    are populated at spawn and popped at close, so a token lifted from a
+    session is dead the moment the session ends."""
+    if not session_id:
+        return False
+    from core.layers.cli.session import _persistent_sessions
+    from core.layers.codex.session import _codex_sessions
+    from core.layers.direct.session import _direct_sessions
+    if (
+        session_id in _persistent_sessions
+        or session_id in _codex_sessions
+        or session_id in _direct_sessions
+    ):
+        return True
+    remote = _remote_layer
+    return bool(remote is not None and session_id in getattr(remote, "_sessions", {}))
+
+
 # ---------------------------------------------------------------------------
 # SessionManager
 # ---------------------------------------------------------------------------

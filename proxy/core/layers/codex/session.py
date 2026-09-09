@@ -27,7 +27,9 @@ import config as app_config
 from core.events.bg_command_state import (
     get_bg_command_registry, reset_bg_command_registry,
 )
-from core.layers.codex.app_server_client import AppServerClient, AppServerError
+from core.layers.codex.app_server_client import (
+    AppServerClient, AppServerError, wait_for_mcp_startup,
+)
 from core.layers.codex.codex_approvals import (
     approval_for_sandbox, build_sandbox_policy, make_server_request_handler,
 )
@@ -51,15 +53,21 @@ logger = logging.getLogger("codex-session")
 _QUESTION_PARK_TIMEOUT_MULT = 2
 
 # Bounded warm-gate for MCP startup before the first turn (the analog of the
-# CLI's _wait_for_init). app-server emits mcpServer/startupStatus/updated per
-# configured server; we wait for startup to go quiet, capped, then proceed.
-# Lean-start: quiescence trimmed 1.5s→0.5s. The daemon stays warm for
-# the whole session and `thread/start` returns before MCPs finish, so the gate
-# is only a first-turn nicety; a shorter silence threshold shaves ~1s off cold
-# first-token. Keep in lock-step with the satellite twin
-# (satellite/codex_session.py).
-_WARM_QUIESCENCE_S = 0.5
+# CLI's _wait_for_init): ``app_server_client.wait_for_mcp_startup`` — shared
+# with the satellite twin — waits until every server this session configured
+# has a terminal startup status (see its docstring for why leaving early costs
+# a turn's tools AND every prefix cache). ``thread/start`` returns before MCPs
+# finish and the dashboard warms the session while the user types, so the wait
+# mostly overlaps typing. The caps bound a server that hangs past Codex's own
+# startup_timeout_sec: 15 s on hosted models; 90 s on a local model, where a
+# changed tool list means minutes of re-prefill (covers the remote MCP startup
+# floor of 60 s; the remote start ack budget allows for it, and it stays under
+# the platform's 90 s one-shot warmup wait). The policy constants live here and
+# in satellite/sessions/codex_session.py — keep them in lock-step.
+_WARM_POLL_S = 0.5
 _WARM_CAP_S = 15.0
+_WARM_CAP_LOCAL_MODEL_S = 90.0
+_WARM_NO_STATUS_S = 5.0
 
 
 @dataclass
@@ -92,6 +100,9 @@ class CodexAppServerSession:
         thread_id: str | None = None,
         system_prompt: str = "",
         user_role: str = "",
+        mcp_server_names: list[str] | None = None,
+        local_model: bool = False,
+        hooks_floor: bool = False,
     ):
         self.session_id = session_id
         self.agent_name = agent_name
@@ -104,6 +115,26 @@ class CodexAppServerSession:
         self.effort = effort
         self.system_prompt = system_prompt
         self.user_role = user_role
+        # The [mcp_servers.*] this session's config.toml declares (the warm
+        # gate waits for each) and whether the model is a local endpoint (the
+        # longer warm cap).
+        self.mcp_server_names: list[str] = list(mcp_server_names or [])
+        self.local_model = local_model
+        # Unattended sessions (task / phone / meeting / trigger / internal):
+        # run the PreToolUse permission_gate floor under the app-server. With
+        # `approvalPolicy: never` + full access the JSON-RPC approval bridge
+        # never fires (Codex auto-approves MCP calls itself), so the hook is
+        # the ONLY gate — decide_tool_permission does not wait for a human on
+        # these client types (critical-tier MCP tools and the external floor
+        # deny-and-inform, everything else is allowed); the one exception is
+        # a meeting participant, which inherits the parent chat's mode and
+        # may wait on that human exactly as a Claude participant does. Trust rides
+        # thread/start.config (bypass_hook_trust); the gate emits JSON only
+        # to deny (OTO_HOOK_DENY_ONLY) and the PostToolUse forwarder stays
+        # quiet (OTO_HOOK_NO_FORWARD — the JSON-RPC stream already carries
+        # tool results). Attended sessions keep the bridge (a hook there
+        # would block-and-wait twice).
+        self.hooks_floor = hooks_floor
 
         # Thread persistence: pre-populated for resume; captured on thread/start.
         self.thread_id: str | None = thread_id
@@ -155,7 +186,19 @@ class CodexAppServerSession:
         )
 
     async def start(self) -> None:
-        """Spawn the daemon, initialize, open/resume the thread, warm MCPs."""
+        """Spawn the daemon, initialize, open/resume the thread, warm MCPs.
+
+        Holds the session lock (the one the layer wraps every turn in): the
+        warm gate is the daemon queue's sole consumer until the router starts,
+        so a turn that began meanwhile — a chat message whose revival wait
+        outlived a long local-model warm-up — would lose its events. The
+        in-turn re-warm (``send_message``) already runs under that lock and
+        calls ``_start_locked`` directly.
+        """
+        async with self.lock:
+            await self._start_locked()
+
+    async def _start_locked(self) -> None:
         if self._started:
             return
         self._started = True
@@ -227,9 +270,10 @@ class CodexAppServerSession:
             raise RuntimeError(f"CodexAppServerSession {self.session_id} is closed")
         if not self.is_alive:
             # Daemon died between turns — re-warm + resume (mirror CLI cli_dead).
+            # The layer holds self.lock for the turn, so take the lock-free path.
             logger.info(f"Codex [{self.session_id[:8]}] daemon dead; re-warming")
             self._started = False
-            await self.start()
+            await self._start_locked()
 
         if inject_time:
             user_tz = get_session_user_tz(self.session_id)
@@ -604,6 +648,13 @@ class CodexAppServerSession:
             overrides["effort"] = self.effort
         if self.working_dir:
             overrides["cwd"] = self.working_dir
+        if self.hooks_floor:
+            # Codex runs a user-layer hooks.json only when trusted; the
+            # app-server has no CLI flag for it (the TUI's
+            # --dangerously-bypass-hook-trust), the per-thread `config` map
+            # is the switch (codex-rs app-server/src/config_manager.rs). The
+            # platform wrote the hook it is trusting.
+            overrides["config"] = {"bypass_hook_trust": True}
         return overrides
 
     async def _connect_with_retry(self, env: dict, cwd: str | None) -> None:
@@ -874,34 +925,33 @@ class CodexAppServerSession:
             )
 
     async def _warm_mcps(self) -> None:
-        """Best-effort wait for configured MCP servers to finish starting.
-
-        app-server emits ``mcpServer/startupStatus/updated {name, status}``.
-        We drain pre-turn notifications until startup goes quiet (no update for
-        ``_WARM_QUIESCENCE_S``) or the cap, logging readiness. Anything else
-        seen here is pre-turn noise (thread/started, status changes) and dropped.
-        """
+        """Wait for the session's MCP servers (``mcp_server_names``, the
+        ``[mcp_servers.*]`` this session wrote) to finish starting before the
+        first turn — ``wait_for_mcp_startup``, with the local-model cap when
+        the session runs on a local endpoint. Runs while the gate is the sole
+        consumer of the daemon's queue (``start`` holds the session lock)."""
         if self._client is None:
             return
-        q = self._client.notif_queue
-        statuses: dict[str, str] = {}
-        deadline = time.monotonic() + _WARM_CAP_S
-        while time.monotonic() < deadline:
-            try:
-                method, params = await asyncio.wait_for(q.get(), timeout=_WARM_QUIESCENCE_S)
-            except asyncio.TimeoutError:
-                break  # quiet → assume warm
-            if method == "__daemon_exit__":
-                logger.warning(f"Codex [{self.session_id[:8]}] daemon exited during warm-up")
-                return
-            if method == "mcpServer/startupStatus/updated":
-                name = params.get("name", "?")
-                statuses[name] = params.get("status", "?")
-        ready = [n for n, s in statuses.items() if s not in ("starting", "failed")]
-        failed = [n for n, s in statuses.items() if s == "failed"]
-        logger.info(
-            f"Codex [{self.session_id[:8]}] MCP warm-up: ready={ready} failed={failed}"
+        cap = _WARM_CAP_LOCAL_MODEL_S if self.local_model else _WARM_CAP_S
+        res = await wait_for_mcp_startup(
+            self._client, self.mcp_server_names, cap_s=cap,
+            poll_s=_WARM_POLL_S, no_status_grace_s=_WARM_NO_STATUS_S,
         )
+        if res.daemon_exited:
+            logger.warning(f"Codex [{self.session_id[:8]}] daemon exited during warm-up")
+            return
+        extra = f" unexpected={res.unexpected}" if res.unexpected else ""
+        if res.pending:
+            logger.warning(
+                f"Codex [{self.session_id[:8]}] MCP warm-up hit the {cap:.0f}s cap "
+                f"after {res.elapsed:.1f}s: still starting={res.pending} "
+                f"ready={res.ready} failed={res.failed}{extra}"
+            )
+        else:
+            logger.info(
+                f"Codex [{self.session_id[:8]}] MCP warm-up done in {res.elapsed:.1f}s: "
+                f"ready={res.ready} failed={res.failed}{extra}"
+            )
 
     def _build_env(self) -> dict[str, str]:
         """Environment for the app-server daemon (mirrors the old exec path)."""
@@ -920,6 +970,13 @@ class CodexAppServerSession:
         if codex_dir and codex_dir not in env.get("PATH", ""):
             env["PATH"] = codex_dir + ":" + env.get("PATH", "/usr/bin:/bin")
         env.update(self.extra_env)  # subscription auth (CODEX_HOME, etc.)
+        if self.hooks_floor:
+            # Codex's PreToolUse hook rejects permissionDecision:"allow" —
+            # permission_gate.py emits JSON only to DENY; and the PostToolUse
+            # forwarder would double every tool card the JSON-RPC stream
+            # already renders, so it exits early. Hooks inherit this env.
+            env["OTO_HOOK_DENY_ONLY"] = "1"
+            env["OTO_HOOK_NO_FORWARD"] = "1"
         return env
 
 
@@ -956,6 +1013,9 @@ async def create_codex_session(
     thread_id: str | None = None,
     user_role: str = "",
     system_prompt: str = "",
+    mcp_server_names: list[str] | None = None,
+    local_model: bool = False,
+    hooks_floor: bool = False,
 ) -> CodexAppServerSession:
     """Create, register, and **start** a Codex app-server session."""
     session = CodexAppServerSession(
@@ -971,6 +1031,9 @@ async def create_codex_session(
         thread_id=thread_id,
         user_role=user_role,
         system_prompt=system_prompt,
+        mcp_server_names=mcp_server_names,
+        local_model=local_model,
+        hooks_floor=hooks_floor,
     )
     async with _codex_sessions_lock:
         _codex_sessions[session_id] = session

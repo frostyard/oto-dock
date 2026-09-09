@@ -154,7 +154,7 @@ class ServerNotificationController:
             # Kill the session and skip the turn — the client already got `aborted`.
             if self._warmup_abort_chat == kick_cid:
                 self._warmup_abort_chat = None
-                _k_layer = self.layer if kick_cid == self.chat_id else self._resolve_layer_for_chat(kick_cid)
+                _k_layer = self.layer if kick_cid == self.chat_id else await self._resolve_layer_for_chat_async(kick_cid)
                 if _k_layer and kick_sid:
                     try:
                         await _k_layer.abort(kick_sid)
@@ -211,7 +211,7 @@ class ServerNotificationController:
             if nudge_chat_id == self.chat_id:
                 await self._send({"type": "bg_agents_complete", "count": count})
             # Drive the review turn on the originating chat (headless if unviewed).
-            nudge_layer = self.layer if nudge_chat_id == self.chat_id else self._resolve_layer_for_chat(nudge_chat_id)
+            nudge_layer = self.layer if nudge_chat_id == self.chat_id else await self._resolve_layer_for_chat_async(nudge_chat_id)
             await self._run_server_turn(
                 nudge,
                 target_session_id=nudge_sid,
@@ -239,7 +239,7 @@ class ServerNotificationController:
             # path is the reliable clear, exactly like bg_nudge → bg_agents_complete.
             if nudge_chat_id == self.chat_id:
                 await self._send({"type": "bg_commands_complete", "count": count})
-            nudge_layer = self.layer if nudge_chat_id == self.chat_id else self._resolve_layer_for_chat(nudge_chat_id)
+            nudge_layer = self.layer if nudge_chat_id == self.chat_id else await self._resolve_layer_for_chat_async(nudge_chat_id)
             await self._run_server_turn(
                 nudge,
                 target_session_id=nudge_sid,
@@ -313,7 +313,7 @@ class ServerNotificationController:
                     "status": result_status,
                 })
             # Drive the synthesis turn on the delegating chat (headless if unviewed).
-            res_layer = self.layer if res_chat_id == self.chat_id else self._resolve_layer_for_chat(res_chat_id)
+            res_layer = self.layer if res_chat_id == self.chat_id else await self._resolve_layer_for_chat_async(res_chat_id)
             turn_pump = await self._run_server_turn(
                 result_prompt,
                 target_session_id=res_sid,
@@ -348,7 +348,7 @@ class ServerNotificationController:
                         "prompt": wake_prompt,
                         "task_id": notification.get("task_id", ""),
                     }))
-            wake_layer = self.layer if wake_chat_id == self.chat_id else self._resolve_layer_for_chat(wake_chat_id)
+            wake_layer = self.layer if wake_chat_id == self.chat_id else await self._resolve_layer_for_chat_async(wake_chat_id)
             await self._run_server_turn(
                 wake_prompt,
                 target_session_id=wake_sid,
@@ -419,11 +419,12 @@ class ServerNotificationController:
         viewed attributes) so attachments save to the right workspace, then
         drives the turn into wcid's pump + DB. The prompt was already persisted
         at send-time (_persist_first_prompt)."""
-        rec = task_store.get_chat(wcid)
+        from storage.pg import run_db
+        rec = await run_db(task_store.get_chat, wcid)
         if not rec:
             return
         k_agent = rec.get("agent") or ""
-        k_layer = self._resolve_layer_for_chat(wcid)
+        k_layer = await self._resolve_layer_for_chat_async(wcid)
         if not k_layer:
             logger.warning(
                 f"WS dashboard: headless server-kick for chat {wcid} could not "

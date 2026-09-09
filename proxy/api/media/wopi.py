@@ -10,6 +10,7 @@ that is scoped to a specific file, user, agent, and permission level.
 import base64
 import contextlib
 import logging
+import os
 import time
 import urllib.parse
 from pathlib import Path
@@ -21,6 +22,7 @@ from pydantic import BaseModel
 
 import config
 from auth.providers import get_current_user, require_auth, UserContext
+from services.infra.path_confinement import PathOutsideRoot, resolve_under, safe_agent_dir
 
 logger = logging.getLogger("claude-proxy")
 router = APIRouter(tags=["wopi"])
@@ -467,16 +469,18 @@ async def generate_wopi_url(
     if not user.can_access_agent(req.agent):
         raise HTTPException(status_code=403, detail="No access to agent")
 
-    # Resolve full path
-    full_path = (config.AGENTS_DIR / req.agent / req.file_path).resolve()
-    agent_root = (config.AGENTS_DIR / req.agent).resolve()
-    workspace = (agent_root / "workspace").resolve()
-    users_dir = (agent_root / "users").resolve()
+    # Resolve full path. The agent name is a request field too — an admin
+    # passes can_access_agent for any string — so confine it to the agents
+    # tree before the file path is confined to the agent.
+    try:
+        agent_root = Path(os.path.realpath(safe_agent_dir(req.agent)))
+        full_path = resolve_under(agent_root / req.file_path, agent_root)
+    except PathOutsideRoot:
+        raise HTTPException(status_code=403, detail="Path must be within agent workspace or users directory")
+    agent_rel = full_path.relative_to(agent_root).as_posix()
 
     # Security: must be within agent workspace or users directory
-    def _within(p, root):
-        return p == root or p.is_relative_to(root)
-    if not (_within(full_path, workspace) or _within(full_path, users_dir)):
+    if agent_rel.split("/", 1)[0] not in ("workspace", "users"):
         raise HTTPException(status_code=403, detail="Path must be within agent workspace or users directory")
 
     if not full_path.is_file():
@@ -489,7 +493,6 @@ async def generate_wopi_url(
     if user.acting_sub is not None:
         from api.agents.agents import _check_file_role
         from storage import database as _db
-        agent_rel = full_path.relative_to(agent_root).as_posix()
         _check_file_role(
             agent_rel, user.get_agent_role(req.agent), writing=False,
             username=_db.get_username_by_sub(user.sub) or "",

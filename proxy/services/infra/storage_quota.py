@@ -81,6 +81,16 @@ def user_scope_dir(agent_slug: str, username: str) -> Path:
     return config.get_agent_dir(agent_slug) / "users" / username
 
 
+def external_scope_key(agent_slug: str) -> str:
+    return f"external:{agent_slug}"
+
+
+def external_scope_dir(agent_slug: str) -> Path:
+    """The external callers' trees (``externals/``) — one bucket per agent,
+    separate from the shared one so a caller cannot fill it."""
+    return config.get_agent_dir(agent_slug) / "externals"
+
+
 @dataclass(frozen=True)
 class QuotaScope:
     """One quota bucket: its identity, the dirs it governs, and notify routing."""
@@ -116,6 +126,14 @@ def iter_scopes() -> list[QuotaScope]:
             username=None,
             dirs=tuple(shared_scope_dirs(slug)),
         ))
+        if external_scope_dir(slug).is_dir():
+            scopes.append(QuotaScope(
+                scope_key=external_scope_key(slug),
+                scope_type="external",
+                agent_slug=slug,
+                username=None,
+                dirs=(external_scope_dir(slug),),
+            ))
         if is_shared_only(slug):
             continue  # no per-user dirs for a Shared-only agent
         for u in database.get_agent_users_with_profile(slug):
@@ -165,6 +183,9 @@ def limits_for(scope_type: str) -> tuple[int, int]:
     if scope_type == "shared":
         mb = _setting_mb("quota_shared_folder_mb", config.QUOTA_SHARED_FOLDER_MB_DEFAULT)
         inodes = _setting_inodes("quota_shared_folder_inodes", config.QUOTA_SHARED_FOLDER_INODES_DEFAULT)
+    elif scope_type == "external":
+        mb = _setting_mb("quota_external_folder_mb", config.QUOTA_EXTERNAL_FOLDER_MB_DEFAULT)
+        inodes = _setting_inodes("quota_user_folder_inodes", config.QUOTA_USER_FOLDER_INODES_DEFAULT)
     else:
         mb = _setting_mb("quota_user_folder_mb", config.QUOTA_USER_FOLDER_MB_DEFAULT)
         inodes = _setting_inodes("quota_user_folder_inodes", config.QUOTA_USER_FOLDER_INODES_DEFAULT)
@@ -285,6 +306,9 @@ def ensure_scope(agent_slug: str, scope_type: str, username: str | None = None) 
             return None
         scope_key = user_scope_key(agent_slug, username)
         dirs = [user_scope_dir(agent_slug, username)]
+    elif scope_type == "external":
+        scope_key = external_scope_key(agent_slug)
+        dirs = [external_scope_dir(agent_slug)]
     else:
         raise ValueError(f"unknown scope_type {scope_type!r}")
 

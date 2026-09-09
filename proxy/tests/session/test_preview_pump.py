@@ -55,6 +55,8 @@ async def test_intra_turn_supersede_deletes_replaced_snapshot(temp_db, monkeypat
     try:
         await pump._handle_perm_event(_preview_item("f1", "snap-a", 1))
         await pump._handle_perm_event(_preview_item("f1", "snap-b", 2))
+        from core.events import chat_writer
+        assert await chat_writer.drain("pv1", timeout=5)  # the delete is a writer job
         assert deleted == [("pv1", "snap-a")]
         # One buffered preview per file, carrying the newest identity.
         assert pump._pending_previews["f1"]["snapshot_id"] == "snap-b"
@@ -107,6 +109,8 @@ async def test_flush_forwards_and_persists_snapshot_identity(temp_db, monkeypatc
         assert len(preview_frames) == 1
         assert preview_frames[0]["snapshot_id"] == "snap-live"
         assert preview_frames[0]["generation"] == 7
+        from core.events import chat_writer
+        assert await chat_writer.drain("pv3", timeout=5)  # the save is a writer job
         # Persisted row carries it too (the frozen block's history source)...
         assert task_store.get_referenced_preview_snapshot_ids("pv3") == {"snap-live"}
         event = task_store.get_preview_event_by_snapshot("pv3", "snap-live")

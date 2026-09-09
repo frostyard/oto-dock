@@ -9,15 +9,17 @@ import {
   usePhoneRoutes, useCreatePhoneRoute, useUpdatePhoneRoute, useDeletePhoneRoute,
   useSetRoutePin, useDeleteRoutePin,
   usePhoneServers, useCreatePhoneServer,
-  usePhoneSettings, useSavePhoneSettings,
+  usePhoneSettings, useSavePhoneSettings, useRouteMcpPreview,
+  useExternalData, useSaveExternalData, useForgetExternalData,
   type PhoneRoute, type PhoneRouteCreate, type PhoneServerCreate, type RouteMode,
 } from '../../api/phone'
+import { formatBytes } from './PlatformPage.shared'
 import CallLogModal from '../../components/phone/CallLogModal'
 import {
   useAudioProviders, type AudioProvider,
   useTurnClassifier,
 } from '../../api/audio'
-import { useAgents } from '../../api/agents'
+import { useAgents, useAgentUsers } from '../../api/agents'
 import { useTriggers, useCreateTrigger } from '../../api/triggers'
 import { SectionCard, SettingRow, Toggle, Badge, SavedBadge } from '../../components/ui/SettingsControls'
 import { PhoneServerPill } from '../../components/phone/PhoneServerPill'
@@ -139,6 +141,7 @@ const EMPTY_ROUTE: PhoneRouteCreate = {
   background_sound: 'off',
   enabled: true, audiosocket_uuid: null, did: '', ami_caller_id: '', ami_outbound_context: '', dial_prefix: '',
   trigger_slug: null,
+  identity_mode: 'caller', identity_user_sub: null, remember_callers: true,
 }
 
 // Per-route filler toggle: the wire value is 'on'/'off' (RouteMode), the
@@ -151,6 +154,46 @@ function ModeToggle({ value, onChange }: { value: RouteMode; onChange: (v: Route
 // PIN travels only through its dedicated write-only endpoints, never in the
 // route payload).
 export type PinIntent = { dirty: boolean; enabled: boolean; value: string }
+
+// Who the caller IS on a route (docs/PHONE-CONFIG.md "Route identity and
+// role"). `caller` never reaches a user's session (on a Shared-only agent it
+// is simply the agent's shared space with no per-caller memory) and always
+// runs as a viewer of the shared space; `user` runs the tied user's own
+// session and is the mode that needs a PIN.
+const IDENTITY_OPTIONS: { value: PhoneRoute['identity_mode']; label: string; hint: string }[] = [
+  { value: 'caller', label: 'Per caller (recommended)', hint: 'Every phone number gets its own private notes and files where the agent has personal spaces; nothing a caller says reaches another caller or the team\'s shared memory. Callers read the agent\'s shared files as viewers and change nothing. On a shared-only agent, callers work in the shared space with no per-caller memory.' },
+  { value: 'user', label: 'A platform user', hint: 'Calls run as that user\'s own session — their memory, schedules, meetings and delegation, capped at manager rights.' },
+]
+
+const IDENTITY_LABEL: Record<PhoneRoute['identity_mode'], string> = {
+  caller: 'per caller', shared: 'shared', user: 'user',
+}
+
+// "Available on this line / Not on calls" — the same resolver the live
+// session uses, minus processes. Re-fetched as the agent or mode changes.
+function McpPreview({ agent, identityMode }: { agent: string; identityMode: PhoneRoute['identity_mode'] }) {
+  const { data, isLoading, isError } = useRouteMcpPreview(agent, identityMode)
+  if (!agent) return null
+  if (isError) return null
+  if (isLoading || !data) return <p className="text-xs text-p-text-light">Checking the tools on this line…</p>
+  const name = (m: { name: string; label: string }) => m.label || m.name
+  return (
+    <div className="text-xs space-y-0.5" data-testid="route-mcp-preview">
+      <p className="text-p-text-secondary">
+        <span className="font-medium">Available on this line:</span>{' '}
+        {data.attached.length ? data.attached.map(name).join(', ') : 'no MCP tools'}
+      </p>
+      {data.excluded.length > 0 && (
+        <p className="text-p-text-light">
+          <span className="font-medium">Not on calls:</span>{' '}
+          {data.excluded.map((m, i) => (
+            <span key={m.name} title={m.reason}>{i > 0 ? ', ' : ''}{name(m)}</span>
+          ))}
+        </p>
+      )}
+    </div>
+  )
+}
 
 function RouteModal({
   route, agents, languages, servers, providers, onSave, onClose, saving,
@@ -167,6 +210,14 @@ function RouteModal({
   const [form, setForm] = useState(route)
   const selectedServerAdapter = servers.find(sv => sv.id === form.phone_server_id)?.adapter_type
   const set = (field: string, value: unknown) => setForm(prev => ({ ...prev, [field]: value }))
+  // Candidates for a user-tied route: the users attached to the agent (a
+  // platform admin qualifies too — the server accepts any admin sub; the
+  // currently tied sub stays selectable while editing).
+  const { data: agentUsers } = useAgentUsers(form.identity_mode === 'user' ? form.agent : '')
+  const userChoices = (agentUsers || []).slice()
+  if (form.identity_user_sub && !userChoices.some(u => u.sub === form.identity_user_sub)) {
+    userChoices.push({ sub: form.identity_user_sub, name: form.identity_user_sub, email: '', role: '' })
+  }
   // PIN state lives OUTSIDE `form`: the value must never ride the route
   // payload, and extra keys would false-positive the dirty-close guard.
   const hasPin = !!route.pin_configured
@@ -197,7 +248,8 @@ function RouteModal({
     )
   }
 
-  const canSave = !saving && !!form.agent && !!form.phone_server_id && pinValid
+  const identityValid = form.identity_mode !== 'user' || !!form.identity_user_sub
+  const canSave = !saving && !!form.agent && !!form.phone_server_id && pinValid && identityValid
 
   // Backdrop click closes the modal; unsaved edits get a confirm first.
   const dirty = JSON.stringify(form) !== JSON.stringify(route) || pinDirty
@@ -259,6 +311,46 @@ function RouteModal({
               {servers.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
             </select>
             {servers.length === 0 && <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">Add a phone server first (Servers section).</p>}
+          </div>
+
+          <div className="border border-p-border-light rounded-lg p-3 space-y-3">
+            <div>
+              <span className="text-sm font-medium text-p-text">Caller identity</span>
+              <p className="text-xs text-p-text-light mt-0.5">Who the agent is talking to on this line, and what the call may touch.</p>
+            </div>
+            <div className="space-y-1.5" role="radiogroup" aria-label="Caller identity">
+              {IDENTITY_OPTIONS.map(o => (
+                <label key={o.value} className="flex items-start gap-2 text-sm text-p-text cursor-pointer">
+                  <input type="radio" name="identity_mode" value={o.value} checked={form.identity_mode === o.value}
+                    onChange={() => set('identity_mode', o.value)} className="mt-0.5" />
+                  <span>
+                    <span className="font-medium">{o.label}</span>
+                    <span className="block text-xs text-p-text-light">{o.hint}</span>
+                  </span>
+                </label>
+              ))}
+            </div>
+            {form.identity_mode === 'user' ? (
+              <div>
+                <label className="block text-xs font-medium text-p-text mb-1">Platform user</label>
+                <select value={form.identity_user_sub ?? ''} onChange={e => set('identity_user_sub', e.target.value || null)}
+                  aria-label="Platform user"
+                  className="w-full px-2.5 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text">
+                  <option value="">— Select user —</option>
+                  {userChoices.map(u => <option key={u.sub} value={u.sub}>{u.name || u.email || u.sub}{u.role ? ` (${u.role})` : ''}</option>)}
+                </select>
+                <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">
+                  {form.direction === 'inbound'
+                    ? 'Require a PIN below — without one, anyone who dials this number acts as that user.'
+                    : 'Whoever answers an outbound call on this route acts as that user.'}
+                </p>
+              </div>
+            ) : (
+              <SettingRow label="Remember callers" description="Keep each caller's notes between calls">
+                <Toggle checked={form.remember_callers} onChange={v => set('remember_callers', v)} />
+              </SettingRow>
+            )}
+            <McpPreview agent={form.agent} identityMode={form.identity_mode} />
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -481,6 +573,14 @@ function RoutesSection() {
   // The PIN rides its own write-only endpoints AFTER the route saves (on
   // create the id only exists then). A PIN failure is loud — the route
   // itself saved fine, but the admin must know the gate isn't armed.
+  // Server-computed identity advisories (a user-tied line without a PIN, a
+  // Codex agent on an external route, …) ride the save / PIN responses —
+  // shown once, loudly; the routes table keeps the marker.
+  const showWarnings = (res: { warnings?: string[] } | undefined, prefix: string) => {
+    const w = res?.warnings ?? []
+    if (w.length) alert(`${prefix}\n\n${w.map(x => `• ${x}`).join('\n')}`)
+  }
+
   const applyPin = (routeId: string, pin: PinIntent, hadPin: boolean) => {
     if (!pin.dirty) return
     if (pin.enabled && pin.value) {
@@ -489,18 +589,27 @@ function RoutesSection() {
       })
     } else if (!pin.enabled && hadPin) {
       delPinMut.mutate(routeId, {
+        onSuccess: (res) => showWarnings(res, 'PIN removed. Please note:'),
         onError: (e) => alert(`Route saved, but removing the PIN failed: ${(e as Error).message}`),
       })
     }
   }
 
   const handleSave = (data: PhoneRouteCreate & { id?: string; pin_configured?: boolean }, pin: PinIntent) => {
-    // pin_configured is a server-computed flag — never send it back.
+    // pin_configured + warnings are server-computed — never send them back.
     const { id, pin_configured, ...rest } = data
+    delete (rest as { warnings?: string[] }).warnings
     const hadPin = !!pin_configured
+    // A PIN being set in the same save answers the "no PIN" advisory.
+    const settingPin = pin.dirty && pin.enabled && !!pin.value
+    const filterPinNote = (res: { warnings?: string[] } | undefined) =>
+      settingPin ? { warnings: (res?.warnings ?? []).filter(w => !w.includes('no PIN')) } : res
     if (id) {
       updateMut.mutate({ id, data: rest }, {
-        onSuccess: () => { applyPin(id, pin, hadPin); setEditRoute(null) },
+        onSuccess: (res) => {
+          applyPin(id, pin, hadPin); setEditRoute(null)
+          showWarnings(filterPinNote(res), 'Route saved. Please note:')
+        },
         onError: (e) => alert((e as Error).message),
       })
     } else {
@@ -509,6 +618,7 @@ function RoutesSection() {
           if (created?.id) applyPin(created.id, pin, false)
           setEditRoute(null)
           if (created?.provisioning_instructions) alert(created.provisioning_instructions)
+          showWarnings(filterPinNote(created), 'Route created. Please note:')
         },
         onError: (e) => alert((e as Error).message),
       })
@@ -530,13 +640,14 @@ function RoutesSection() {
         // overflow-x-auto (not hidden): the 8-column table is wider than a
         // phone screen — let the admin scroll to the Actions column
         <div className="border border-p-border-light rounded-lg overflow-x-auto">
-          <table className="w-full min-w-[640px] text-sm">
+          <table className="w-full min-w-[760px] text-sm">
             <thead className="bg-gray-50 dark:bg-gray-800/50">
               <tr>
                 <th className="text-left px-3 py-2 font-medium text-p-text-secondary">Name</th>
                 <th className="text-left px-3 py-2 font-medium text-p-text-secondary">Direction</th>
                 <th className="text-left px-3 py-2 font-medium text-p-text-secondary">DID</th>
                 <th className="text-left px-3 py-2 font-medium text-p-text-secondary">Agent</th>
+                <th className="text-left px-3 py-2 font-medium text-p-text-secondary">Identity</th>
                 <th className="text-left px-3 py-2 font-medium text-p-text-secondary">Language</th>
                 <th className="text-left px-3 py-2 font-medium text-p-text-secondary">Trigger</th>
                 <th className="text-center px-3 py-2 font-medium text-p-text-secondary">Enabled</th>
@@ -558,6 +669,16 @@ function RoutesSection() {
                   </td>
                   <td className="px-3 py-2 text-p-text font-mono text-xs">{r.did || <span className="text-p-text-light">—</span>}</td>
                   <td className="px-3 py-2 text-p-text font-mono text-xs">{r.agent}</td>
+                  <td className="px-3 py-2 text-p-text text-xs whitespace-nowrap">
+                    {IDENTITY_LABEL[r.identity_mode] ?? r.identity_mode}
+                    {(r.warnings?.length ?? 0) > 0 && (
+                      <svg className="inline-block w-3.5 h-3.5 ml-1.5 text-amber-500 align-text-bottom" fill="none" viewBox="0 0 24 24" stroke="currentColor"
+                        aria-label="Route warnings" role="img">
+                        <title>{r.warnings.join('\n')}</title>
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+                      </svg>
+                    )}
+                  </td>
                   <td className="px-3 py-2 text-p-text">{r.language}</td>
                   <td className="px-3 py-2 text-p-text font-mono text-xs">{r.trigger_slug || <span className="text-p-text-light">—</span>}</td>
                   <td className="px-3 py-2 text-center">
@@ -590,6 +711,80 @@ function RoutesSection() {
       )}
       {logRoute && <CallLogModal route={logRoute} onClose={() => setLogRoute(null)} />}
     </>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Caller data — what external callers leave behind, and for how long
+// ---------------------------------------------------------------------------
+
+function CallerDataSection() {
+  const { data, isLoading } = useExternalData()
+  const save = useSaveExternalData()
+  const forget = useForgetExternalData()
+  const [days, setDays] = useState<string | null>(null)
+  const shownDays = days ?? (data ? String(data.days) : '')
+
+  const saveDays = () => {
+    const n = Number(shownDays)
+    if (!Number.isInteger(n) || n < 1 || n > 3650 || !data || n === data.days) { setDays(null); return }
+    save.mutate({ days: n }, {
+      onSuccess: () => setDays(null),
+      onError: (e) => { alert((e as Error).message); setDays(null) },
+    })
+  }
+
+  const forgetAll = () => {
+    if (!window.confirm(
+      'Forget ALL caller data now? Every caller\'s private notes and files, every phone conversation and the whole call log are deleted. '
+      + 'Calls in progress are skipped. Nothing goes to the Recover bin — this cannot be undone.')) return
+    forget.mutate(undefined, {
+      onSuccess: (r) => alert(
+        `Caller data forgotten: ${r.callers_forgotten} callers, ${r.phone_chats_deleted} conversations, `
+        + `${r.call_log_rows_deleted} call-log rows (${formatBytes(r.caller_bytes_freed)} freed)`
+        + (r.callers_busy_skipped || r.phone_chats_busy_skipped
+          ? `. Skipped ${r.callers_busy_skipped} callers and ${r.phone_chats_busy_skipped} conversations still on a call — run again later.`
+          : '.'),
+      ),
+      onError: (e) => alert((e as Error).message),
+    })
+  }
+
+  if (isLoading || !data) return <p className="text-sm text-p-text-secondary">Loading...</p>
+  return (
+    <div className="space-y-4">
+      <p className="text-xs text-p-text-light">
+        Callers who are not platform users leave three things behind: their private notes and files
+        (per-caller routes), the phone conversations, and the call log. They age out together.
+      </p>
+      <SettingRow label="Forget callers automatically"
+        description="Callers not heard from within the window below are forgotten on the daily cleanup. Off keeps everything until you forget it by hand.">
+        <Toggle checked={data.enabled} onChange={v => save.mutate({ enabled: v }, { onError: (e) => alert((e as Error).message) })} />
+      </SettingRow>
+      <SettingRow label="Keep caller data for (days)" description="Counted from the caller's last call. Minimum 1.">
+        <input type="number" min={1} max={3650} value={shownDays} disabled={!data.enabled}
+          aria-label="Keep caller data for (days)"
+          onChange={e => setDays(e.target.value)} onBlur={saveDays}
+          onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
+          className="w-20 px-2 py-1.5 text-sm border border-p-border-light rounded-lg bg-p-bg text-p-text text-right disabled:opacity-50" />
+      </SettingRow>
+      <div>
+        <p className="text-sm font-medium text-p-text mb-1">On this platform now</p>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-6 gap-y-1 text-xs" data-testid="caller-data-usage">
+          <div className="flex justify-between gap-2"><span className="text-p-text-light">Callers remembered</span><span className="text-p-text tabular-nums">{data.callers}</span></div>
+          <div className="flex justify-between gap-2"><span className="text-p-text-light">Caller files</span><span className="text-p-text tabular-nums">{formatBytes(data.bytes)}</span></div>
+          <div className="flex justify-between gap-2"><span className="text-p-text-light">Phone conversations</span><span className="text-p-text tabular-nums">{data.phone_chats}</span></div>
+          <div className="flex justify-between gap-2"><span className="text-p-text-light">Call-log rows</span><span className="text-p-text tabular-nums">{data.call_log_rows}</span></div>
+        </div>
+      </div>
+      <div className="flex items-center gap-3 flex-wrap">
+        <button onClick={forgetAll} disabled={forget.isPending}
+          className="px-3 py-1.5 text-xs font-medium rounded-lg border border-red-300 text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20 disabled:opacity-40">
+          {forget.isPending ? 'Forgetting…' : 'Forget all caller data now'}
+        </button>
+        <span className="text-xs text-p-text-light">Deletes every caller's files, the phone conversations and the call log. Nothing lands in the Recover bin.</span>
+      </div>
+    </div>
   )
 }
 
@@ -923,6 +1118,7 @@ export default function PhoneServersTab() {
     <div className="space-y-4">
       <SectionCard title="Phone Servers"><ServersSection /></SectionCard>
       <SectionCard title="Routes"><RoutesSection /></SectionCard>
+      <SectionCard title="Caller Data" defaultOpen={false}><CallerDataSection /></SectionCard>
       <SectionCard title="Call Prompts" defaultOpen={false}><CallPromptsSection /></SectionCard>
       <SectionCard title="Languages" defaultOpen={false}><LanguagesSection /></SectionCard>
       <SectionCard title="Turn Classifier"><TurnClassifierSection /></SectionCard>

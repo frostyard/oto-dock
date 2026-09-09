@@ -52,11 +52,11 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
-import config
 from auth.providers import UserContext, get_current_user, require_auth
 from storage import agent_store
 from storage import database as task_store
 from storage import memory_store
+from services.infra.path_confinement import safe_agent_dir
 from services.memory import memory_file
 from services.memory.memory_file import MemoryOpError, OpResult
 
@@ -96,6 +96,21 @@ def _require_mcp_caller(user: UserContext, agent: str) -> None:
         raise HTTPException(400, "X-Agent-Name required")
 
 
+def _require_agent_match(user: UserContext, agent: str) -> None:
+    """The calling session must belong to the agent it names.
+
+    Token-authoritative: a session minted for agent A cannot read or write
+    agent B's memory by naming B in ``X-Agent-Name`` (the header is a hint,
+    the ``agent`` claim is the fact); a user-backed session must have access
+    to the agent. The master key (memory consolidation) is unrestricted.
+    Runs AFTER the agent-existence check so an unknown agent stays a 404.
+    """
+    if user.is_session and user.agent and agent != user.agent:
+        raise HTTPException(403, "session token is not for this agent")
+    if user.acting_sub is not None and not user.can_access_agent(agent):
+        raise HTTPException(403, "no access to this agent")
+
+
 def _scope_enabled(scope: str, agent: str) -> bool:
     """Master AND per-agent toggle compose."""
     settings = memory_store.get_settings()
@@ -111,6 +126,28 @@ def _scope_enabled(scope: str, agent: str) -> bool:
             and toggles.get("user_memory_enabled")
         )
     return False
+
+
+def _external_caller_home(agent: str, agent_dir: Path, claim: str) -> Path | None:
+    """The caller tree a session's signed ``ext`` claim points at, or None
+    when the session has no tree (shared mode / withheld without a tree) or
+    the agent's visibility mode offers no personal scope (Shared-only)."""
+    from core.session.external_identity import home_from_claim
+    from core.session.visibility import available_scopes_for
+    row = agent_store.get_agent(agent) or {}
+    if "user" not in available_scopes_for(
+            bool(row.get("collaborative", True)), row.get("default_scope") or "user"):
+        return None
+    try:
+        return home_from_claim(agent_dir, claim)
+    except ValueError:
+        logger.error("memory: malformed external claim %r on agent %s", claim, agent)
+        return None
+
+
+def _is_external_tree(tree_rel: str) -> bool:
+    """Caller trees never sync, fan out or broadcast to the Files UI."""
+    return tree_rel.startswith("externals/")
 
 
 def _err(output: str, warnings: list[str] | None = None) -> dict[str, Any]:
@@ -155,7 +192,7 @@ async def _publish_changes(
 
         for rel in result.changed:
             tree_rel = _tree_rel(agent_dir, root, rel)
-            if not tree_rel:
+            if not tree_rel or _is_external_tree(tree_rel):
                 continue
             await asyncio.to_thread(
                 file_tombstones_store.drop, agent_slug, tree_rel,
@@ -182,7 +219,7 @@ async def _publish_changes(
         now = time.time()
         for rel in result.deleted:
             tree_rel = _tree_rel(agent_dir, root, rel)
-            if not tree_rel:
+            if not tree_rel or _is_external_tree(tree_rel):
                 continue
             await asyncio.to_thread(
                 file_tombstones_store.record, agent_slug, tree_rel, now,
@@ -251,6 +288,7 @@ async def memory_op(
     agent = x_agent_name or ""
     if not agent_store.agent_exists(agent):
         raise HTTPException(404, f"agent not found: {agent}")
+    _require_agent_match(u, agent)
 
     body = await request.json()
     command = body.get("command")
@@ -275,16 +313,33 @@ async def memory_op(
     if user_sub:
         username = task_store.get_username_by_sub(user_sub)
     role = _resolve_effective_role(user_sub, agent)
-    agent_dir = config.get_agent_dir(agent)
+    agent_dir = safe_agent_dir(agent)
 
     # Scopes available to THIS session (existence is lazy — roots may not
     # exist on disk yet; that's fine for view/create).
+    #
+    # EXTERNAL session (a phone caller who is not a platform user): never
+    # the shared agent scope; the caller's own tree (from the signed token
+    # claim) is the user scope when the agent's mode has one and the route
+    # gave the caller a tree — same toggles as a user's memory.
+    external = u.is_external
     scopes: dict[str, Path] = {}
-    if _scope_enabled("agent", agent):
+    if _scope_enabled("agent", agent) and not external:
         scopes["agent"] = memory_file.scope_root(agent_dir, "agent")
-    if username and _scope_enabled("user", agent):
+    if external:
+        role = "external"
+        caller_home = _external_caller_home(agent, agent_dir, u.external_claim)
+        if caller_home is not None and _scope_enabled("user", agent):
+            scopes["user"] = caller_home / "context" / "memory"
+    elif username and _scope_enabled("user", agent):
         scopes["user"] = memory_file.scope_root(agent_dir, "user", username)
     if not scopes:
+        if external:
+            return _err(
+                "Memory is not available on this line: shared agent memory "
+                "is never available on external routes, and this route keeps "
+                "no per-caller memory."
+            )
         return _err("Memory is disabled for this agent.")
 
     # rename carries two paths; both must land in the SAME scope.
@@ -309,6 +364,13 @@ async def memory_op(
             return _ok(memory_file.view_root(scopes))
 
         if scope not in scopes:
+            if external and scope == "agent":
+                return _err(
+                    "Shared agent memory is not available on external routes "
+                    "— caller memories live under /memories/user/."
+                )
+            if external and scope == "user":
+                return _err("This route keeps no per-caller memory.")
             if scope == "user" and not username:
                 return _err(
                     "user-scope memory is not available in this session "
@@ -376,10 +438,13 @@ async def memory_op(
         return _err(str(e))
 
     if result.changed or result.deleted:
-        writer = username or "agent-session"
-        await asyncio.to_thread(
-            _commit, agent_dir, scope, username, result, command, writer,
-        )
+        if not external:
+            # A caller's tree is not a git repo (no per-user context repo
+            # there) — the memory index + tombstones are its history.
+            writer = username or "agent-session"
+            await asyncio.to_thread(
+                _commit, agent_dir, scope, username, result, command, writer,
+            )
         await _publish_changes(
             agent, agent_dir, root, result,
             writer_slug=username, exclude_user_sub=user_sub,
@@ -462,7 +527,7 @@ async def patch_agent_settings(
 def _clear_memory_dir(agent_slug: str, scope: str, username: str | None) -> int:
     """Delete every file in one scope's memory dir (git-committed). Returns
     the number of files removed. Tombstones are recorded by the caller."""
-    agent_dir = config.get_agent_dir(agent_slug)
+    agent_dir = safe_agent_dir(agent_slug)
     root = memory_file.scope_root(agent_dir, scope, username)
     if not root.is_dir():
         return 0
@@ -490,7 +555,7 @@ async def _clear_and_tombstone(
 ) -> int:
     """Clear one scope dir + record per-file tombstones / fan out deletes so
     idle satellites apply the wipe instead of resurrecting it."""
-    agent_dir = config.get_agent_dir(agent_slug)
+    agent_dir = safe_agent_dir(agent_slug)
     root = memory_file.scope_root(agent_dir, scope, username)
     rels: list[str] = []
     if root.is_dir():
@@ -526,11 +591,13 @@ async def clear_all_endpoint(
     if scope not in ("user", "agent"):
         raise HTTPException(400, "scope must be 'user' or 'agent'")
 
+    if agent and not agent_store.agent_exists(agent):
+        raise HTTPException(404, f"agent not found: {agent}")
     slugs = [agent] if agent else [a["slug"] for a in agent_store.get_all_agents()]
     files_unlinked = 0
     agents_affected = 0
     for slug in slugs:
-        agent_dir = config.get_agent_dir(slug)
+        agent_dir = safe_agent_dir(slug)
         if not agent_dir.exists():
             continue
         touched = 0

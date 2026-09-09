@@ -269,6 +269,7 @@ class TwilioCallAPI:
                 "started_at": now,
                 "ended_at": now,
                 "duration_s": 0,
+                "session_id": "",   # never warmed
             }))
             return _twiml(_TWIML_REJECT)
 

@@ -9,10 +9,14 @@ Two-pass gate:
   Pass 2 (existing):    mode-based logic (default/acceptEdits/plan/dontAsk)
 """
 
+import re
 from dataclasses import dataclass, field, replace as _dc_replace
 from pathlib import Path
 
 import config
+# str-typed readers: a duck-typed / mocked context must never look external
+# (a truthy stand-in attribute would otherwise become a host path).
+from core.session.external_identity import external_home_of, is_external_ctx
 
 
 # ---------------------------------------------------------------------------
@@ -80,8 +84,10 @@ class SecurityContext:
     # probe — scratchpad + background-task outputs live under
     # ``<root>/<cwd-slug>/<session-id>/``. Together with ``cli_session_id``
     # it admits the session's OWN runtime tree even with allow_full_fs off.
-    # Empty for local sessions (bwrap gives them a private tmpfs /tmp) and
-    # for satellites that haven't reported the capability (fail closed).
+    # Empty for local sessions — their root is a proxy-host constant
+    # (``core.sandbox.sandbox.claude_runtime_root()``, the sandbox's private
+    # tmpfs /tmp + the proxy uid) applied by ``_is_local_session_runtime_path``
+    # — and for satellites that haven't reported the capability (fail closed).
     target_claude_runtime_root: str = ""
     # This session's CLI session id (== chats.session_id, the value spawned
     # via --session-id/--resume). Stamped centrally by
@@ -133,6 +139,29 @@ class SecurityContext:
     # by construction. Grants ``/knowledge`` RW (mount + hook + satellite
     # write-back); ``/config`` is deliberately untouched (human-manager-only).
     knowledge_rw: bool = False
+    # --- External routes (core/session/external_identity.py) ---
+    # ``principal`` says what kind of session this is: "user" (a human, or
+    # any session that is not external — the default), "agent" (reserved for
+    # platform-internal service sessions), "external" (a phone caller who is
+    # not a platform user). An external session has its own caller tree at
+    # ``external_home`` (host path; "" when the mode has no personal scope or
+    # the target is remote), mounted at /caller; no shared memory; none of
+    # the platform-management MCPs; no shell; and a proxy API confined to
+    # the endpoints its tools use (auth/external_endpoints.py). The JWT
+    # minted into its processes carries ``external_claim`` — derived from
+    # this context at mint time, which is why the layers register the
+    # context BEFORE the spawn.
+    principal: str = "user"
+    external_channel: str = ""
+    external_id: str = ""            # normalised caller id ("" when withheld)
+    external_home: str = ""
+    external_ephemeral: bool = False
+    external_verified: bool = False  # the daemon's PIN gate passed
+    external_claim: str = ""
+
+    @property
+    def is_external(self) -> bool:
+        return self.principal == "external"
 
     @property
     def mount_username(self) -> str:
@@ -180,6 +209,27 @@ class PathDecision:
 
 _ALLOW = PathDecision(allowed=True)
 
+#: External sessions (a phone caller who is not a platform user) never get a
+#: shell — a shell reaches what the caller cannot hear: the MCP processes'
+#: credentials (config.toml, ``/proc/*/environ``), token files, the proxy
+#: with the session token. Three layers enforce it: the permission-hook
+#: floor (``api/hooks/hooks.py``), the CLI argv ``--disallowedTools``
+#: (``core/layers/cli``) and the settings.json deny list
+#: (``core/sandbox/session_config_dir.py``). Direct LLM has no shell; an
+#: external Codex session has no shell tool at all (``[features] shell_tool
+#: = false``) and runs this gate as its PreToolUse hook — its file writes
+#: arrive as ``apply_patch`` (``_check_apply_patch``).
+#:
+#: ``WebSearch`` and ``WebFetch`` are NOT floored (2026-09-08): a caller can
+#: already hear anything the session can read (the shared space as viewer,
+#: their own tree), so a query or a URL carries nothing the phone line does
+#: not, and the direct engine already gives callers the provider's web
+#: tools. ``WebFetch`` keeps its SSRF gate (``path_shell._check_webfetch``)
+#: and the local sandbox netns still blackholes private ranges; on a remote
+#: target, where there is no netns and the gate is literal-URL only, the
+#: gate denies ``WebFetch`` to external sessions outright.
+EXTERNAL_DENIED_CLI_TOOLS: tuple[str, ...] = ("Bash", "Monitor", "PowerShell")
+
 # ---------------------------------------------------------------------------
 # Resolved path constants (computed once at import)
 # ---------------------------------------------------------------------------
@@ -223,6 +273,15 @@ def _translate_sandbox_path(raw_path: str, ctx: SecurityContext) -> str:
     """
     agent_dir = _AGENTS_DIR / ctx.agent
 
+    # /caller/ — an external caller's private tree (SecurityContext.
+    # external_home). A session without one has no /caller at all: the raw
+    # path is returned untranslated and resolves outside every allowed root.
+    if raw_path == "/caller" or raw_path.startswith("/caller/"):
+        if not external_home_of(ctx):
+            return raw_path
+        rest = raw_path[len("/caller"):].lstrip("/")
+        return str(Path(ctx.external_home) / rest) if rest else ctx.external_home
+
     # /config/ — agent config dir (manager/admin RW; editor/viewer RO)
     if raw_path.startswith("/config/") or raw_path == "/config":
         return str(agent_dir / raw_path[1:])
@@ -251,6 +310,8 @@ def _session_cwd_anchor(ctx: SecurityContext) -> Path:
     """Host equivalent of the sandbox session cwd — ``/users/{u}`` for user
     mounts, ``/workspace`` for agent-scope (sandbox.get_cwd pins these)."""
     agent_dir = _AGENTS_DIR / ctx.agent
+    if external_home_of(ctx):
+        return Path(ctx.external_home)
     if ctx.mount_username:
         return agent_dir / "users" / ctx.mount_username
     return agent_dir / "workspace"
@@ -300,6 +361,45 @@ def _check_path_arg(
     return first or PathDecision(False, "path could not be resolved")
 
 
+#: Codex apply_patch file headers (``codex-rs/apply-patch``): every file the
+#: patch touches is announced on one of these lines. The path runs to the end
+#: of the line and is stripped by the caller: a lazy ``.+?`` before ``\s*$``
+#: backtracks quadratically on a long run of spaces (CodeQL py/polynomial-redos).
+_PATCH_FILE_RE = re.compile(
+    r"^\*\*\* (Add File|Update File|Delete File|Move to): (.+)$", re.M,
+)
+
+
+def _check_apply_patch(tool_input: dict | str, ctx: SecurityContext) -> PathDecision:
+    """Role-check every path a Codex ``apply_patch`` call names.
+
+    ``Update File`` reads the original before writing it back (a zero-chunk
+    update with ``Move to`` copies the file verbatim), so it needs the read
+    AND the write check; ``Add File`` / ``Delete File`` / ``Move to`` are
+    writes. Relative paths resolve the way the file tools' do (cwd-anchored
+    candidates — ``_check_path_arg``). A patch that names no file is left to
+    Codex to reject.
+    """
+    text: object = tool_input
+    if isinstance(tool_input, dict):
+        text = (
+            tool_input.get("command") or tool_input.get("patch")
+            or tool_input.get("input") or tool_input.get("patch_text") or ""
+        )
+    if not isinstance(text, str) or not text:
+        return _ALLOW
+    for kind, raw in _PATCH_FILE_RE.findall(text):
+        raw = raw.strip()
+        if not raw:
+            continue
+        checks = ((False, True) if kind == "Update File" else (True,))
+        for writing in checks:
+            decision = _check_path_arg(raw, ctx, writing=writing)
+            if not decision.allowed:
+                return PathDecision(False, f"apply_patch denied for {kind} {raw}: {decision.reason}")
+    return _ALLOW
+
+
 def _is_other_users_dir(resolved: Path, username: str) -> bool:
     """Return True if path is inside another user's directory.
 
@@ -315,6 +415,24 @@ def _is_other_users_dir(resolved: Path, username: str) -> bool:
             if not username or dir_owner != username:
                 return True
     return False
+
+
+def _is_local_session_runtime_path(resolved: Path, ctx: SecurityContext) -> bool:
+    """``resolved`` is inside THIS session's Claude-CLI runtime tree on a LOCAL
+    sandbox: ``/tmp/claude-<proxy uid>/<cwd-slug>/<this session id>/…`` —
+    the scratchpad the CLI's own system prompt directs the agent to, plus its
+    background-task outputs. The sandbox's ``/tmp`` is a private tmpfs, so the
+    only thing to scope is the session id (same predicate remote uses with the
+    satellite-reported root). The rest of ``/tmp`` — ``HOME``, the CLI's own
+    state files — stays denied. Widening-only: callers run the credential /
+    agent-config / cross-user denies first."""
+    if ctx.target_kind != "local" or not ctx.cli_session_id:
+        return False
+    from core.sandbox.sandbox import claude_runtime_root  # lazy: auth → core
+    from services import path_roles
+    return path_roles.is_session_runtime_path(
+        resolved, claude_runtime_root(), ctx.cli_session_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +477,14 @@ def _check_read_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
     if _is_other_users_dir(resolved, ctx.mount_username):
         return PathDecision(False, "Access denied: cannot read other users' files")
 
+    # External sessions (a phone caller who is not a platform user): the
+    # shared agent memory is not theirs (it is masked out of the mount as
+    # well), and under externals/ only their own tree is theirs.
+    if is_external_ctx(ctx):
+        denied = _external_read_denial(resolved, ctx)
+        if denied is not None:
+            return denied
+
     # Claude Code CLI background-command output: the agent's own ephemeral task
     # output (HOME=/tmp → /tmp/claude-<uid>/.../tasks/<id>.output). Safe to read
     # — its own command output in its per-session tmpfs, no cross-user surface.
@@ -368,16 +494,27 @@ def _check_read_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
     if path_roles.is_claude_bg_output_path(resolved):
         return _ALLOW
 
+    # The CLI's OWN session runtime tree on a local sandbox (scratchpad +
+    # task outputs, read side) — same slot and same reasoning as the rule
+    # above; see _is_local_session_runtime_path. Remote sessions get the
+    # equivalent from path_policy_v2 (satellite-reported root).
+    if _is_local_session_runtime_path(resolved, ctx):
+        return _ALLOW
+
     # Helper: check access for a single agent dir based on role
     def _check_agent_read(agent_name: str) -> bool:
         agent_dir = (_AGENTS_DIR / agent_name).resolve()
 
         # Agent-scoped context (no username): workspace/ + knowledge/
-        # (NOT config — config is human-owner curation only).
+        # (NOT config — config is human-owner curation only). An external
+        # caller additionally reads their own tree.
         if not ctx.username:
             if _path_under(resolved, (agent_dir / "workspace").resolve()):
                 return True
             if _path_under(resolved, (agent_dir / "knowledge").resolve()):
+                return True
+            if external_home_of(ctx) and _path_under(
+                    resolved, Path(ctx.external_home).resolve()):
                 return True
             return False
 
@@ -429,6 +566,12 @@ def _check_read_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
 _USER_DIR_WRITABLE_SUBDIRS: tuple[str, ...] = (
     "workspace", "context", ".claude", ".codex",
 )
+#: An external caller (a phone caller who is not a platform user) writes
+#: only its files and context. Its CLI config dir (``/caller/.claude`` /
+#: ``/caller/.codex``) holds the permission hook itself, the settings deny
+#: list and the session's config — never a tool-write target (the CLI's
+#: own process state writes there without going through a tool).
+_EXTERNAL_WRITABLE_SUBDIRS: tuple[str, ...] = ("workspace", "context")
 
 # Paths that are NEVER writable (even admin on admin agent).
 # Protects the permission system itself and sensitive infrastructure.
@@ -460,9 +603,27 @@ def _is_memory_file(resolved: Path) -> bool:
         prev = parts[i - 1]
         if prev == "knowledge":
             return True
-        if prev == "context" and i >= 2 and "users" in parts[:i]:
+        # users/{u}/context/memory and externals/<channel>/<caller>/context/memory
+        if prev == "context" and i >= 2 and (
+                "users" in parts[:i] or "externals" in parts[:i]):
             return True
     return False
+
+
+def _external_read_denial(resolved: Path, ctx: SecurityContext) -> PathDecision | None:
+    """External-session read rules that precede every grant: no shared agent
+    memory, and no other caller's tree. ``None`` = nothing to deny here."""
+    agent_dir = (_AGENTS_DIR / ctx.agent).resolve()
+    if _path_under(resolved, (agent_dir / "knowledge" / "memory").resolve()):
+        return PathDecision(
+            False,
+            "Read denied: shared agent memory is not available on external routes",
+        )
+    if _path_under(resolved, (agent_dir / "externals").resolve()):
+        home = Path(ctx.external_home).resolve() if external_home_of(ctx) else None
+        if home is None or not _path_under(resolved, home):
+            return PathDecision(False, "Access denied: another caller's files")
+    return None
 
 
 def _check_write_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
@@ -501,6 +662,34 @@ def _check_write_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
     # Block other users' dirs (MOUNT identity — see the read-path comment).
     if _is_other_users_dir(resolved, ctx.mount_username):
         return PathDecision(False, "Write denied: cannot write to other users' files")
+
+    # External sessions: only their own caller tree under externals/, and
+    # only its known subdirs (the root is reserved, like a user dir's root).
+    if is_external_ctx(ctx):
+        denied = _external_read_denial(resolved, ctx)
+        if denied is not None:
+            return PathDecision(False, denied.reason.replace("Read denied", "Write denied"))
+        if external_home_of(ctx):
+            home = Path(ctx.external_home).resolve()
+            if _path_under(resolved, home):
+                if resolved != home:
+                    for sub in _EXTERNAL_WRITABLE_SUBDIRS:
+                        if _path_under(resolved, home / sub):
+                            return _ALLOW
+                return PathDecision(
+                    False,
+                    "Write denied: the root of the caller folder is reserved; "
+                    "only its workspace/ and context/ subfolders are writable "
+                    "on this line.",
+                )
+
+    # The CLI's OWN session runtime tree on a local sandbox (the scratchpad
+    # its system prompt directs it to): admitted read + write, scoped by the
+    # session id. Ordered AFTER the memory / OAuth-credential / always-deny /
+    # .env / cross-user denies above so it can never weaken them. See
+    # _is_local_session_runtime_path; remote gets this from path_policy_v2.
+    if _is_local_session_runtime_path(resolved, ctx):
+        return _ALLOW
 
     # Plan files — handled by sandbox per-user isolation
 
@@ -564,7 +753,11 @@ def _check_write_path(resolved: Path, ctx: SecurityContext) -> PathDecision:
         # earlier (_is_memory_file precedes this branch).
         if not ctx.username:
             if _path_under(resolved, (agent_dir / "workspace").resolve()):
-                return True
+                # An external caller never writes the shared workspace: the
+                # builder always makes it a viewer (phone_identity.
+                # EXTERNAL_ROUTE_ROLE); the role check stays as defence in
+                # depth should another producer ever hand out a wider role.
+                return not (is_external_ctx(ctx) and ctx.role == "viewer")
             if ctx.knowledge_rw:
                 mirror = _mirror_verdict()
                 if mirror is not None:
@@ -667,14 +860,15 @@ def _check_remote_bash_path(
 # Main entry point
 # ---------------------------------------------------------------------------
 
-# Tools with file_path argument (Read/Write/Edit)
-_FILE_PATH_TOOLS = {"Read", "Write", "Edit", "NotebookEdit"}
+# Tools with file_path argument (Read/Write/Edit; Delete is the Direct-LLM
+# builtin — the CLIs delete via Bash — checked as a write on its file_path)
+_FILE_PATH_TOOLS = {"Read", "Write", "Edit", "NotebookEdit", "Delete"}
 # Tools with path argument (Glob/Grep — optional, defaults to cwd)
 _SEARCH_PATH_TOOLS = {"Glob", "Grep"}
 # Read-operation tools
 _READ_TOOLS = {"Read", "Glob", "Grep"}
 # Write-operation tools
-_WRITE_TOOLS = {"Write", "Edit", "NotebookEdit"}
+_WRITE_TOOLS = {"Write", "Edit", "NotebookEdit", "Delete"}
 
 # Shell command-execution tools, routed through the command gate.
 #   * _BASH_TOOLS → _check_bash. "Monitor" is Claude Code's background-command
@@ -703,6 +897,9 @@ _KNOWN_STRUCTURED_TOOLS = (
         "TodoRead", "ToolSearch", "AskUserQuestion", "ExitPlanMode",
         "EnterPlanMode", "CronList", "CronCreate", "CronDelete",
         "CodexEscalation",
+        # Direct-LLM client-side builtins (core/layers/direct/builtins.py):
+        # a skill name / search query is natural language, never a command.
+        "Skill", "tool_search",
     }
 )
 
@@ -758,6 +955,13 @@ def check_tool_access(
     # WebFetch: SSRF prevention
     if tool_name == "WebFetch":
         return _check_webfetch(tool_input.get("url", ""), ctx), None
+
+    # Codex apply_patch: the patch text names its files. Each one gets the
+    # Read/Write role check, so a patch cannot read a protected file (an
+    # "Update" with a "Move to" is a copy) or write outside the caller's
+    # writable subfolders.
+    if tool_name == "apply_patch":
+        return _check_apply_patch(tool_input, ctx), None
 
     # Admin on admin agent: skip all path checks
     if ctx.is_admin_agent and ctx.role == "admin":

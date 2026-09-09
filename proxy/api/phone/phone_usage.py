@@ -14,6 +14,7 @@ credit); this records the BASE price locally for display — a separate ledger.
 
 import asyncio
 import logging
+import uuid
 
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
@@ -21,6 +22,9 @@ from pydantic import BaseModel
 import config
 from core.layers.providers import ProviderUsage, get_adapter
 from services.billing import usage_service
+from services.infra import external_retention
+from services.phone.phone_identity import pop_call_identity
+from storage import database as task_store
 from storage import phone_call_log_store, phone_route_store
 
 logger = logging.getLogger("claude-proxy")
@@ -110,6 +114,30 @@ class CallReport(BaseModel):
     started_at: str = ""
     ended_at: str = ""
     duration_s: int | None = None
+    # The warmed session (empty for calls that never reached the agent) —
+    # the audit-trail join key: identity label + tools run.
+    session_id: str = ""
+
+
+def _audit_trail(session_id: str, agent: str) -> tuple[str, str, list[str]]:
+    """``(session_id, identity, tools_run)`` for one report.
+
+    The identity label was stamped at warmup (``remember_call_identity``);
+    the tools come from the persisted tool blocks of the session's chat — and
+    ONLY for a phone chat of the reported agent, so a mis-sent id can never
+    surface a dashboard conversation's tools in the call log. Anything that
+    isn't a UUID is dropped outright.
+    """
+    try:
+        sid = str(uuid.UUID(str(session_id or "")))
+    except ValueError:
+        return "", "", []
+    identity = pop_call_identity(sid)
+    chat = task_store.get_chat_by_session(sid)
+    if (not chat or chat.get("source_type") != "phone"
+            or (agent and chat.get("agent") != agent)):
+        return sid, identity, []
+    return sid, identity, task_store.list_tool_names(chat["id"])
 
 
 def _record_call(data: dict) -> dict:
@@ -131,7 +159,13 @@ def _record_call(data: dict) -> dict:
     else:
         # Unknown/deleted route: keep the row, drop the FK.
         data["route_id"] = ""
-    row_id = phone_call_log_store.insert_call(data)
+    data["session_id"], data["identity"], data["tools_run"] = _audit_trail(
+        data.get("session_id") or "", data.get("agent") or "",
+    )
+    # Opportunistic prune under the caller-data window (disabled → keep).
+    row_id = phone_call_log_store.insert_call(
+        data, prune_before=external_retention.prune_cutoff(),
+    )
     return {"recorded": True, "id": row_id}
 
 

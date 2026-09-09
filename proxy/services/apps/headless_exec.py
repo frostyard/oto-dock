@@ -407,15 +407,15 @@ async def execute_app_tool(row: dict, action: dict, merged_args: dict) -> dict:
         entry.busy += 1
         entry.last_used = time.monotonic()
         try:
-            # execute_tools bounds the CALL (TOOL_CALL_TIMEOUT, surfaced as
-            # error text); this outer margin only covers a wedged dispatch
-            # layer — the click must ALWAYS get a terminal result.
-            from core.layers.direct.mcp import TOOL_CALL_TIMEOUT
+            # execute_tools bounds the CALL (the manager's tool_timeout —
+            # 60 s for app actions — surfaced as error text); this outer
+            # margin only covers a wedged dispatch layer — the click must
+            # ALWAYS get a terminal result.
             results = await asyncio.wait_for(
                 entry.manager.execute_tools(
                     [{"id": "app-action", "name": namespaced, "input": merged_args}],
                 ),
-                timeout=TOOL_CALL_TIMEOUT + 30,
+                timeout=entry.manager.tool_timeout + 30,
             )
         except asyncio.TimeoutError:
             logger.error(f"app exec: dispatch timed out for {namespaced}")

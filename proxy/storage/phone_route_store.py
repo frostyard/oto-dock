@@ -106,9 +106,11 @@ def create_route(data: dict) -> dict:
                 backchannel_mode, thinking_filler_mode, background_sound,
                 enabled,
                 audiosocket_uuid, did, ami_caller_id, ami_outbound_context,
-                dial_prefix, adapter_data, trigger_slug, created_at, updated_at)
+                dial_prefix, adapter_data, trigger_slug,
+                identity_mode, identity_user_sub, role, remember_callers,
+                created_at, updated_at)
                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                       %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                       %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (
                 route_id,
                 data.get("direction", "inbound"),
@@ -132,6 +134,10 @@ def create_route(data: dict) -> dict:
                 data.get("dial_prefix", ""),
                 json.dumps(data.get("adapter_data") or {}),
                 data.get("trigger_slug") or None,
+                data.get("identity_mode") or "caller",
+                data.get("identity_user_sub") or None,
+                data.get("role") or "viewer",
+                bool(data.get("remember_callers", True)),
                 now,
                 now,
             ),
@@ -153,13 +159,15 @@ def update_route(route_id: str, data: dict) -> dict | None:
         "enabled",
         "audiosocket_uuid", "did", "ami_caller_id",
         "ami_outbound_context", "dial_prefix", "trigger_slug",
+        "identity_mode", "identity_user_sub", "role", "remember_callers",
     }
-    # ``trigger_slug`` may be cleared by passing empty string — keep it in the
-    # update dict so the explicit clear lands in DB. Other fields are dropped
-    # when None (Pydantic ``exclude_unset`` already handles "not supplied").
+    # ``trigger_slug`` / ``identity_user_sub`` may be cleared by passing empty
+    # string — keep them in the update dict so the explicit clear lands in DB.
+    # Other fields are dropped when None (Pydantic ``exclude_unset`` already
+    # handles "not supplied").
     updates = {
         k: v for k, v in data.items()
-        if k in allowed and (v is not None or k == "trigger_slug")
+        if k in allowed and (v is not None or k in ("trigger_slug", "identity_user_sub"))
     }
     if not updates:
         return get_route(route_id)
@@ -167,9 +175,11 @@ def update_route(route_id: str, data: dict) -> dict | None:
     # Allow clearing audiosocket_uuid by passing empty string → NULL
     if "audiosocket_uuid" in updates and updates["audiosocket_uuid"] == "":
         updates["audiosocket_uuid"] = None
-    # Same for trigger_slug — empty string means "unbind trigger".
-    if "trigger_slug" in updates and updates["trigger_slug"] == "":
-        updates["trigger_slug"] = None
+    # Same for trigger_slug — empty string means "unbind trigger" — and for
+    # identity_user_sub — empty string means "no tied user".
+    for _nullable in ("trigger_slug", "identity_user_sub"):
+        if _nullable in updates and updates[_nullable] == "":
+            updates[_nullable] = None
 
     updates["updated_at"] = _now()
     set_clause = ", ".join(f"{k} = %s" for k in updates)

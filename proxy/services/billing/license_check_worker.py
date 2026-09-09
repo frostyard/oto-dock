@@ -108,11 +108,14 @@ async def _do_check_under_lock(force: bool = False) -> None:
 async def _do_check(force: bool = False) -> None:
     import auth.license as L
     from storage import database as db
+    from storage.pg import run_db
 
     # Dormant unless connected + self-hosted (defensive — also guards /recheck).
     if config.OTODOCK_CLOUD or not relay_client.is_available():
         return
-    key = L.get_license_key()
+    # Periodic worker: every store touch goes through run_db (storage/pg.py's
+    # event-loop rule) — the hourly tick must never hold the loop on a commit.
+    key = await run_db(L.get_license_key)
     if not key:
         return
     lic = L.validate_license_key(key)
@@ -122,9 +125,9 @@ async def _do_check(force: bool = False) -> None:
     if not (lic.lifetime or lic.license_mode == "subscription"):
         return
 
-    L._advance_seen_clock()  # anti-rollback floor
+    await run_db(L._advance_seen_clock)  # anti-rollback floor
 
-    receipt = db.get_platform_setting("license_activation_receipt")
+    receipt = await run_db(db.get_platform_setting, "license_activation_receipt")
     if not L._receipt_valid(receipt, key):
         # Not bound yet → bind (retried every tick until it sticks — edge case 1).
         await _activate(key)
@@ -132,16 +135,17 @@ async def _do_check(force: bool = False) -> None:
     if lic.lifetime:
         return  # bound lifetime → perpetual, never re-check (no liveness)
     # subscription, activated → weekly liveness.
-    if not force and not _check_due():
+    if not force and not await _check_due():
         return
     await _check(key)
 
 
-def _check_due() -> bool:
+async def _check_due() -> bool:
     import auth.license as L
     from storage import database as db
+    from storage.pg import run_db
 
-    last = L._parse_iso(db.get_platform_setting("license_last_check_at"))
+    last = L._parse_iso(await run_db(db.get_platform_setting, "license_last_check_at"))
     if last is None:
         return True
     return (datetime.now(timezone.utc) - last).total_seconds() >= _CHECK_EVERY_DAYS * 86400
@@ -151,8 +155,9 @@ async def _activate(key: str) -> None:
     """Bind the key to this install. The relay returns a signed receipt that the
     offline state machine later verifies (must bind to this key + install_id)."""
     from storage import database as db
+    from storage.pg import run_db
 
-    db.set_platform_setting("license_last_check_at", _now_iso())
+    await run_db(db.set_platform_setting, "license_last_check_at", _now_iso())
     try:
         receipt = await relay_client.activate_license(key)
     except relay_client.RelayError as e:
@@ -166,10 +171,10 @@ async def _activate(key: str) -> None:
         logger.exception("License activation failed (will retry)")
         return
     if isinstance(receipt, str) and receipt:
-        db.set_platform_setting("license_activation_receipt", receipt)
-        _adopt_key_from_receipt(receipt, key)
-    db.set_platform_setting("license_check_status", "active")
-    db.set_platform_setting("license_last_ok_at", _now_iso())
+        await run_db(db.set_platform_setting, "license_activation_receipt", receipt)
+        await run_db(_adopt_key_from_receipt, receipt, key)
+    await run_db(db.set_platform_setting, "license_check_status", "active")
+    await run_db(db.set_platform_setting, "license_last_ok_at", _now_iso())
     logger.info("License activated + bound to this install")
 
 
@@ -189,9 +194,10 @@ def _adopt_key_from_receipt(receipt: str, stored_key: str) -> None:
 async def _check(key: str) -> None:
     """Weekly liveness check for an activated subscription key. Fail-open."""
     from storage import database as db
+    from storage.pg import run_db
     import auth.license as L
 
-    db.set_platform_setting("license_last_check_at", _now_iso())
+    await run_db(db.set_platform_setting, "license_last_check_at", _now_iso())
     try:
         result = await relay_client.license_check(key)
     except relay_client.RelayNotConfigured:
@@ -207,10 +213,10 @@ async def _check(key: str) -> None:
     new_key = result.get("license", "")
     new_receipt = result.get("receipt", "")
     if new_key and new_key != key:
-        L.set_license_key(new_key)
+        await run_db(L.set_license_key, new_key)
         if new_receipt:
-            db.set_platform_setting("license_activation_receipt", new_receipt)
+            await run_db(db.set_platform_setting, "license_activation_receipt", new_receipt)
         logger.info("Adopted re-issued license key (via liveness check)")
-    db.set_platform_setting("license_check_status", verdict)
-    db.set_platform_setting("license_last_ok_at", _now_iso())
+    await run_db(db.set_platform_setting, "license_check_status", verdict)
+    await run_db(db.set_platform_setting, "license_last_ok_at", _now_iso())
     logger.debug("License check OK: verdict=%s", verdict or "(none)")

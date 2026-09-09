@@ -22,6 +22,9 @@ from pydantic import BaseModel
 import config
 from storage import agent_store
 from auth.providers import UserContext, get_current_user, require_agent_access, require_auth
+from services.infra.path_confinement import (
+    PathOutsideRoot, join_under, resolve_under, safe_agent_dir,
+)
 from storage import database as task_store
 
 logger = logging.getLogger("claude-proxy.uploads")
@@ -153,7 +156,7 @@ def _resolve_upload_destination(
     if not is_agent_scoped and not username:
         raise HTTPException(status_code=400, detail="User has no username configured")
 
-    agent_dir = config.get_agent_dir(agent)
+    agent_dir = safe_agent_dir(agent)
     if target_dir:
         # Custom target — authorize the RESOLVED final path against the caller's
         # per-agent role (fixes a role-var bug — was user.role — and defeats
@@ -186,16 +189,18 @@ def _resolve_upload_destination(
             agent_dir / "users" / username / "workspace" / "uploads" / "files"
         )
 
+    # Every branch lands inside the agent tree by construction; re-check it
+    # on the RESOLVED landing dir so a symlink planted there cannot redirect
+    # the write, and hand back resolved paths so ``relative_to`` agrees.
+    agent_root = Path(os.path.realpath(agent_dir))
+    try:
+        upload_dir = resolve_under(upload_dir, agent_root)
+    except PathOutsideRoot:
+        raise HTTPException(status_code=403, detail="Path outside agent directory")
     if create:
         upload_dir.mkdir(parents=True, exist_ok=True)
 
-    # Security: ensure resolved path is within agent dir
-    resolved_dir = upload_dir.resolve()
-    agent_root = agent_dir.resolve()
-    if resolved_dir != agent_root and not resolved_dir.is_relative_to(agent_root):
-        raise HTTPException(status_code=403, detail="Path outside agent directory")
-
-    return upload_dir, agent_dir
+    return upload_dir, agent_root
 
 
 @router.post("/v1/upload")
@@ -415,7 +420,7 @@ class ChunkedInitRequest(BaseModel):
 
 # token_urlsafe(16) → 22 chars of [A-Za-z0-9_-]; anything else in the path
 # param is hostile (upload_id feeds filesystem paths — this regex is the
-# traversal guard, not just tidiness).
+# traversal guard, not just tidiness; the joins restate it in barrier shape).
 _UPLOAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
 
@@ -423,7 +428,7 @@ def _staging_paths(upload_id: str) -> tuple[Path, Path]:
     if not _UPLOAD_ID_RE.match(upload_id):
         raise HTTPException(status_code=404, detail="Unknown upload id")
     d = config.UPLOAD_STAGING_DIR
-    return d / f"{upload_id}.partial", d / f"{upload_id}.json"
+    return join_under(d, f"{upload_id}.partial"), join_under(d, f"{upload_id}.json")
 
 
 def _load_chunk_meta(upload_id: str, user: UserContext) -> tuple[dict, Path, Path]:
@@ -619,7 +624,7 @@ def _finalize_staged_file(staging: Path, target: Path, upload_id: str) -> None:
     except OSError as e:
         if e.errno != errno.EXDEV:
             raise
-    tmp = target.with_name(f".{target.name}.{upload_id}.part")
+    tmp = join_under(target.parent, f".{target.name}.{upload_id}.part")
     try:
         shutil.copyfile(staging, tmp)
         os.replace(tmp, target)

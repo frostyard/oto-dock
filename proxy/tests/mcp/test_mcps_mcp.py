@@ -639,5 +639,6 @@ def test_manifest_declares_expected_shape():
     # Not in scheduled tasks or meetings: browsing/requesting marketplace
     # MCPs is a human management flow — a background task would fill the
     # request queue with nobody asking, and every meeting participant would
-    # pay the tool-schema cost each turn.
-    assert manifest["exclude_from"] == ["task", "meeting"]
+    # pay the tool-schema cost each turn. "external" (2026-09): never on a
+    # phone caller's session either.
+    assert manifest["exclude_from"] == ["task", "meeting", "external"]

@@ -458,12 +458,13 @@ class ClientMessageDispatcher:
             "WS dashboard: move_chat requested chat=%s session=%s streaming=%s",
             self.chat_id or "?", (self.session_id or "?")[:8], self.streaming,
         )
-        chat = task_store.get_chat(self.chat_id) if self.chat_id else None
+        from storage.pg import run_db
+        chat = await run_db(task_store.get_chat, self.chat_id) if self.chat_id else None
         if not chat:
             await self._send({"type": "error", "message": "Chat not found."})
             return
         agent = chat.get("agent") or ""
-        role = _effective_agent_role(self.user_sub, agent)
+        role = await run_db(_effective_agent_role, self.user_sub, agent)
         if chat.get("user_sub") != self.user_sub and role != "admin":
             await self._send({"type": "error",
                               "message": "Only the chat owner can move it."})
@@ -593,7 +594,8 @@ class ClientMessageDispatcher:
             "WS dashboard: switch_engine requested chat=%s -> %s/%s",
             self.chat_id or "?", new_path or "?", new_model or "?",
         )
-        chat = task_store.get_chat(self.chat_id) if self.chat_id else None
+        from storage.pg import run_db
+        chat = await run_db(task_store.get_chat, self.chat_id) if self.chat_id else None
         if not chat:
             await _deny("Chat not found.")
             return
@@ -603,7 +605,7 @@ class ClientMessageDispatcher:
             await _deny("Phone chats can't switch engines — their calls "
                         "resolve the engine from the agent configuration.")
             return
-        role = _effective_agent_role(self.user_sub, agent)
+        role = await run_db(_effective_agent_role, self.user_sub, agent)
         is_task_chat = cid.startswith("task-")
         task_run = None
         if is_task_chat:

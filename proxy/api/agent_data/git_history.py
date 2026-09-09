@@ -19,6 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 import config as app_config
 from auth.providers import UserContext, get_current_user, require_auth
 from services.infra import git_writer
+from services.infra.path_confinement import PathOutsideRoot, resolve_under, safe_agent_dir
 from storage import agent_store
 from storage import database as task_store
 
@@ -39,7 +40,7 @@ def _authz_user_scope(u: UserContext, scope: str, user_sub: str | None) -> None:
 def _resolve_repo(scope: str, agent: str, user_sub: str | None) -> Path:
     if not agent_store.agent_exists(agent):
         raise HTTPException(404, f"agent not found: {agent}")
-    agent_dir = app_config.get_agent_dir(agent)
+    agent_dir = safe_agent_dir(agent)
     if scope == "agent":
         return agent_dir / "config"
     if scope == "knowledge":
@@ -117,10 +118,9 @@ async def git_revert(
     if not (agent and commit and path):
         raise HTTPException(400, "agent, commit, path required")
     repo = _resolve_repo(scope, agent, user_sub)
-    target = (repo / path).resolve()
-    # Don't allow escaping the repo via .. — resolve and re-check the
-    # parent boundary.
-    if repo.resolve() not in target.parents and target != repo.resolve():
+    try:
+        target = resolve_under(repo / path, repo)
+    except PathOutsideRoot:
         raise HTTPException(400, "path escapes repo")
     new_sha = await asyncio.to_thread(
         git_writer.revert_file_to, repo, commit, target,

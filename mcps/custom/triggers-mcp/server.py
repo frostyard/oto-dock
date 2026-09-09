@@ -113,6 +113,9 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="create_trigger",
             description=(
+                "Read the skill `triggers-guide` (Skill tool) before creating a trigger — "
+                "call shapes, event_filter rules for vendor subscriptions, the setup steps "
+                "to explain to the user. "
                 "Create a webhook trigger that external systems (GitHub, Stripe, "
                 "Linear, IoT, Zapier, etc.) can call to fire a task and/or a "
                 "notification. Returns the trigger record + the webhook URL the "

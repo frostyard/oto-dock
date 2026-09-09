@@ -115,6 +115,9 @@ _SUPPRESSED_METHODS = frozenset({
     "model/rerouted", "account/updated", "account/rateLimits/updated",
     "app/list/updated", "fs/changed", "item/plan/delta",
     "item/reasoning/summaryPartAdded", "deprecationNotice", "configWarning",
+    # 0.152+: the daemon announces a provider auth refresh (token rotation)
+    # — housekeeping, nothing for the chat.
+    "modelProvider/authRecoveryStarted", "modelProvider/authRecoveryCompleted",
 })
 
 

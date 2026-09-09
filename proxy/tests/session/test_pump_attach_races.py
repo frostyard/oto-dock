@@ -196,7 +196,7 @@ async def test_done_keeps_live_blocks_and_advances_cutoff(temp_db):
         q = pump.attach()
         await pump._process_event(CommonEvent(TEXT, {"content": "hello world"}))
         assert any(b.get("type") == "text" for b in live["live_blocks"])
-        cutoff_before = pump._db_msg_cutoff_id
+        cutoff_before = pump._db_msg_cutoff_id or 0
 
         await pump._process_event(CommonEvent(DONE, {}))
 
@@ -204,6 +204,10 @@ async def test_done_keeps_live_blocks_and_advances_cutoff(temp_db):
         # the final save and the producer's exit reconstructs the WHOLE turn
         # from live_state (DB rows past the cutoff are withheld meanwhile).
         assert any(b.get("type") == "text" for b in live["live_blocks"])
+        # The save is an off-loop writer job: its rows, the cutoff advance
+        # and the live_blocks trim land together when it does.
+        from core.events import chat_writer
+        assert await chat_writer.drain("pc3", timeout=5)
         # The saved row's id is now INSIDE the cutoff → a resume's id-based
         # truncation keeps it; the turn cannot be hidden from chat_history.
         assert pump._db_msg_cutoff_id > cutoff_before

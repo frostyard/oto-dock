@@ -276,3 +276,38 @@ async def test_fan_out_write_untracked_with_no_targets_stays_silent(monkeypatch)
 
     await wf.fan_out_write("agent-1", "workspace/rec.m4a", b"abc", include_idle=True)
     assert rec.types() == []
+
+
+@pytest.mark.asyncio
+async def test_fan_out_write_size_probe_stays_in_agent_tree(monkeypatch, tmp_path):
+    """The registry's bytes_total comes from the platform copy inside the
+    agent tree; a source path that resolves outside it is never stat'ed
+    (best-effort: the push still runs, the total reads 0)."""
+    import config
+    from services.remote import workspace_fanout as wf
+
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path / "agents")
+    inside = tmp_path / "agents" / "agent-1" / "workspace" / "rec.m4a"
+    inside.parent.mkdir(parents=True)
+    inside.write_bytes(b"abcdef")
+    outside = tmp_path / "elsewhere.m4a"
+    outside.write_bytes(b"0123456789")
+
+    rec = _Recorder()
+    tr.set_broadcaster(rec)
+    monkeypatch.setattr(wf, "fanout_targets", lambda *a, **k: [])
+
+    async def _no_idle(*a, **k):
+        return []
+    monkeypatch.setattr(wf, "idle_connected_targets", _no_idle)
+
+    await wf.fan_out_write(
+        "agent-1", "workspace/rec.m4a", inside, include_idle=True,
+        transfer_kind="upload", transfer_id="t-in",
+    )
+    assert tr.get("t-in").bytes_total == 6
+    await wf.fan_out_write(
+        "agent-1", "workspace/rec.m4a", outside, include_idle=True,
+        transfer_kind="upload", transfer_id="t-out",
+    )
+    assert tr.get("t-out").bytes_total == 0

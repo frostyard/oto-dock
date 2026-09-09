@@ -43,4 +43,4 @@ When the caller agent asks a question mid-call:
 - **Scheduling conflicts** → check the calendar if available, approve or decline accordingly.
 - **Preference questions** (seating, dietary, special requests) → ask the user if not obvious from context.
 - **Simple factual questions** (name, number of people) → answer directly from the call context.
-- **Anything uncertain** → ask the user. You can interact with the user while the call is on hold.
+- **Anything uncertain** → ask the user. Nobody is put on hold: the call stays live, the caller agent tells the other person it is checking and keeps the conversation going until your answer arrives — so answer promptly (the caller gives up waiting after about 40 seconds and offers to call back).

@@ -236,3 +236,38 @@ class TestTierDecision:
     def test_unknown_tier_treated_as_sensitive(self):
         assert mcp_permissions.tier_decision("bogus", "acceptEdits") == "prompt"
         assert mcp_permissions.tier_decision("bogus", "dontAsk") == "allow"
+
+
+# ---------------------------------------------------------------------------
+# canonical_tool_name — Codex's sanitized server keys map back to the manifest
+# ---------------------------------------------------------------------------
+#
+# Codex names MCP tools for its PreToolUse hook with the server key sanitized
+# (``meetings-mcp`` → ``meetings_mcp``). Observed live 2026-09-09: a Codex
+# meeting participant's ``mcp__meetings_mcp__direct_to`` missed the manifest's
+# ``open`` rule, fell to the default tier and parked the meeting on a
+# permission card in acceptEdits mode.
+
+
+class TestCanonicalToolName:
+    def test_sanitized_server_key_maps_to_the_manifest(self, manifests):
+        manifests["meetings-mcp"] = _mk("meetings-mcp")
+        assert (mcp_permissions.canonical_tool_name("mcp__meetings_mcp__direct_to")
+                == "mcp__meetings-mcp__direct_to")
+
+    def test_exact_server_name_and_non_mcp_tools_are_untouched(self, manifests):
+        manifests["meetings-mcp"] = _mk("meetings-mcp")
+        manifests["my_tools"] = _mk("my_tools")
+        assert (mcp_permissions.canonical_tool_name("mcp__meetings-mcp__direct_to")
+                == "mcp__meetings-mcp__direct_to")
+        assert mcp_permissions.canonical_tool_name("mcp__my_tools__go") == "mcp__my_tools__go"
+        assert mcp_permissions.canonical_tool_name("Bash") == "Bash"
+        assert mcp_permissions.canonical_tool_name("mcp__meetings_mcp") == "mcp__meetings_mcp"
+
+    def test_unknown_server_stays_as_is(self, manifests):
+        assert mcp_permissions.canonical_tool_name("mcp__ghost_x__y") == "mcp__ghost_x__y"
+
+    def test_server_name_override_is_the_key(self, manifests):
+        manifests["gh"] = _mk("gh", server_name="github-mcp")
+        assert (mcp_permissions.canonical_tool_name("mcp__github_mcp__list_issues")
+                == "mcp__github-mcp__list_issues")

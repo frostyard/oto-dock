@@ -154,7 +154,12 @@ def nouser_read_targets(user) -> set[str]:
     service callers are unfiltered anyway. Every consuming surface clamps
     edge reads to the target's AGENT-SCOPE rows, and an edge never grants
     writes or fire authority (rule 2).
+
+    EXTERNAL principals (phone callers who are not platform users) get
+    nothing: the roster is an agent-to-agent grant, and a caller is neither.
     """
+    if getattr(user, "is_external", False):
+        return set()
     if not (getattr(user, "is_no_user_session", False) and user.agent):
         return set()
     from storage import agent_store

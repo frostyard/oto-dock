@@ -38,6 +38,13 @@ describe('getToolDetail — collapsed pill title', () => {
   it('non-Bash tools keep summary precedence', () => {
     expect(getToolDetail('Read', 'notes.md', { file_path: '/workspace/notes.md' })).toBe('notes.md')
   })
+
+  it('Direct-LLM builtins show the path, the skill name, or the query', () => {
+    expect(getToolDetail('Delete', undefined, { file_path: '/workspace/old.md' })).toBe('/workspace/old.md')
+    expect(getToolDetail('Skill', undefined, { name: 'task-scheduling-guide' })).toBe('task-scheduling-guide')
+    expect(getToolDetail('tool_search', undefined, { query: 'schedule a task' })).toBe('schedule a task')
+    expect(getToolDetail('tool_search', undefined, {})).toBe('')
+  })
 })
 
 describe('eventToBlock — expandable pill data from persisted events', () => {

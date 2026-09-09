@@ -74,6 +74,21 @@ def _serialize_content_blocks(content_blocks: list) -> list[dict]:
     return result
 
 
+def _server_tool_result_preview(block) -> str:
+    """A short human-readable preview of a server tool's result block for
+    the dashboard's tool row (``result_preview``): a count for list results
+    (web search hits), the error code for an error, else the block's text."""
+    content = getattr(block, "content", None)
+    if isinstance(content, list):
+        return f"{len(content)} result(s)"
+    err = getattr(content, "error_code", None) if content is not None else None
+    if err:
+        return f"error: {err}"
+    if content is None:
+        return ""
+    return str(content)[:200]
+
+
 class AnthropicAdapter(ProviderAdapter):
     """Anthropic Claude API adapter."""
 
@@ -139,7 +154,7 @@ class AnthropicAdapter(ProviderAdapter):
             # Tools — filter out server-side tools for models that don't support them,
             # then mark last tool as cache breakpoint
             if not app_config.model_supports_server_tools(model):
-                # Remove server-side tools (they have 'type' field like 'web_search_20260209')
+                # Remove server-side tools (they have 'type' field like 'web_search_20250305')
                 tools = [t for t in tools if "input_schema" in t]
             if tools:
                 formatted_tools = list(tools)
@@ -152,6 +167,14 @@ class AnthropicAdapter(ProviderAdapter):
             # Stream response
             current_tool_json = ""
             final_message = None
+            # Server-side tools (web_search, web_fetch, code_execution …) run
+            # inside the API: their call is a ``server_tool_use`` block and
+            # their result the following ``*_tool_result`` block. The runner
+            # never executes them, so it is the result block that ends the
+            # tool's turn for the dashboard (tool_end) — without it the tool
+            # row spun forever (live-hit 2026-09-07). Tracked by id so a
+            # server tool the stream never answers is still closed at the end.
+            open_server_tools: dict[str, str] = {}
 
             try:
                 async with client.messages.stream(**api_kwargs) as stream:
@@ -172,10 +195,19 @@ class AnthropicAdapter(ProviderAdapter):
                                 )
                             elif block.type == "server_tool_use":
                                 # Server-side tool (web_search, web_fetch)
+                                open_server_tools[block.id] = block.name
                                 yield ProviderStreamEvent(
                                     type="tool_start",
                                     tool_name=block.name,
                                     tool_id=block.id,
+                                )
+                            elif str(block.type).endswith("_tool_result"):
+                                result_id = getattr(block, "tool_use_id", "") or ""
+                                yield ProviderStreamEvent(
+                                    type="tool_result",
+                                    tool_name=open_server_tools.pop(result_id, ""),
+                                    tool_id=result_id,
+                                    text=_server_tool_result_preview(block),
                                 )
 
                         elif event.type == "content_block_delta":
@@ -189,6 +221,14 @@ class AnthropicAdapter(ProviderAdapter):
                                 yield ProviderStreamEvent(
                                     type="tool_input_delta",
                                     tool_input_json=event.delta.partial_json,
+                                )
+                            elif getattr(event.delta, "thinking", None):
+                                # Adaptive thinking streams its text as
+                                # thinking_delta blocks (signature_delta is
+                                # opaque and stays ignored).
+                                yield ProviderStreamEvent(
+                                    type="thinking_delta",
+                                    text=event.delta.thinking,
                                 )
 
                         elif event.type == "content_block_stop":
@@ -216,6 +256,15 @@ class AnthropicAdapter(ProviderAdapter):
                     # Get final assembled message
                     final_message = await stream.get_final_message()
 
+                # A server tool whose result block never came (the stream
+                # ended first): close its row rather than leave it spinning.
+                for tool_id, tool_name in open_server_tools.items():
+                    yield ProviderStreamEvent(
+                        type="tool_result", tool_name=tool_name, tool_id=tool_id,
+                        text="",
+                    )
+                open_server_tools.clear()
+
             except anthropic.APIError as e:
                 raise ProviderError(
                     message=str(e),
@@ -226,6 +275,10 @@ class AnthropicAdapter(ProviderAdapter):
             # Extract usage
             if final_message and final_message.usage:
                 u = final_message.usage
+                # The SDK accumulates the cumulative message_delta usage, so a
+                # server-tool turn reports every iteration's tokens here; the
+                # searches it ran (billed per call) ride in server_tool_use.
+                server = getattr(u, "server_tool_use", None)
                 yield ProviderStreamEvent(
                     type="usage",
                     usage=ProviderUsage(
@@ -233,6 +286,7 @@ class AnthropicAdapter(ProviderAdapter):
                         output_tokens=u.output_tokens or 0,
                         cache_write_tokens=getattr(u, "cache_creation_input_tokens", 0) or 0,
                         cache_read_tokens=getattr(u, "cache_read_input_tokens", 0) or 0,
+                        web_search_requests=getattr(server, "web_search_requests", 0) or 0,
                     ),
                 )
 

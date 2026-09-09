@@ -23,6 +23,7 @@ async def create_llm_backend(
     caller_phone: str = "",
     caller_did: str = "",
     dial_event: dict | None = None,
+    pin_verified: bool = False,
 ) -> ProxyClient:
     """Create the LLM backend for a phone route.
 
@@ -41,7 +42,8 @@ async def create_llm_backend(
     message so it can resolve the route → trigger linkage and build a
     ``${trigger.*}`` payload enriching manifest ``agent_context`` blocks.
     Empty defaults mean "no enrichment" — the call proceeds with the base
-    prompt.
+    prompt. ``pin_verified`` is the PIN gate's result (inbound routes with a
+    PIN) — it rides the warmup so the proxy can trust the caller's identity.
     """
     override = route.phone_context_override or ""
     common_kwargs = dict(
@@ -53,6 +55,7 @@ async def create_llm_backend(
         caller_phone=caller_phone,
         caller_did=caller_did,
         dial_event=dial_event,
+        pin_verified=pin_verified,
     )
     if route.llm_mode == "direct":
         client = ProxyClient(

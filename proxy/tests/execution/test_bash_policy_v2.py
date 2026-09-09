@@ -224,6 +224,43 @@ class TestInputRedirect:
         assert d.allowed
 
 
+# ===== Network pseudo-devices are sockets, not files — never floor-denied =====
+
+class TestNetworkPseudoDevices:
+    """``/dev/tcp/…`` / ``/dev/udp/…`` left the catastrophe floor: the sandbox
+    netns (local) and the pairing decision (remote) govern network reach, so
+    the gate neither denies the pattern nor treats the pseudo-path as a file
+    that must fall inside the role's read/write scope."""
+
+    CMDS = [
+        "exec 3<>/dev/tcp/example.com/80",
+        "cat </dev/tcp/example.com/80",
+        "echo ping > /dev/udp/192.168.1.1/53",
+        "bash -c 'exec 3<>/dev/tcp/example.com/443'",
+    ]
+
+    @pytest.mark.parametrize("cmd", CMDS)
+    def test_allowed_for_viewer_local(self, cmd):
+        assert _d(cmd, _ctx(role="viewer")).allowed, cmd
+
+    @pytest.mark.parametrize("cmd", CMDS)
+    def test_allowed_for_admin_on_admin_agent(self, cmd):
+        assert _d(cmd, _ctx(role="admin", is_admin_agent=True)).allowed, cmd
+
+    @pytest.mark.parametrize("cmd", CMDS)
+    def test_allowed_on_home_restricted_satellite(self, cmd):
+        ctx = SecurityContext(
+            role="editor", username="alice", agent="personal-assistant",
+            is_admin_agent=False, target_kind="admin_remote",
+            target_home_dir="/home/alice", target_allow_full_fs=False,
+        )
+        assert _d(cmd, ctx).allowed, cmd
+
+    def test_real_device_writes_stay_denied(self):
+        assert not _d("echo x > /dev/sda").allowed
+        assert not _d("cat /dev/tcp/example.com/80 > /dev/sdb").allowed
+
+
 # ===== Backstop survives wrapping (agent-config; raw-string regex) =====
 # Proves the raw-command backstops still fire when the reference is hidden in a
 # `bash -c "…"` / `$(…)` wrapper (the backstop runs on the raw command BEFORE
@@ -398,4 +435,129 @@ class TestRelativePathSessionAnchor:
 
     def test_absolute_escape_still_denied(self):
         d = _d("cat /etc/sudoers")
+        assert not d.allowed
+
+
+# ===== Assignment-only segments are shell structure, not a parse failure =====
+# (2026-09-05: `F=/x`, `x=1 y=2`, `F=a && grep … $F` were hard-denied "could
+# not parse command" — the parse-deny now covers only genuinely unparseable
+# text such as a dangling backslash.)
+
+class TestAssignmentOnlySegments:
+    @pytest.mark.parametrize("cmd", [
+        "F=/tmp/x",
+        "x=1 y=2",
+        "F=engineering-status.html && grep -c x $F",
+        "CLI=/usr/lib/node_modules/cli.js; ls -la \"$CLI\"",
+        "OUT=out.txt\necho $OUT",
+    ])
+    def test_assignment_only_is_read_structure(self, cmd):
+        d = _d(cmd)
+        assert d.allowed, d.reason
+        assert not d.destructive
+
+    def test_assignment_with_own_redirect_is_edit(self):
+        d = _d("F=x > /users/alice/workspace/out.txt")
+        assert d.allowed and d.permission_tier == "edit"
+
+    def test_assignment_with_cross_user_redirect_denied(self):
+        d = _d("F=x > /users/bob/workspace/out.txt")
+        assert not d.allowed
+
+    def test_bare_redirect_truncate_is_edit_and_path_checked(self):
+        assert _d(": > /users/alice/workspace/log").permission_tier == "edit"
+        assert not _d(": > /users/bob/workspace/log").allowed
+
+    def test_assignment_with_substitution_still_recurses(self):
+        assert not _d("F=$(rm -rf /)").allowed          # dangerous inner
+        assert _d("F=$(date)").permission_tier == "ask"  # unanalyzable outer
+
+    def test_dangling_backslash_still_parse_denied(self):
+        d = _d("echo \\")
+        assert not d.allowed and "could not parse" in d.reason
+
+    def test_admin_floor_unchanged(self):
+        d = _d("F=/x; x=1 y=2", _ctx(role="admin", is_admin_agent=True))
+        assert d.allowed and d.permission_tier == "admin"
+
+
+# ===== Shell structure is peeled off so the wrapped command is classified =====
+# (2026-09-05: `do rm -rf x`, `then cat /users/bob/x`, `{ rm x`, `! grep`,
+# `( mv a b )`, `done < f` all classified as the KEYWORD (read tier) — the
+# command behind it never reached the tier / path / destructive checks.)
+
+class TestShellStructureIsStripped:
+    def test_loop_body_destructive_is_flagged(self):
+        d = _d("for f in x; do rm -rf /users/alice/workspace/y; done")
+        assert d.allowed and d.destructive and d.permission_tier == "edit"
+
+    def test_brace_group_destructive_is_flagged(self):
+        d = _d("{ rm -rf /users/alice/workspace/z; }")
+        assert d.allowed and d.destructive
+
+    @pytest.mark.parametrize("cmd", [
+        "then cat /users/bob/workspace/secret.txt",
+        "if grep -q x /users/bob/workspace/f; then echo y; fi",
+        "! grep -q x /users/bob/workspace/f",
+        "( mv a /users/bob/workspace/x )",
+        "done < /users/bob/workspace/secret.txt",
+        "while read -r l; do echo $l; done < /users/bob/workspace/secret.txt",
+        "case $x in a) cat /users/bob/workspace/f ;; esac",
+        "if ! timeout 5 cat /users/bob/workspace/f; then echo no; fi",
+        "elif [ -f x ]; then\n  cat /users/bob/workspace/f\nfi",
+    ])
+    def test_cross_user_paths_behind_structure_denied(self, cmd):
+        assert not _d(cmd).allowed
+
+    @pytest.mark.parametrize("cmd", ["( cd a && make )", "(cd a && make)",
+                                     "( (cd a; make) )"])
+    def test_subshell_takes_the_inner_tier(self, cmd):
+        d = _d(cmd)
+        assert d.allowed and d.permission_tier == "extended"  # make, not "ask"
+
+    def test_loop_body_extended_takes_its_tier(self):
+        d = _d("for u in a b; do curl $u; done")
+        assert d.allowed and d.permission_tier == "extended"
+
+    @pytest.mark.parametrize("cmd", [
+        "while read -r l; do echo $l; done",
+        "while :; do sleep 1; done",
+        "if [ -f x ]; then echo y; else echo n; fi",
+        "if [[ \"$a\" > \"$b\" ]]; then echo gt; fi",   # [[ ]] compares, no redirect
+        "((i++))",
+        "do", "then", "(", "{", "! true",
+        "mapfile -t arr < <(echo a)",
+    ])
+    def test_quiet_structure_stays_read(self, cmd):
+        d = _d(cmd)
+        assert d.allowed, d.reason
+        assert d.permission_tier in ("read", "ask"), (cmd, d.permission_tier)
+        if cmd != "mapfile -t arr < <(echo a)":      # process subst → ask (unchanged)
+            assert d.permission_tier == "read", (cmd, d.permission_tier)
+
+    def test_single_bracket_redirect_is_real(self):
+        # `[ a > b ]` DOES create b in bash — checked, unlike [[ ]].
+        assert not _d("[ \"$a\" > /users/bob/workspace/b ]").allowed
+
+    def test_trailing_paren_strip_is_quote_and_escape_aware(self):
+        assert _d("echo \")\"").permission_tier == "read"
+        assert _d("echo \\)").permission_tier == "read"
+
+    def test_command_builtin_unwraps(self):
+        assert _d("command -v python3").permission_tier == "read"
+        assert _d("command -pv python3").permission_tier == "read"
+        d = _d("command rm -rf /users/alice/workspace/x")
+        assert d.allowed and d.destructive
+        d = _d("builtin cd /users/alice/workspace")
+        assert d.allowed and d.permission_tier == "read"
+        assert not _d("command cat /users/bob/workspace/f").allowed
+
+    def test_dangerous_floor_still_universal_behind_structure(self):
+        assert not _d("do rm -rf /").allowed
+        assert not _d("( rm -rf / )", _ctx(role="admin", is_admin_agent=True)).allowed
+
+    def test_heredoc_and_newline_behaviour_unchanged(self):
+        d = _d("cat > workspace/x.py <<'EOF'\ndo_something()\nEOF")
+        assert d.allowed and d.permission_tier == "edit"
+        d = _d("echo a\nthen cat /users/bob/workspace/f")
         assert not d.allowed

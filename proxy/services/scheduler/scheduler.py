@@ -331,6 +331,11 @@ async def _reap_prior_lane_pump(chat_id: str, run_id: str) -> None:
         # Wait WITHOUT cancelling — the pump's finally flushes the partial
         # turn; a laggard past the timeout is left to finish on its own.
         await asyncio.wait([prior._task], timeout=5.0)
+    # The pump's rows are writer-lane jobs: wait for them to land before
+    # this round reads its output cursor, or the prior round's tail would be
+    # collected as this run's output.
+    from core.events import chat_writer
+    await chat_writer.drain(chat_id, timeout=5.0)
 
 
 # Hard max-time backstop for an interactive task run:
@@ -1606,6 +1611,7 @@ async def _deliver_via_oneshot(
     _os_is_remote = _os_kind in ("admin_remote", "user_remote")
     _os_has_display = remote_store.get_target_has_display(_os_kind, target)
     _os_grants = remote_store.get_target_device_grants(_os_kind, target)
+    _os_browser = remote_store.get_target_browser_settings(_os_kind, target)
     agent_prompt = config.build_agent_prompt(
         agent, client_type="task",
         is_remote=_os_is_remote, target_has_display=_os_has_display,
@@ -1614,7 +1620,7 @@ async def _deliver_via_oneshot(
     mcp_config, _, _, _, _ = mcp_registry.build_session_mcp_config(
         agent, None, task_mode=True, task_scope="agent",
         is_remote=_os_is_remote, target_has_display=_os_has_display,
-        target_device_grants=_os_grants,
+        target_device_grants=_os_grants, target_browser=_os_browser,
     )
     # A LOCAL one-shot resume MUST run sandboxed + network-isolated like every
     # other session — the local layers fail closed without a sandbox dir. Resolve
@@ -2288,6 +2294,10 @@ async def _watch_task_pump(layer, pump, run_id: str, chat_id: str,
             # Wait WITHOUT cancelling — the pump's finally persists the
             # partial turn; a laggard is simply left to finish.
             await asyncio.wait([pump._task], timeout=2.0)
+        # ...and its rows are writer-lane jobs — let them land so the failure
+        # record collects the partial output.
+        from core.events import chat_writer
+        await chat_writer.drain(chat_id, timeout=2.0)
         try:
             await layer.prepare_resume(session_id)
         except Exception:

@@ -8,6 +8,7 @@ Behavior is pinned by tests/session/test_ws_dashboard_*.
 """
 
 import asyncio
+import functools
 import json
 import logging
 import re
@@ -18,6 +19,8 @@ from pathlib import Path
 from fastapi import WebSocketDisconnect
 import config
 from storage import database as task_store, agent_store
+from storage.pg import run_db
+from core.events import chat_writer
 from services.notifications import notification_manager
 from core.session.session_state import (
     _chat_streaming_state,
@@ -58,12 +61,14 @@ from ws.dashboard import (
     _EXTERNAL_DRIVEN_SOURCES,
     _build_chat_restore,
     _effective_agent_role,
+    _role_and_layer,
     _host_to_sandbox_path,
     _model_allowed_for_path,
     _save_base64_image,
     _task_continue_allowed,
     chat_process_alive,
     task_run_active,
+    task_run_active_async,
 )
 
 logger = logging.getLogger("claude-proxy")
@@ -94,6 +99,35 @@ _STOP_AND_SEND_NOTE = (
     "previous turn was interrupted mid-step so you can respond now. "
     "Completed work and running background tasks are unaffected.]"
 )
+
+
+_PROVIDER_WORDS = {
+    "openai": "OpenAI",
+    "ollama": "the Ollama endpoint",
+    "openai_compatible": "the local OpenAI-compatible endpoint",
+}
+
+
+def _codex_provider_switch_blocker(session_id: str, new_model: str) -> str:
+    """Non-empty user-facing reason when ``new_model`` belongs to a different
+    provider than the subscription the live Codex session is bound to. Codex
+    fixes ``model_provider`` in config.toml at session start, so the switch
+    cannot be applied to a running session; empty when nothing is bound
+    (pool-external credentials) or the provider is the same."""
+    from services.engines import subscription_pool
+    from storage import subscription_store
+    sub_id = subscription_pool.get_session_subscription(session_id)
+    if not sub_id or sub_id == "default":
+        return ""
+    bound = (subscription_store.get_subscription(sub_id) or {}).get("provider") or ""
+    wanted = config.get_model_provider(new_model, layer="codex-cli")
+    if not bound or bound == wanted:
+        return ""
+    return (
+        "Codex keeps its model provider for the life of a chat: this chat runs on "
+        f"{_PROVIDER_WORDS.get(bound, bound)} and {new_model} needs "
+        f"{_PROVIDER_WORDS.get(wanted, wanted)}. Start a new chat to use it."
+    )
 
 
 def _queued_outgoing(stop_flags: dict, combined: str) -> str:
@@ -154,7 +188,7 @@ class ChatController:
         # DB using the chat_id the client sent. Without this, the auto-warmup
         # below is skipped and the user sees "No session — send warmup first".
         if msg_chat_id and (not self.chat_id or not self.agent_name):
-            chat = task_store.get_chat(msg_chat_id)
+            chat = await run_db(task_store.get_chat, msg_chat_id)
             if chat:
                 allowed = chat["user_sub"] == self.user_sub or self.user_role == "admin"
                 if not allowed:
@@ -192,15 +226,12 @@ class ChatController:
 
                     self.chat_id = msg_chat_id
                     self.agent_name = chat["agent"]
-                    chat_exec_path = chat.get("execution_path", "")
-                    recover_role = _effective_agent_role(self.user_sub, self.agent_name, fallback_user=self.user)
                     # Pinned target for resume affinity — the recovered layer
                     # drives liveness/resume checks for this chat's session
-                    # (see _do_warmup).
-                    self.layer = get_execution_layer(
-                        self.agent_name, execution_path=chat_exec_path,
-                        user_sub=self.user_sub, role=recover_role,
-                        execution_target=chat.get("execution_target") or "",
+                    # (see _do_warmup). Role + layer in ONE executor job.
+                    _, self.layer = await run_db(
+                        _role_and_layer, self.user_sub, self.agent_name, chat,
+                        fallback_user=self.user,
                     )
                     # If a pump is already running for this chat (orphaned task,
                     # meeting, or a turn from a now-dead WS), attach to it
@@ -300,17 +331,13 @@ class ChatController:
                         return
                     # The finished warmup may have bound a NEW session id to the
                     # chat row — adopt it (+ its layer) before re-checking.
-                    _cur = task_store.get_chat(self.chat_id) or {}
+                    _cur = await run_db(task_store.get_chat, self.chat_id) or {}
                     _cur_sid = _cur.get("session_id") or ""
                     if _cur_sid and _cur_sid != self.session_id:
                         self.session_id = _cur_sid
-                        _cur_role = _effective_agent_role(
-                            self.user_sub, self.agent_name, fallback_user=self.user)
-                        self.layer = get_execution_layer(
-                            self.agent_name,
-                            execution_path=_cur.get("execution_path", ""),
-                            user_sub=self.user_sub, role=_cur_role,
-                            execution_target=_cur.get("execution_target") or "",
+                        _, self.layer = await run_db(
+                            _role_and_layer, self.user_sub, self.agent_name, _cur,
+                            fallback_user=self.user,
                         )
                     alive = self.layer and await self.layer.is_session_alive(self.session_id)
             if not alive:
@@ -401,7 +428,7 @@ class ChatController:
         # no `/users/{u}/`. All other agents' chats are user-scoped — sandbox
         # mounts `/users/{u}/` (and `/workspace/` for managers). Mirrors the
         # `pump_scope` derivation in `_start_new_stream` above.
-        if not self.agent_name or not agent_store.agent_exists(self.agent_name):
+        if not self.agent_name or not await run_db(agent_store.agent_exists, self.agent_name):
             await self._send_error("Unknown agent")
             return
         is_agent_scoped = _vis.is_shared_only(self.agent_name)
@@ -435,13 +462,6 @@ class ChatController:
             is_direct_llm=is_direct_llm,
         )
 
-        # Shared-only: detect a change of hands BEFORE persisting this message
-        # (afterwards the sender IS the last author). Drives the speaker-
-        # transition note injected below.
-        prev_author = ""
-        if is_agent_scoped and self.chat_id and not server_kick:
-            prev_author = task_store.get_last_user_message_author(self.chat_id)
-
         # Save original user text to DB (without image/file paths injection)
         event_meta = {}
         if image_meta:
@@ -449,49 +469,70 @@ class ChatController:
         if valid_files:
             event_meta["files"] = valid_files
         event_data = json.dumps(event_meta) if event_meta else ""
-        if not server_kick and not artifact_framed:
-            task_store.add_chat_message(self.chat_id, "user", text, event_data=event_data, author_sub=self.user_sub)
 
-        # Stable deterministic title at first-message time — set once when the
-        # chat has no title yet. No LLM, no post-turn rename churn.
-        if self.chat_id:
-            chat_rec = task_store.get_chat(self.chat_id)
-            if chat_rec and not chat_rec.get("title") and not artifact_framed:
-                _title = self._deterministic_title(text)
-                task_store.update_chat(self.chat_id, title=_title)
-                # BOTH sends, deliberately: the broadcast reaches every other
-                # viewer's sidebar + Active-now widget now, but the SENDING
-                # socket's notify queue drains only between turns — the direct
-                # send is what titles the sending tab for the whole first
-                # turn. The client's title_updated patch is idempotent.
-                await self._send({"type": "title_updated", "chat_id": self.chat_id, "title": _title})
-                try:
-                    notification_manager.broadcast_chat_title(
-                        chat_rec.get("user_sub") or "", self.chat_id, _title,
-                        agent=chat_rec.get("agent") or "",
-                    )
-                except Exception:
-                    logger.debug("first-message title broadcast failed for %s",
-                                 self.chat_id, exc_info=True)
+        # ONE chat-lane job for the send-time row work, ordered against the
+        # pump's rows and against any other sender of the same chat:
+        #   * Shared-only: the previous author, read BEFORE this message
+        #     persists (afterwards the sender IS the last author) — drives
+        #     the speaker-transition note injected below.
+        #   * The user row.
+        #   * The stable deterministic title at first-message time — ONE
+        #     conditional write, so a rename that already landed wins. No
+        #     LLM, no post-turn rename churn.
+        #   * The cancelled-turn context: a hard abort (killpg / stream
+        #     cancel) loses the partial turn engine-side, so it is read back
+        #     from our DB and prepended; a GRACEFUL abort kept it in the
+        #     engine's own history — injecting would duplicate it. Skipped
+        #     while a history seed is pending (the digest injected at
+        #     _start_new_stream already contains the aborted turn).
+        _cid = self.chat_id
+        _sender = self.user_sub
+        _persist_row = not server_kick and not artifact_framed
+        _read_prev_author = is_agent_scoped and bool(_cid) and not server_kick
+        _title = self._deterministic_title(text) if (_cid and not artifact_framed) else ""
 
-            # Inject cancelled turn context if previous turn was aborted AND
-            # the abort was a hard kill (killpg / stream cancel) — those paths
-            # lose the partial turn engine-side, so we read it from our DB and
-            # prepend it. A GRACEFUL abort (last_abort_graceful) kept the
-            # partial turn in the engine's own history — injecting would
-            # duplicate it. Skipped while a history seed is pending — the
-            # digest injected at _start_new_stream already contains the
-            # aborted turn.
-            if chat_rec and chat_rec.get("last_turn_aborted") \
-                    and not chat_rec.get("pending_history_seed"):
-                graceful_abort = bool(chat_rec.get("last_abort_graceful"))
-                task_store.update_chat(self.chat_id, last_turn_aborted=False,
+        def _send_job() -> dict:
+            out = {"prev_author": "", "title_set": False, "rec": None, "cancelled": ""}
+            if _read_prev_author:
+                out["prev_author"] = task_store.get_last_user_message_author(_cid)
+            if _persist_row:
+                task_store.add_chat_message(_cid, "user", text, event_data=event_data,
+                                            author_sub=_sender)
+            if not _cid:
+                return out
+            rec = task_store.get_chat(_cid)
+            out["rec"] = rec
+            if rec and _title and task_store.set_chat_title_if_unset(_cid, _title):
+                out["title_set"] = True
+            if rec and rec.get("last_turn_aborted") and not rec.get("pending_history_seed"):
+                graceful_abort = bool(rec.get("last_abort_graceful"))
+                task_store.update_chat(_cid, last_turn_aborted=False,
                                        last_abort_graceful=False)
                 if not graceful_abort:
-                    cancelled = self._build_cancelled_context(self.chat_id)
-                    if cancelled:
-                        cli_text = cancelled + "\n\n" + cli_text
-                        logger.info(f"WS dashboard: injected cancelled turn context ({len(cancelled)} chars) for chat={self.chat_id}")
+                    out["cancelled"] = self._build_cancelled_context(_cid)
+            return out
+
+        sent = await chat_writer.submit(_cid, _send_job, label="chat_send")
+        prev_author = sent["prev_author"]
+        chat_rec = sent["rec"]
+        if sent["title_set"]:
+            # BOTH sends, deliberately: the broadcast reaches every other
+            # viewer's sidebar + Active-now widget now, but the SENDING
+            # socket's notify queue drains only between turns — the direct
+            # send is what titles the sending tab for the whole first
+            # turn. The client's title_updated patch is idempotent.
+            await self._send({"type": "title_updated", "chat_id": self.chat_id, "title": _title})
+            try:
+                notification_manager.broadcast_chat_title(
+                    (chat_rec or {}).get("user_sub") or "", self.chat_id, _title,
+                    agent=(chat_rec or {}).get("agent") or "",
+                )
+            except Exception:
+                logger.debug("first-message title broadcast failed for %s",
+                             self.chat_id, exc_info=True)
+        if sent["cancelled"]:
+            cli_text = sent["cancelled"] + "\n\n" + cli_text
+            logger.info(f"WS dashboard: injected cancelled turn context ({len(sent['cancelled'])} chars) for chat={self.chat_id}")
 
         # Speaker-transition note (Shared-only): the resumed transcript may
         # carry other teammates' turns, and the warmup's identity line names
@@ -525,7 +566,14 @@ class ChatController:
                 combined = "\n\n".join(self.message_queue)
                 self.message_queue.clear()
                 await self._send({"type": "queue_sent", "text": combined})
-                task_store.add_chat_message(self.chat_id, "user", combined, author_sub=self.user_sub)
+                # Lane-ordered after the finished turn's rows (drained at its
+                # pump end) and before the next pump's.
+                await chat_writer.submit(
+                    self.chat_id,
+                    functools.partial(task_store.add_chat_message, self.chat_id,
+                                      "user", combined, author_sub=self.user_sub),
+                    label="queue_drain",
+                )
                 pump = await self._start_new_stream(
                     combined,
                     target_session_id=self.session_id,
@@ -545,12 +593,17 @@ class ChatController:
                 from ws import artifact_interactions as _ai
                 batch = list(self.artifact_queue)
                 self.artifact_queue.clear()
+                _rows = [(_ai.event_type(it), _ai.event_row_json(it)) for it in batch]
+                _bcid = self.chat_id
+
+                def _batch_job(_r=_rows) -> None:
+                    for _etype, _edata in _r:
+                        task_store.add_chat_message(
+                            _bcid, "event", "", event_type=_etype, event_data=_edata,
+                        )
+
+                await chat_writer.submit(_bcid, _batch_job, label="artifact_batch")
                 for it in batch:
-                    task_store.add_chat_message(
-                        self.chat_id, "event", "",
-                        event_type=_ai.event_type(it),
-                        event_data=_ai.event_row_json(it),
-                    )
                     await self._send(_ai.ws_frame(it, self.chat_id or ""))
                 pump = await self._start_new_stream(
                     _ai.frame_text(batch),
@@ -658,7 +711,7 @@ class ChatController:
         from core.concurrency import acquire_chat_slot
         await acquire_chat_slot(isess.session_id, target=isess.target)
         self.session_id = isess.session_id
-        chat_rec = task_store.get_chat(self.chat_id) or {}
+        chat_rec = await run_db(task_store.get_chat, self.chat_id) or {}
         await self._send({
             "type": "warmup_ready",
             "session_id": self.session_id,
@@ -678,10 +731,16 @@ class ChatController:
                 event_meta["images"] = image_meta
             if valid_files:
                 event_meta["files"] = valid_files
-            task_store.add_chat_message(
-                self.chat_id, "user", text,
-                event_data=json.dumps(event_meta) if event_meta else "",
-                author_sub=self.user_sub,
+            # Awaited: the row must exist before note_sent_prompt below, or
+            # the tailer's duplicate-skip and the row race.
+            await chat_writer.submit(
+                self.chat_id,
+                functools.partial(
+                    task_store.add_chat_message, self.chat_id, "user", text,
+                    event_data=json.dumps(event_meta) if event_meta else "",
+                    author_sub=self.user_sub,
+                ),
+                label="live_send",
             )
         user_tz = get_session_user_tz(self.session_id) or get_user_tz(self.user_sub)
         stamped = (
@@ -727,7 +786,7 @@ class ChatController:
         if interaction is None:
             return await ack("denied", err)
         # Meeting turn flow is managed — no page-event injection mid-meeting.
-        if task_store.get_active_meeting_for_chat(chat_id):
+        if await run_db(task_store.get_active_meeting_for_chat, chat_id):
             return await ack("unavailable", "meeting in progress")
         if await self._deny_task_continue(chat_id):
             return await ack("denied", "task chat not continuable")
@@ -748,14 +807,20 @@ class ChatController:
             return await ack("queued" if queued else "denied",
                              "" if queued else "queue full")
 
-        # Idle: persist the distinct row, then run the framed turn through the
-        # normal chat path (auto-warmup, limits, cancelled-context — with the
-        # _artifact_framed downgrades). Ack BEFORE the turn so the artifact's
-        # button state settles while the agent works.
-        task_store.add_chat_message(
-            chat_id, "event", "",
-            event_type="artifact_interaction",
-            event_data=_ai.event_row_json(interaction),
+        # Idle: persist the distinct row (awaited — the framed turn below
+        # skips its own user row BECAUSE this one exists), then run the framed
+        # turn through the normal chat path (auto-warmup, limits,
+        # cancelled-context — with the _artifact_framed downgrades). Ack
+        # BEFORE the turn so the artifact's button state settles while the
+        # agent works.
+        await chat_writer.submit(
+            chat_id,
+            functools.partial(
+                task_store.add_chat_message, chat_id, "event", "",
+                event_type="artifact_interaction",
+                event_data=_ai.event_row_json(interaction),
+            ),
+            label="artifact_row",
         )
         await ack("sent")
         await self._handle_chat({
@@ -792,7 +857,7 @@ class ChatController:
         )
         if interaction is None:
             return await ack("denied", err)
-        if task_store.get_active_meeting_for_chat(chat_id):
+        if await run_db(task_store.get_active_meeting_for_chat, chat_id):
             return await ack("unavailable", "meeting in progress")
         if await self._deny_task_continue(chat_id):
             return await ack("denied", "task chat not continuable")
@@ -802,15 +867,17 @@ class ChatController:
         # A chat whose FIRST content is an app action (front-page button →
         # fresh chat) never gets the send-time title (the framed turn skips
         # it by design) — name it from the action itself, matching the chip:
-        # "Infra Dashboard — Refresh data". The LLM title upgrade may still
-        # improve it after the first completed turn.
-        chat_rec = task_store.get_chat(chat_id)
-        if chat_rec and not chat_rec.get("title"):
-            _title = self._deterministic_title(
-                f"{interaction['title'] or interaction['slug']} — "
-                f"{interaction['label'] or interaction['action_id']}"
-            )
-            task_store.update_chat(chat_id, title=_title)
+        # "Infra Dashboard — Refresh data". One conditional write on the
+        # chat's lane (a title that already landed wins). The LLM title
+        # upgrade may still improve it after the first completed turn.
+        _title = self._deterministic_title(
+            f"{interaction['title'] or interaction['slug']} — "
+            f"{interaction['label'] or interaction['action_id']}"
+        )
+        if await chat_writer.submit(
+            chat_id, functools.partial(task_store.set_chat_title_if_unset, chat_id, _title),
+            label="app_title",
+        ):
             await self._send({"type": "title_updated", "chat_id": chat_id,
                               "title": _title})
 
@@ -826,10 +893,13 @@ class ChatController:
             return await ack("queued" if queued else "denied",
                              "" if queued else "queue full")
 
-        task_store.add_chat_message(
-            chat_id, "event", "",
-            event_type="app_action",
-            event_data=_ai.event_row_json(interaction),
+        await chat_writer.submit(
+            chat_id,
+            functools.partial(
+                task_store.add_chat_message, chat_id, "event", "",
+                event_type="app_action", event_data=_ai.event_row_json(interaction),
+            ),
+            label="app_action_row",
         )
         await ack("sent")
         await self._handle_chat({
@@ -848,23 +918,32 @@ class ChatController:
         cid = msg.get("chat_id") or ""
         if not cid:
             return
-        chat = task_store.get_chat(cid)
-        if not chat:
+        _uid, _role, _agents = self.user_sub, self.user_role, set(self.user_agents)
+
+        def _read_job() -> tuple[str, str] | None:
+            # Access gate + the read mark in ONE executor job.
+            chat = task_store.get_chat(cid)
+            if not chat:
+                return None
+            owner = chat.get("user_sub", "")
+            chat_agent = chat.get("agent", "")
+            if owner != _uid and _role != "admin":
+                # Mirror the resume gate: assigned users may read agent-scoped
+                # chats of shared-only agents (+ phone conversations).
+                is_agent_scoped = (
+                    _vis.is_shared_only(chat_agent)
+                    or chat.get("source_type") == "phone"
+                    or _vis.is_shared_chat_owner(owner)
+                )
+                if not (chat_agent in _agents and is_agent_scoped):
+                    return None
+            task_store.mark_chat_read(cid, _vis.chat_history_owner(chat_agent, _uid))
+            return owner, chat_agent
+
+        res = await run_db(_read_job)
+        if res is None:
             return
-        owner = chat.get("user_sub", "")
-        chat_agent = chat.get("agent", "")
-        if owner != self.user_sub and self.user_role != "admin":
-            # Mirror the resume gate: assigned users may read agent-scoped
-            # chats of shared-only agents (+ phone conversations).
-            is_agent_scoped = (
-                _vis.is_shared_only(chat_agent)
-                or chat.get("source_type") == "phone"
-                or _vis.is_shared_chat_owner(owner)
-            )
-            if not (chat_agent in self.user_agents and is_agent_scoped):
-                return
-        identity = _vis.chat_history_owner(chat_agent, self.user_sub)
-        await asyncio.to_thread(task_store.mark_chat_read, cid, identity)
+        owner, chat_agent = res
         notification_manager.broadcast_chat_read(owner, cid, agent=chat_agent)
 
     async def _handle_resume_chat(self, msg: dict):
@@ -876,7 +955,7 @@ class ChatController:
             await self._send_error("chat_id required")
             return
 
-        chat = task_store.get_chat(cid)
+        chat = await run_db(task_store.get_chat, cid)
         if not chat:
             await self._send_error("Chat not found")
             return
@@ -913,14 +992,22 @@ class ChatController:
             # ready" bug). Send chat_history FIRST so the frontend clears its
             # switch-away discard guard (onChatHistory) before the replayed warmup_*
             # events re-render the "Getting ready" state on top of the prompt.
-            inflight_msgs, inflight_has_more = task_store.get_chat_messages_page(cid, _CHAT_PAGE)
+            def _inflight_job():
+                return (*task_store.get_chat_messages_page(cid, _CHAT_PAGE),
+                        _build_chat_restore(cid))
+
+            # A lane job: the first prompt was queued on this chat's lane by
+            # _persist_first_prompt — read it back behind that write.
+            inflight_msgs, inflight_has_more, inflight_restore = await chat_writer.submit(
+                cid, _inflight_job, label="inflight_history",
+            )
             await self._send({
                 "type": "chat_history",
                 "chat_id": cid,
                 "agent": chat["agent"],  # agent of record — URL normalization
                 "messages": inflight_msgs,
                 "has_more": inflight_has_more,
-                "restore": _build_chat_restore(cid),
+                "restore": inflight_restore,
                 "plans": [],
                 "total_cost": chat.get("total_cost") or 0,
                 "context_used": chat.get("context_used") or 0,
@@ -956,10 +1043,8 @@ class ChatController:
         # chat's session actually lives on, not wherever the agent is
         # currently targeted (resume affinity — see _do_warmup).
         chat_exec_path = chat.get("execution_path", "")
-        resume_role = _effective_agent_role(self.user_sub, self.agent_name, fallback_user=self.user)
-        self.layer = get_execution_layer(
-            self.agent_name, execution_path=chat_exec_path, user_sub=self.user_sub,
-            role=resume_role, execution_target=chat.get("execution_target") or "",
+        _, self.layer = await run_db(
+            _role_and_layer, self.user_sub, self.agent_name, chat, fallback_user=self.user,
         )
         effective_exec_path = resolve_execution_path(self.agent_name, chat_exec_path)
         chat_model = chat.get("model", "")
@@ -973,11 +1058,20 @@ class ChatController:
         # cursor over a mixed-id set is incoherent, so they load FULL (no paging).
         # Every other chat loads the newest page; older turns lazy-load on scroll-up.
         is_task_chat = cid.startswith("task-")
-        if is_task_chat:
-            messages = task_store.get_chat_messages(cid)
-            has_more = False
-        else:
-            messages, has_more = task_store.get_chat_messages_page(cid, _CHAT_PAGE)
+
+        def _history_job():
+            # A chat-lane job: the page read lands BEHIND the pump's queued
+            # saves for this chat, so a resume right after a turn sees its
+            # rows; the plans + panel-restore state ride the same job.
+            if is_task_chat:
+                msgs, more = task_store.get_chat_messages(cid), False
+            else:
+                msgs, more = task_store.get_chat_messages_page(cid, _CHAT_PAGE)
+            return msgs, more, task_store.get_chat_plans(cid), _build_chat_restore(cid)
+
+        messages, has_more, plans, restore = await chat_writer.submit(
+            cid, _history_job, label="history_read",
+        )
 
         # Multi-turn task runs: include messages from all turns in the session.
         # Each turn has its own chat_id (task-{runId}) but shares session_id.
@@ -1009,13 +1103,13 @@ class ChatController:
                             # rows — filtering it made the message vanish on revisit.
                             extra_msgs = [
                                 m for m in extra_msgs
-                                if int(m["id"]) <= rp._db_msg_cutoff_id
+                                if rp._db_msg_cutoff_id is None  # start job pending: no row of that turn exists yet
+                                or int(m["id"]) <= rp._db_msg_cutoff_id
                                 or m.get("role") == "user"
                             ]
                         if extra_msgs:
                             messages.extend(extra_msgs)
 
-        plans = task_store.get_chat_plans(cid)
         # Restore plan filename from DB so subsequent pumps reuse it
         if plans and not self.chat_plan_filename:
             self.chat_plan_filename = plans[-1]["filename"]
@@ -1135,7 +1229,8 @@ class ChatController:
             # queue_snapshot and aren't persisted yet), so no double-render.
             messages = [
                 m for m in messages
-                if int(m["id"]) <= pump._db_msg_cutoff_id
+                if pump._db_msg_cutoff_id is None  # start job pending: no row of this turn exists yet
+                or int(m["id"]) <= pump._db_msg_cutoff_id
                 or m.get("role") == "user"
             ]
         elif active_task_pump:
@@ -1152,7 +1247,7 @@ class ChatController:
                      "agent": chat["agent"],
                      "messages": messages,
                      "has_more": has_more,
-                     "restore": _build_chat_restore(cid),
+                     "restore": restore,
                      "plans": [{"filename": p["filename"], "content": p["content"],
                                 "status": p["status"]} for p in plans],
                      "total_cost": total_cost,
@@ -1216,7 +1311,7 @@ class ChatController:
                 "mode": perm_mode,
                 "model": chat_model,
                 "execution_path": effective_exec_path,
-                **self._target_mismatch_fields(self.chat_id),
+                **(await run_db(self._target_mismatch_fields, self.chat_id)),
             })
             # Resync any reload-persisted queuedMessages on the
             # client against the pump's actual queue. Backend is the source
@@ -1264,7 +1359,7 @@ class ChatController:
                     # sidebar live state for good (broadcasts are
                     # transition-only; finishWarmup maps True → streaming).
                     "turn_open": isess.turn_open,
-                    **self._target_mismatch_fields(self.chat_id),
+                    **(await run_db(self._target_mismatch_fields, self.chat_id)),
                 })
                 await self._send({"type": "queue_snapshot", "chat_id": self.chat_id, "messages": []})
                 # Client attaches the PTY viewer via pty_attach (see _dispatch).
@@ -1291,7 +1386,7 @@ class ChatController:
                     "model": chat_model,
                     "execution_path": effective_exec_path,
                     "interactive": False,
-                    **self._target_mismatch_fields(self.chat_id),
+                    **(await run_db(self._target_mismatch_fields, self.chat_id)),
                 })
                 # No active pump → queue is empty by definition. Emit so
                 # the client clears any reload-persisted stale entries.
@@ -1311,16 +1406,20 @@ class ChatController:
             if stale_perm and self.chat_id:
                 evt_type = stale_perm.get("event_type", "")
                 if evt_type == "permission_prompt":
-                    task_store.add_chat_message(
-                        self.chat_id, "event", "",
-                        event_type="permission_prompt",
-                        event_data=json.dumps({
-                            "type": "permission_prompt",
-                            "request_id": stale_perm.get("request_id", ""),
-                            "tool_name": stale_perm.get("tool_name", ""),
-                            "tool_input": stale_perm.get("tool_input", {}),
-                            "resolved": True, "approved": False,
-                        }),
+                    await chat_writer.submit(
+                        self.chat_id,
+                        functools.partial(
+                            task_store.add_chat_message, self.chat_id, "event", "",
+                            event_type="permission_prompt",
+                            event_data=json.dumps({
+                                "type": "permission_prompt",
+                                "request_id": stale_perm.get("request_id", ""),
+                                "tool_name": stale_perm.get("tool_name", ""),
+                                "tool_input": stale_perm.get("tool_input", {}),
+                                "resolved": True, "approved": False,
+                            }),
+                        ),
+                        label="stale_permission",
                     )
                     logger.info(f"WS dashboard: saved stale permission as rejected for chat={self.chat_id}")
                 elif evt_type == "plan_review":
@@ -1336,7 +1435,7 @@ class ChatController:
             "execution_path": effective_exec_path,
             "execution_mode": chat.get("execution_mode", ""),
             "needs_warmup": True,
-            **self._target_mismatch_fields(self.chat_id),
+            **(await run_db(self._target_mismatch_fields, self.chat_id)),
         })
         # Lazy path — no pump, no session yet. Clear any persisted queue
         # on the client (rare but possible if user reloaded after a turn
@@ -1485,7 +1584,7 @@ class ChatController:
         # that fails to start. Direct-LLM rebuilds full history from the DB
         # on its own — never seeded.
         if target_chat_id and target_layer.capabilities.name != "direct-llm":
-            prompt, reseed_notice = consume_pending_seed(target_chat_id, prompt)
+            prompt, reseed_notice = await run_db(consume_pending_seed, target_chat_id, prompt)
             if reseed_notice and is_viewed:
                 await self._send({
                     "type": "system", "subtype": "session_reseeded",
@@ -1497,7 +1596,7 @@ class ChatController:
         # ahead of this turn's prompt so the orchestrator finally processes
         # them. Same chokepoint rationale + atomic claim as the seed above.
         if target_chat_id:
-            pending_wakes = task_store.claim_pending_delegate_wake(target_chat_id)
+            pending_wakes = await run_db(task_store.claim_pending_delegate_wake, target_chat_id)
             if pending_wakes:
                 prompt = "\n\n".join(pending_wakes + [prompt])
                 logger.info(
@@ -1543,6 +1642,25 @@ class ChatController:
                     )
             except Exception:
                 pass
+
+        # Fallback usage scope — on a Shared-only agent the chat row's owner is
+        # synthetic, so "agent" is the bucket when no payer is known. When a USER
+        # subscription served the session, _record_usage re-attributes the row to
+        # that payer (user scope). Use the target chat's agent (resolve from the
+        # row only for a non-viewed server turn; the viewed turn's agent is the
+        # connection's agent_name).
+        # One row read (off-loop) serves the usage scope AND the pump's
+        # turn-start broadcast (owner + agent), so the pump never reads the
+        # row on the loop. It runs BEFORE the producer task exists: the pump's
+        # first suspension must come before any event is queued, so the
+        # viewer attaches into an empty stream (live_state snapshot empty,
+        # every event forwarded live) — an await between the producer and
+        # pump.start() would let the producer fill the queue first.
+        _turn_row = await run_db(task_store.get_chat, target_chat_id) or {}
+        scope_agent = self.agent_name if is_viewed else (
+            _turn_row.get("agent") or self.agent_name
+        )
+        pump_scope = "agent" if _vis.is_shared_only(scope_agent) else "user"
 
         event_queue: asyncio.Queue = asyncio.Queue()
 
@@ -1604,17 +1722,6 @@ class ChatController:
 
         producer = asyncio.create_task(_produce())
 
-        # Fallback usage scope — on a Shared-only agent the chat row's owner is
-        # synthetic, so "agent" is the bucket when no payer is known. When a USER
-        # subscription served the session, _record_usage re-attributes the row to
-        # that payer (user scope). Use the target chat's agent (resolve from the
-        # row only for a non-viewed server turn; the viewed turn's agent is the
-        # connection's agent_name).
-        scope_agent = self.agent_name if is_viewed else (
-            (task_store.get_chat(target_chat_id) or {}).get("agent") or self.agent_name
-        )
-        pump_scope = "agent" if _vis.is_shared_only(scope_agent) else "user"
-
         pump = ChatStreamPump(
             chat_id=target_chat_id,
             session_id=sid,
@@ -1623,6 +1730,8 @@ class ChatController:
             perm_queue=perm_queue,
             implementing_plan=self.implementing_plan if is_viewed else "",
             scope=pump_scope,
+            chat_owner=_turn_row.get("user_sub") or "",
+            chat_agent=_turn_row.get("agent") or scope_agent or "",
         )
         pump.message_queue = msg_queue  # share the same list with producer
         pump.system_queue = sys_queue   # share system prompt queue with producer
@@ -1768,19 +1877,41 @@ class ChatController:
                             if tb.get("type") == "plan_review" and tb.get("request_id") == req_id:
                                 tb["action"] = action
                                 break
+                        # Mode/plan-status writes ride the chat lane so they
+                        # stay ordered with the pump's own plan-mode write.
                         if self.chat_id and plan_fn and action == "reject":
-                            task_store.update_chat_plan_status(self.chat_id, plan_fn, "rejected")
+                            chat_writer.submit(
+                                self.chat_id,
+                                functools.partial(task_store.update_chat_plan_status,
+                                                  self.chat_id, plan_fn, "rejected"),
+                                label="plan_rejected",
+                            )
                             restored_mode = self.pre_plan_mode_holder[0]
-                            task_store.update_chat(self.chat_id, permission_mode=restored_mode)
+                            chat_writer.submit(
+                                self.chat_id,
+                                functools.partial(task_store.update_chat, self.chat_id,
+                                                  permission_mode=restored_mode),
+                                label="plan_mode_restore",
+                            )
                             await self._send({"type": "mode_changed", "mode": restored_mode})
                         if action == "implement_accept_edits":
                             self.pending_control_requests.append(("set_permission_mode", {"mode": "acceptEdits"}))
-                            task_store.update_chat(self.chat_id, permission_mode="acceptEdits")
+                            chat_writer.submit(
+                                self.chat_id,
+                                functools.partial(task_store.update_chat, self.chat_id,
+                                                  permission_mode="acceptEdits"),
+                                label="plan_implement_mode",
+                            )
                             await self._send({"type": "mode_changed", "mode": "acceptEdits"})
                             pump.queue_message("Please implement the plan now.")
                             pump.implementing_plan = plan_fn
                         elif action == "implement_default":
-                            task_store.update_chat(self.chat_id, permission_mode="default")
+                            chat_writer.submit(
+                                self.chat_id,
+                                functools.partial(task_store.update_chat, self.chat_id,
+                                                  permission_mode="default"),
+                                label="plan_implement_mode",
+                            )
                             await self._send({"type": "mode_changed", "mode": "default"})
                             pump.queue_message("Please implement the plan now.")
                             pump.implementing_plan = plan_fn
@@ -1813,8 +1944,12 @@ class ChatController:
                                 self.user_sub, pump.chat_id, self.notify_connection_id,
                             )
                             if steered:
-                                task_store.add_chat_message(
-                                    pump.chat_id, "user", text, author_sub=self.user_sub,
+                                await chat_writer.submit(
+                                    pump.chat_id,
+                                    functools.partial(task_store.add_chat_message,
+                                                      pump.chat_id, "user", text,
+                                                      author_sub=self.user_sub),
+                                    label="steered_row",
                                 )
                                 await self._send({"type": "steered", "text": text, "chat_id": frame_chat_id})
                             else:
@@ -1841,7 +1976,7 @@ class ChatController:
                         a_frame: dict = {"type": "artifact_ack", "token": a_token}
                         if not a_chat or a_chat != pump.chat_id:
                             a_frame.update(status="denied", reason="not the viewed chat")
-                        elif pump._meeting_agent or task_store.get_active_meeting_for_chat(a_chat):
+                        elif pump._meeting_agent or await run_db(task_store.get_active_meeting_for_chat, a_chat):
                             a_frame.update(status="unavailable", reason="meeting in progress")
                         else:
                             interaction, a_err = _ai.validate_interaction(
@@ -1875,7 +2010,7 @@ class ChatController:
                                           "action_id": ap_action}
                         if not ap_chat or ap_chat != pump.chat_id:
                             ap_frame.update(status="denied", reason="not the viewed chat")
-                        elif pump._meeting_agent or task_store.get_active_meeting_for_chat(ap_chat):
+                        elif pump._meeting_agent or await run_db(task_store.get_active_meeting_for_chat, ap_chat):
                             ap_frame.update(status="unavailable", reason="meeting in progress")
                         else:
                             interaction, ap_err = _ai.validate_app_action(
@@ -1939,15 +2074,23 @@ class ChatController:
                         # injection (the engine's own history has the partial
                         # turn).
                         if self.chat_id:
-                            task_store.update_chat(self.chat_id,
-                                                   last_turn_aborted=True,
-                                                   last_abort_graceful=graceful)
+                            _abort_cid = self.chat_id
+
+                            def _abort_job(_g=graceful) -> dict | None:
+                                # Flag write then the row read, one lane job.
+                                task_store.update_chat(_abort_cid,
+                                                       last_turn_aborted=True,
+                                                       last_abort_graceful=_g)
+                                return task_store.get_chat(_abort_cid)
+
+                            _abort_chat = await chat_writer.submit(
+                                _abort_cid, _abort_job, label="abort_flags",
+                            )
                             # A hard CLI Stop kills the whole process group —
                             # any bg agents/commands died with it; clear their
                             # badges. Graceful keeps the process (and its bg
                             # work) alive; Codex keeps its daemon either way.
                             if self.session_id and not graceful:
-                                _abort_chat = task_store.get_chat(self.chat_id)
                                 _abort_path = resolve_execution_path(
                                     self.agent_name,
                                     (_abort_chat or {}).get("execution_path", ""),
@@ -2149,10 +2292,10 @@ class ChatController:
             if pump and pump.source_type in _EXTERNAL_DRIVEN_SOURCES:
                 pump = None
             if (not pump or pump.is_done):
-                pump = self._find_task_pump()
+                pump = await run_db(self._find_task_pump)
             if not pump or pump.is_done:
                 # Wait briefly for next pump: task chats (multi-turn) OR meetings
-                is_meeting = bool(task_store.get_active_meeting_for_chat(self.chat_id))
+                is_meeting = bool(await run_db(task_store.get_active_meeting_for_chat, self.chat_id))
                 max_retries = 15 if is_meeting else 5  # 30s for meetings, 10s for tasks
                 should_poll = (
                     last_pump and task_wait_retries < max_retries and (
@@ -2219,7 +2362,7 @@ class ChatController:
             # chat_history, then loop to wait for the next pump.
             if not result.get("detached") and (
                 (self.chat_id and self.chat_id.startswith("task-"))
-                or task_store.get_active_meeting_for_chat(self.chat_id)
+                or await run_db(task_store.get_active_meeting_for_chat, self.chat_id)
             ):
                 await self._handle_resume_chat({"chat_id": self.chat_id})
                 continue
@@ -2233,8 +2376,11 @@ class ChatController:
                     # only the resume-from-DB path ever restored it).
                     self.chat_plan_filename = pump._plan_filename
                 if pump.implementing_plan and not pump.message_queue:
-                    task_store.update_chat_plan_status(
-                        self.chat_id, pump.implementing_plan, "implemented",
+                    chat_writer.submit(
+                        self.chat_id,
+                        functools.partial(task_store.update_chat_plan_status,
+                                          self.chat_id, pump.implementing_plan, "implemented"),
+                        label="plan_implemented",
                     )
                     await self._send({"type": "plan_status",
                                  "filename": pump.implementing_plan,
@@ -2346,15 +2492,29 @@ class ChatController:
             cut = True
         return title + ("…" if cut else "")
 
-    def _persist_first_prompt(self, cid: str, prompt_text: str) -> None:
+    async def _persist_first_prompt(self, cid: str, prompt_text: str) -> None:
         """Persist the first user prompt + a deterministic title at send-time so
         the chat is durable during the spawn window and the sidebar shows a
         stable name immediately. The turn is server-kicked after
         warmup_ready via _handle_chat(_server_kick=True), which skips re-persist.
-        Image/file attachment meta for the first prompt is captured at turn time."""
+        Image/file attachment meta for the first prompt is captured at turn time.
+
+        ONE chat-lane job (row + conditional title): awaited, so the tailer's
+        duplicate-skip note below never precedes the row it refers to."""
         if not cid or not prompt_text:
             return
-        task_store.add_chat_message(cid, "user", prompt_text, author_sub=self.user_sub)
+        _sub = self.user_sub
+        title = self._deterministic_title(prompt_text)
+
+        def _job() -> dict | None:
+            task_store.add_chat_message(cid, "user", prompt_text, author_sub=_sub)
+            # A title that already landed (rename, LLM upgrade) wins: this
+            # method re-runs on every cold re-send of an already-titled chat.
+            if task_store.set_chat_title_if_unset(cid, title):
+                return task_store.get_chat(cid) or {}
+            return None
+
+        rec = await chat_writer.submit(cid, _job, label="first_prompt")
         # Interactive spawns: the CLI journals this exact text and the tailer
         # would re-insert it — note it so the tailer skips that one row (the
         # live-observed duplicated first user row). Harmless for headless
@@ -2363,13 +2523,8 @@ class ChatController:
         note_sent_prompt(cid, prompt_text)
         # Route the end-of-turn alert to the device that sent this prompt.
         notification_manager.set_chat_turn_origin(self.user_sub, cid, self.notify_connection_id)
-        rec = task_store.get_chat(cid)
-        if rec and not rec.get("title"):
-            title = self._deterministic_title(prompt_text)
-            task_store.update_chat(cid, title=title)
-            # Inside the not-title guard: this method re-runs on every cold
-            # re-send of an already-titled chat, and the fan-out belongs only
-            # to the one send that actually writes the title. Broadcast so
+        if rec is not None:
+            # Only the one send that actually wrote the title fans out — so
             # OTHER tabs/users' sidebars + Active-now widgets title the row
             # during the warmup window; the SENDING socket's copy rides its
             # notify queue, which drains between turns — its own tab already
@@ -2631,13 +2786,19 @@ class ChatController:
         """
         if not cid or not cid.startswith("task-"):
             return False
-        run = task_store.get_run(cid.removeprefix("task-"))
+        _rid, _sub, _fb = cid.removeprefix("task-"), self.user_sub, self.user
+
+        def _gate_job() -> tuple[dict | None, str]:
+            # The run row + the effective role: three reads, one gate, one job.
+            run = task_store.get_run(_rid)
+            if not run:
+                return None, ""
+            return run, _effective_agent_role(_sub, run.get("agent") or "", fallback_user=_fb)
+
+        run, eff_role = await run_db(_gate_job)
         if not run:
             await self._send_error("Task run not found")
             return True
-        eff_role = _effective_agent_role(
-            self.user_sub, run.get("agent") or "", fallback_user=self.user,
-        )
         if not _task_continue_allowed(run, effective_role=eff_role, user_sub=self.user_sub):
             await self._send_error("Access denied")
             return True
@@ -2669,7 +2830,11 @@ class ChatController:
         # when the parent CLI process is dead.
         set_session_mode(sid, new_mode)
         if self.chat_id:
-            task_store.update_chat(self.chat_id, permission_mode=new_mode)
+            await chat_writer.submit(
+                self.chat_id,
+                functools.partial(task_store.update_chat, self.chat_id, permission_mode=new_mode),
+                label="mode_change",
+            )
 
         if not await self.layer.is_session_alive(sid):
             self.deferred_mode = new_mode
@@ -2717,8 +2882,8 @@ class ChatController:
         if self.chat_id and self.chat_id.startswith("task-"):
             if await self._deny_task_continue(self.chat_id):
                 return
-            if task_run_active(self.chat_id):
-                chat_rec = task_store.get_chat(self.chat_id) or {}
+            if await task_run_active_async(self.chat_id):
+                chat_rec = await run_db(task_store.get_chat, self.chat_id) or {}
                 await self._send({
                     "type": "model_changed",
                     "model": chat_rec.get("model", ""),
@@ -2728,27 +2893,47 @@ class ChatController:
 
         # Refuse a model foreign to this chat's execution layer (see
         # _model_allowed_for_path) and resync the client's selector to the
-        # chat's real model instead of applying/persisting the poison.
+        # chat's real model instead of applying/persisting the poison. The
+        # read → validate → write is ONE chat-lane job, so a pump starting
+        # meanwhile binds after the write, and nothing interleaves between
+        # the check and the persist.
         if self.chat_id:
-            chat_rec = task_store.get_chat(self.chat_id) or {}
-            chat_path = chat_rec.get("execution_path") or resolve_execution_path(
-                chat_rec.get("agent") or self.agent_name or ""
-            )
-            if not _model_allowed_for_path(new_model, chat_path):
-                logger.warning(
-                    f"WS dashboard model change REFUSED: model={new_model} is not a "
-                    f"{chat_path} model (chat={self.chat_id}) — keeping {chat_rec.get('model', '')!r}"
+            _mcid, _magent, _msid = self.chat_id, self.agent_name or "", self.session_id or ""
+
+            def _model_job() -> tuple[dict, str, bool, str]:
+                rec = task_store.get_chat(_mcid) or {}
+                path = rec.get("execution_path") or resolve_execution_path(
+                    rec.get("agent") or _magent
                 )
+                if not _model_allowed_for_path(new_model, path):
+                    return rec, path, False, ""
+                # Codex pins its model provider in config.toml at session
+                # start: a live session cannot cross from a local endpoint to
+                # OpenAI or back — refuse and keep the chat's model.
+                if path == "codex-cli" and _msid:
+                    blocker = _codex_provider_switch_blocker(_msid, new_model)
+                    if blocker:
+                        return rec, path, False, blocker
+                task_store.update_chat(_mcid, model=new_model)  # persisted even before a session exists
+                return rec, path, True, ""
+
+            chat_rec, chat_path, applied, blocker = await chat_writer.submit(
+                _mcid, _model_job, label="model_change",
+            )
+            if not applied:
+                logger.warning(
+                    f"WS dashboard model change REFUSED: model={new_model} "
+                    f"({blocker or 'not a ' + chat_path + ' model'}) "
+                    f"(chat={self.chat_id}) — keeping {chat_rec.get('model', '')!r}"
+                )
+                if blocker:
+                    await self._send_error(blocker)
                 await self._send({
                     "type": "model_changed",
                     "model": chat_rec.get("model", ""),
                     "chat_id": self.chat_id,
                 })
                 return
-
-        # Persist to DB immediately (even before session exists)
-        if self.chat_id:
-            task_store.update_chat(self.chat_id, model=new_model)
         await self._send({"type": "model_changed", "model": new_model})
 
         if not self.session_id or not self.layer:
@@ -2817,16 +3002,19 @@ class ChatController:
             await self._send_error(f"Invalid execution_mode: {new_mode}")
             return
         cid = msg.get("chat_id") or self.chat_id
-        chat = task_store.get_chat(cid) if cid else None
+        chat = await run_db(task_store.get_chat, cid) if cid else None
         if not cid or not chat:
             await self._handle_execution_mode_change(msg)  # nothing live → just persist
             return
 
         # Persist the target so the re-warm resolves to it.
-        task_store.update_chat(cid, execution_mode=new_mode)
+        await chat_writer.submit(
+            cid, functools.partial(task_store.update_chat, cid, execution_mode=new_mode),
+            label="exec_mode",
+        )
         old_sid = chat.get("session_id") or (self.session_id if cid == self.chat_id else None)
         agent = chat.get("agent", "")
-        role = _effective_agent_role(self.user_sub, agent, fallback_user=self.user)
+        role = await run_db(_effective_agent_role, self.user_sub, agent, fallback_user=self.user)
 
         # Kill the current live session, keeping the conversation resumable.
         if old_sid:
@@ -2849,16 +3037,21 @@ class ChatController:
         # Reload the conversation into the client (the interactive close() just
         # tailed it) so the -p view shows the history; harmless when swapping to
         # the terminal (the messages sit hidden under it).
-        if cid.startswith("task-"):
-            msgs = task_store.get_chat_messages(cid)
-            msgs_has_more = False
-        else:
-            msgs, msgs_has_more = task_store.get_chat_messages_page(cid, _CHAT_PAGE)
+        def _switch_history_job():
+            if cid.startswith("task-"):
+                return task_store.get_chat_messages(cid), False, _build_chat_restore(cid)
+            return (*task_store.get_chat_messages_page(cid, _CHAT_PAGE),
+                    _build_chat_restore(cid))
+
+        # Lane job: behind the closed session's last rows.
+        msgs, msgs_has_more, switch_restore = await chat_writer.submit(
+            cid, _switch_history_job, label="switch_history",
+        )
         await self._send({
             "type": "chat_history", "chat_id": cid, "agent": chat.get("agent", ""),
             "messages": msgs, "plans": [],
             "has_more": msgs_has_more,
-            "restore": _build_chat_restore(cid),
+            "restore": switch_restore,
             "total_cost": chat.get("total_cost") or 0,
             "context_used": chat.get("context_used") or 0,
             "context_max": chat.get("context_max") or 0,

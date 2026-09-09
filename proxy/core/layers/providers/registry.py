@@ -21,20 +21,22 @@ def register_adapter(adapter: ProviderAdapter) -> None:
 def get_adapter(provider: str) -> ProviderAdapter:
     """Look up a provider adapter by name.
 
-    Falls back to the OpenAI-compatible adapter for unknown providers
-    (e.g., custom self-hosted endpoints that use the OpenAI API format).
+    Falls back to the generic OpenAI-compatible adapter (chat completions)
+    for unknown providers, e.g. custom self-hosted endpoints that use the
+    OpenAI API format — NOT the ``openai`` adapter, which speaks the
+    Responses API against OpenAI's own endpoint.
     """
     adapter = _ADAPTERS.get(provider)
     if adapter:
         return adapter
     # Fall back to OpenAI-compatible for unknown providers
-    openai_adapter = _ADAPTERS.get("openai")
-    if openai_adapter:
+    compat_adapter = _ADAPTERS.get("openai_compatible")
+    if compat_adapter:
         logger.warning(
             f"No adapter for provider '{provider}', "
-            f"falling back to OpenAI-compatible adapter"
+            f"falling back to the OpenAI-compatible adapter"
         )
-        return openai_adapter
+        return compat_adapter
     raise ValueError(f"No provider adapter registered for '{provider}'")
 
 

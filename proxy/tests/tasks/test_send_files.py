@@ -9,21 +9,36 @@ preservation, conflict renames, caps), and the audit row. There is
 deliberately NO session-start notify (removed 2026-08-14 — the prompt's
 workspace listing is the discovery surface).
 
+Remote sources (2026-09-05): ``prefetch_remote_sources`` reads every path
+through from the caller's satellite before the copy (same-turn writes,
+stale copies, directories via one manifest, the per-call cap, typos that
+must not mkdir, offline degradation, invalid paths never reaching the
+satellite), and the endpoint's remote-aware 404.
+
 Run: cd proxy && python -m pytest tests/tasks/test_send_files.py -v
 """
 
 import shutil
+from contextlib import contextmanager
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 
 import config
 from auth.providers import UserContext
+from core.remote import remote_file_flow
 from services.delegation.file_transfer import (
+    MissingSourcePath,
     authorize_send_files,
     perform_send_files,
+    prefetch_remote_sources,
+    validate_send_path,
 )
-from storage import agent_store, db_file_transfers, mcp_store
+from storage import agent_store, db_file_transfers, mcp_store, remote_store
 from storage import database as task_store
 
 
@@ -369,3 +384,419 @@ class TestSymlinkedDestRefused:
         assert e.value.status_code == 400
         assert "escapes the target workspace" in e.value.detail
         assert list(outside.iterdir()) == []
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# 2026-09-05 remote sources — read-through before the copy
+# ───────────────────────────────────────────────────────────────────────────
+
+
+USER_WS = "users/alice/workspace"
+
+
+class _FakeInfo:
+    """Stand-in for RemoteSessionInfo (what remote_file_flow consumes)."""
+
+    def __init__(self, machine_id: str = "m-1", agent_name: str = SRC):
+        self.machine_id = machine_id
+        self.agent_name = agent_name
+
+
+class _FakeSatellite:
+    """A satellite-side agent tree served by a mocked connection manager:
+    ``file_stat`` / ``file_pull`` / ``request_manifest`` over agent-dir-
+    relative paths, with the real helpers' failure shapes (pull mkdirs the
+    parent chain before asking, returns False when not connected)."""
+
+    def __init__(self, tree: dict[str, bytes], *, online: bool = True,
+                 stat: bool = True, name: str = "drill-sat"):
+        self.tree = dict(tree)
+        self.online = online
+        self.stat = stat
+        self.name = name
+        self.probes: list[str] = []
+        self.pulls: list[str] = []
+        self.manifests = 0
+        cm = MagicMock()
+        cm.satellite_supports_file_stat.side_effect = lambda mid: self.online and self.stat
+        cm.stat_file = AsyncMock(side_effect=self._stat)
+        cm.pull_file_to_path = AsyncMock(side_effect=self._pull)
+        cm.send_command = AsyncMock(side_effect=self._command)
+        cm.get_connection.side_effect = (
+            lambda mid: SimpleNamespace(name=self.name) if self.online else None
+        )
+        cm.get_connected_machines.return_value = []
+        self.cm = cm
+
+    async def _stat(self, machine_id, ref, agent_slug=""):
+        self.probes.append(ref.value)
+        data = self.tree.get(ref.value)
+        if data is None:
+            return {"exists": False, "size": 0, "mtime_ns": 0}
+        return {"exists": True, "size": len(data), "mtime_ns": 1}
+
+    async def _pull(self, machine_id, ref, dest_path, *, agent_slug="", timeout=180.0):
+        self.pulls.append(ref.value)
+        if not self.online:
+            return False
+        dest = Path(dest_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)   # the real helper does this first
+        data = self.tree.get(ref.value)
+        if data is None:
+            return False
+        dest.write_bytes(data)
+        return True
+
+    async def _command(self, machine_id, msg, *, timeout=30.0, command_id=None):
+        assert msg["type"] == "request_manifest"
+        self.manifests += 1
+        if not self.online:
+            raise RuntimeError("Satellite m-1 not connected")
+        return {"files": [
+            {"path": p, "size": len(b), "mtime": 1.0} for p, b in self.tree.items()
+        ]}
+
+
+@contextmanager
+def _remote(sat: _FakeSatellite, agent: str = SRC):
+    with patch.object(
+        remote_file_flow, "_get_remote_session_info",
+        return_value=_FakeInfo(agent_name=agent),
+    ), patch(
+        "core.remote.satellite_connection.get_connection_manager",
+        return_value=sat.cm,
+    ):
+        yield
+
+
+@pytest.fixture
+def flow_reset():
+    remote_file_flow._sessions.clear()
+    remote_file_flow._global_path_locks.clear()
+    remote_file_flow._pull_stat_records.clear()
+    yield
+    remote_file_flow._sessions.clear()
+    remote_file_flow._global_path_locks.clear()
+    remote_file_flow._pull_stat_records.clear()
+
+
+def _inbox(target=TGT_COLLAB) -> Path:
+    return config.get_agent_dir(target) / USER_WS / "inbox" / SRC
+
+
+class TestValidateSendPath:
+    def test_normalizes_to_the_manifest_form(self):
+        assert validate_send_path("./reports//q3.md/") == "reports/q3.md"
+        assert validate_send_path("  notes.md ") == "notes.md"
+
+    @pytest.mark.parametrize("bad", ["", "   ", "/etc/passwd", "\\x", "a/../b", "../x"])
+    def test_rejects_what_perform_rejects(self, bad):
+        with pytest.raises(HTTPException) as exc:
+            validate_send_path(bad)
+        assert exc.value.status_code == 400
+
+
+class TestRemotePrefetch:
+    @pytest.mark.asyncio
+    async def test_local_session_never_touches_the_satellite(self, send_env, flow_reset):
+        sat = _FakeSatellite({f"{USER_WS}/notes.md": b"v2"})
+        authz = _authz(_user_session())
+        with patch.object(
+            remote_file_flow, "_get_remote_session_info", return_value=None,
+        ), patch(
+            "core.remote.satellite_connection.get_connection_manager",
+            return_value=sat.cm,
+        ):
+            assert await prefetch_remote_sources("s-1", authz, ["notes.md"]) == []
+        assert (sat.probes, sat.pulls, sat.manifests) == ([], [], 0)
+        assert (config.get_agent_dir(SRC) / USER_WS / "notes.md").read_text() == "notes"
+
+    @pytest.mark.asyncio
+    async def test_same_turn_write_is_pulled_before_the_copy(self, send_env, flow_reset):
+        """The loud variant: absent platform-side, written on the satellite
+        this turn — pulled into the user-scope prefix, then copied."""
+        sat = _FakeSatellite({f"{USER_WS}/today.md": b"written this turn"})
+        authz = _authz(_user_session())
+        with _remote(sat):
+            unavailable = await prefetch_remote_sources(
+                "s-1", authz, ["today.md"], max_files=20,
+            )
+        assert unavailable == []
+        # The prefetch's own probe, then pull_through's revalidation probe.
+        assert sat.probes == [f"{USER_WS}/today.md"] * 2
+        assert sat.pulls == [f"{USER_WS}/today.md"]
+        result = perform_send_files(authz, paths=["today.md"])
+        assert (_inbox() / "today.md").read_bytes() == b"written this turn"
+        assert result.landed == [f"{USER_WS}/inbox/{SRC}/today.md"]
+
+    @pytest.mark.asyncio
+    async def test_modified_this_turn_sends_the_current_bytes(self, send_env, flow_reset):
+        """The silent variant: a platform copy exists (turn-end synced,
+        no pull-stat record) — the pull is unconditional, so the newer
+        satellite bytes ship, not the stale copy."""
+        sat = _FakeSatellite({f"{USER_WS}/notes.md": b"notes v2"})
+        authz = _authz(_user_session())
+        with _remote(sat):
+            await prefetch_remote_sources("s-1", authz, ["notes.md"], max_files=20)
+        assert sat.pulls == [f"{USER_WS}/notes.md"]
+        perform_send_files(authz, paths=["notes.md"])
+        assert (_inbox() / "notes.md").read_bytes() == b"notes v2"
+
+    @pytest.mark.asyncio
+    async def test_unchanged_since_last_pull_is_served_from_the_copy(self, send_env, flow_reset):
+        """Stat fast path: a second send of an unchanged file re-probes but
+        does not re-transfer."""
+        sat = _FakeSatellite({f"{USER_WS}/notes.md": b"notes v2"})
+        authz = _authz(_user_session())
+        with _remote(sat):
+            await prefetch_remote_sources("s-1", authz, ["notes.md"], max_files=20)
+            await prefetch_remote_sources("s-1", authz, ["notes.md"], max_files=20)
+        assert sat.pulls == [f"{USER_WS}/notes.md"]
+        assert len(sat.probes) == 4   # prefetch probe + pull_through's own, twice
+
+    @pytest.mark.asyncio
+    async def test_agent_scope_uses_the_shared_prefix(self, send_env, flow_reset):
+        sat = _FakeSatellite({"workspace/shared.txt": b"shared v2"})
+        authz = _authz(_svc_session(), target=TGT_SHARED, scope="agent")
+        with _remote(sat):
+            await prefetch_remote_sources("s-svc", authz, ["shared.txt"], max_files=20)
+        assert sat.pulls == ["workspace/shared.txt"]
+        result = perform_send_files(authz, paths=["shared.txt"])
+        dest = config.get_agent_dir(TGT_SHARED) / "workspace" / "inbox" / SRC / "shared.txt"
+        assert dest.read_bytes() == b"shared v2"
+        assert result.landed == [f"workspace/inbox/{SRC}/shared.txt"]
+
+    @pytest.mark.asyncio
+    async def test_directory_is_one_manifest_then_per_file_pulls(self, send_env, flow_reset):
+        sat = _FakeSatellite({
+            f"{USER_WS}/reports/q3.md": b"q3 v2",
+            f"{USER_WS}/reports/new.csv": b"x,y",
+            f"{USER_WS}/reports/tmp.csv.partial": b"torn",
+            f"{USER_WS}/notes.md": b"unrelated",
+        })
+        authz = _authz(_user_session())
+        with _remote(sat):
+            unavailable = await prefetch_remote_sources(
+                "s-1", authz, ["reports"], max_files=20,
+            )
+        assert unavailable == []
+        assert sat.manifests == 1
+        # A platform-side directory is never probed (or pulled) as a file;
+        # the only probes are pull_through's own, per pulled entry.
+        assert f"{USER_WS}/reports" not in sat.probes
+        assert sat.pulls == [f"{USER_WS}/reports/new.csv", f"{USER_WS}/reports/q3.md"]
+        perform_send_files(authz, paths=["reports"])
+        base = _inbox() / "reports"
+        assert (base / "q3.md").read_bytes() == b"q3 v2"
+        assert (base / "new.csv").read_bytes() == b"x,y"
+        # Deleted-on-satellite-this-turn lag: the platform copy still ships.
+        assert (base / "data.csv").is_file()
+        assert not (base / "tmp.csv.partial").exists()
+
+    @pytest.mark.asyncio
+    async def test_directory_new_on_the_satellite(self, send_env, flow_reset):
+        sat = _FakeSatellite({
+            f"{USER_WS}/out/a.txt": b"a",
+            f"{USER_WS}/out/sub/b.txt": b"b",
+        })
+        authz = _authz(_user_session())
+        with _remote(sat):
+            unavailable = await prefetch_remote_sources("s-1", authz, ["out"], max_files=20)
+        assert unavailable == []
+        # Not a platform dir → probed; exists=False (a dir) → no pull of the
+        # dir itself (no failed pull, no junk), then the manifest; the two
+        # remaining probes are pull_through's, per pulled entry.
+        assert sat.probes == [
+            f"{USER_WS}/out", f"{USER_WS}/out/a.txt", f"{USER_WS}/out/sub/b.txt",
+        ]
+        assert sat.pulls == [f"{USER_WS}/out/a.txt", f"{USER_WS}/out/sub/b.txt"]
+        result = perform_send_files(authz, paths=["out"])
+        assert sorted(Path(p).name for p in result.landed) == ["a.txt", "b.txt"]
+        assert (_inbox() / "out" / "sub" / "b.txt").read_bytes() == b"b"
+
+    @pytest.mark.asyncio
+    async def test_directory_pulls_stop_at_the_call_cap(self, send_env, flow_reset):
+        sat = _FakeSatellite({f"{USER_WS}/big/f{i}.txt": b"x" for i in range(6)})
+        authz = _authz(_user_session())
+        with _remote(sat):
+            await prefetch_remote_sources("s-1", authz, ["big"], max_files=2)
+        assert len(sat.pulls) == 3   # max_files + 1 — perform's 413 decides
+        mcp_store.set_mcp_config_values(
+            "delegation-mcp", {"SEND_FILES_MAX_FILES": "2"},
+        )
+        with pytest.raises(HTTPException) as exc:
+            perform_send_files(authz, paths=["big"])
+        assert exc.value.status_code == 413
+
+    @pytest.mark.asyncio
+    async def test_cap_is_read_from_config_when_not_given(self, send_env, flow_reset):
+        mcp_store.set_mcp_config_values(
+            "delegation-mcp", {"SEND_FILES_MAX_FILES": "1"},
+        )
+        sat = _FakeSatellite({f"{USER_WS}/big/f{i}.txt": b"x" for i in range(4)})
+        authz = _authz(_user_session())
+        with _remote(sat):
+            await prefetch_remote_sources("s-1", authz, ["big"])
+        assert len(sat.pulls) == 2
+
+    @pytest.mark.asyncio
+    async def test_typo_never_mkdirs_and_is_reported_unavailable(self, send_env, flow_reset):
+        sat = _FakeSatellite({f"{USER_WS}/notes.md": b"notes"})
+        authz = _authz(_user_session())
+        with _remote(sat):
+            unavailable = await prefetch_remote_sources(
+                "s-1", authz, ["reprots/q3.md"], max_files=20,
+            )
+        assert unavailable == ["reprots/q3.md"]
+        assert sat.pulls == []        # exists=False → no pull → no parent-chain mkdir
+        assert sat.manifests == 1
+        assert not (config.get_agent_dir(SRC) / USER_WS / "reprots").exists()
+        with pytest.raises(MissingSourcePath) as exc:
+            perform_send_files(authz, paths=["reprots/q3.md"])
+        assert exc.value.status_code == 404
+        assert exc.value.raw == "reprots/q3.md"
+        assert exc.value.detail == "No such file or directory in your workspace: 'reprots/q3.md'"
+
+    @pytest.mark.asyncio
+    async def test_old_satellite_without_stat_still_pulls(self, send_env, flow_reset):
+        sat = _FakeSatellite({f"{USER_WS}/today.md": b"fresh"}, stat=False)
+        authz = _authz(_user_session())
+        with _remote(sat):
+            unavailable = await prefetch_remote_sources(
+                "s-1", authz, ["today.md"], max_files=20,
+            )
+        assert unavailable == [] and sat.probes == []
+        assert sat.pulls == [f"{USER_WS}/today.md"]
+        assert (config.get_agent_dir(SRC) / USER_WS / "today.md").read_bytes() == b"fresh"
+
+    @pytest.mark.asyncio
+    async def test_offline_satellite_degrades_to_the_platform_tree(self, send_env, flow_reset):
+        sat = _FakeSatellite({f"{USER_WS}/reports/q3.md": b"never served"}, online=False)
+        authz = _authz(_user_session())
+        with _remote(sat):
+            unavailable = await prefetch_remote_sources(
+                "s-1", authz, ["notes.md", "reports", "gone.md"], max_files=20,
+            )
+        # notes.md: pull fails → platform mirror; reports: manifest fails →
+        # platform copy; gone.md: nothing on either side.
+        assert unavailable == ["reports", "gone.md"]
+        assert sat.manifests == 1   # one attempt per call, not per path
+        result = perform_send_files(authz, paths=["notes.md", "reports"])
+        assert len(result.landed) == 3
+        assert (_inbox() / "notes.md").read_text() == "notes"
+        assert (_inbox() / "reports" / "q3.md").read_text() == "q3 report"
+        with pytest.raises(MissingSourcePath):
+            perform_send_files(authz, paths=["gone.md"])
+
+    @pytest.mark.asyncio
+    async def test_invalid_paths_never_reach_the_satellite(self, send_env, flow_reset):
+        sat = _FakeSatellite({})
+        authz = _authz(_user_session())
+        bad = ["../../config/agent.md", "/etc/passwd", ""]
+        with _remote(sat):
+            unavailable = await prefetch_remote_sources("s-1", authz, bad, max_files=20)
+        assert unavailable == []
+        assert (sat.probes, sat.pulls, sat.manifests) == ([], [], 0)
+        for raw in bad:
+            with pytest.raises(HTTPException) as exc:
+                perform_send_files(authz, paths=[raw])
+            assert exc.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_prefetch_defects_degrade_and_never_abort(self, send_env, flow_reset):
+        authz = _authz(_user_session())
+        with patch.object(
+            remote_file_flow, "_get_remote_session_info", return_value=_FakeInfo(),
+        ), patch.object(
+            remote_file_flow, "stat_probe", AsyncMock(side_effect=RuntimeError("probe")),
+        ), patch.object(
+            remote_file_flow, "pull_through", AsyncMock(side_effect=RuntimeError("pull")),
+        ), patch.object(
+            remote_file_flow, "list_remote_files", AsyncMock(side_effect=RuntimeError("mf")),
+        ):
+            unavailable = await prefetch_remote_sources(
+                "s-1", authz, ["notes.md", "reports"], max_files=20,
+            )
+        assert unavailable == ["notes.md", "reports"]
+        result = perform_send_files(authz, paths=["notes.md", "reports"])
+        assert len(result.landed) == 3
+
+
+def _endpoint_client(user: UserContext) -> TestClient:
+    from api.tasks import delegation as delegation_api
+    from auth.providers import get_current_user
+
+    app = FastAPI()
+    app.include_router(delegation_api.router)
+
+    async def _current():
+        return user
+
+    app.dependency_overrides[get_current_user] = _current
+    return TestClient(app)
+
+
+def _post(client: TestClient, paths: list[str], *, target=TGT_COLLAB, scope="user"):
+    return client.post("/v1/delegation/send_files", json={
+        "target_agent": target, "paths": paths, "scope": scope,
+    })
+
+
+class TestEndpointRemoteSources:
+    def test_same_turn_write_lands_through_the_endpoint(self, send_env, flow_reset):
+        sat = _FakeSatellite({f"{USER_WS}/today.md": b"fresh"})
+        client = _endpoint_client(_user_session())
+        with _remote(sat):
+            r = _post(client, ["today.md"])
+        assert r.status_code == 200, r.text
+        assert r.json()["files"] == [f"{USER_WS}/inbox/{SRC}/today.md"]
+        assert (_inbox() / "today.md").read_bytes() == b"fresh"
+
+    def test_remote_404_names_the_connected_machine(self, send_env, flow_reset):
+        sat = _FakeSatellite({}, name="drill-sat")
+        client = _endpoint_client(_user_session())
+        with _remote(sat):
+            r = _post(client, ["missing.md"])
+        assert r.status_code == 404
+        assert r.json()["detail"] == (
+            "'missing.md' is not in the platform copy of your workspace and "
+            "the remote machine 'drill-sat' could not provide it (offline, or "
+            "the file does not exist there)"
+        )
+
+    def test_remote_404_offline_name_comes_from_the_store(self, send_env, flow_reset, monkeypatch):
+        sat = _FakeSatellite({}, online=False)
+        monkeypatch.setattr(
+            remote_store, "get_remote_machine",
+            lambda mid: {"id": mid, "name": "my laptop"} if mid == "m-1" else None,
+        )
+        client = _endpoint_client(_user_session())
+        with _remote(sat):
+            r = _post(client, ["missing.md"])
+        assert r.status_code == 404
+        assert "the remote machine 'my laptop' could not provide it" in r.json()["detail"]
+
+    def test_remote_404_only_for_paths_the_satellite_lacked(self, send_env, flow_reset):
+        """A path that is missing platform-side but exists on the satellite
+        is pulled, so it never 404s; one that neither side has gets the
+        remote wording — and a local session keeps the plain detail."""
+        sat = _FakeSatellite({f"{USER_WS}/today.md": b"fresh"})
+        client = _endpoint_client(_user_session())
+        with _remote(sat):
+            r = _post(client, ["today.md", "missing.md"])
+        assert r.status_code == 404
+        assert r.json()["detail"].startswith("'missing.md' is not in the platform copy")
+        with patch.object(remote_file_flow, "_get_remote_session_info", return_value=None):
+            r = _post(client, ["missing.md"])
+        assert r.status_code == 404
+        assert r.json()["detail"] == "No such file or directory in your workspace: 'missing.md'"
+
+    def test_cookie_caller_has_no_session_and_no_prefetch(self, send_env, flow_reset):
+        """A dashboard caller (no session id) never enters the prefetch — the
+        400 from authorize fires exactly as before."""
+        sat = _FakeSatellite({})
+        client = _endpoint_client(_cookie())
+        with _remote(sat):
+            r = _post(client, ["notes.md"])
+        assert r.status_code == 400
+        assert (sat.probes, sat.pulls, sat.manifests) == ([], [], 0)

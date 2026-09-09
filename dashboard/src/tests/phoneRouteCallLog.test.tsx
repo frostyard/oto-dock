@@ -21,6 +21,7 @@ function entry(over: Record<string, unknown> = {}) {
     to_number: '+16083191947', transport: 'twilio', call_uuid: 'CA1',
     outcome: 'completed', pin_attempts: 0,
     started_at: new Date().toISOString(), ended_at: null, duration_s: 65,
+    session_id: '', identity: '', tools_run: [],
     created_at: '', ...over,
   }
 }
@@ -62,6 +63,24 @@ describe('CallLogModal', () => {
     mockLog([entry({ direction: 'outbound', to_number: '+15559998888' })])
     renderModal()
     expect(await screen.findByText('+15559998888')).toBeInTheDocument()
+  })
+
+  it('shows who the session ran as and the tools it used', async () => {
+    mockLog([
+      entry({ identity: 'caller-pin:+15550001111',
+              tools_run: ['mcp__memory-mcp__memory', 'Read'] }),
+      entry({ id: 2, identity: 'user:alice', from_number: '+15550002222' }),
+      entry({ id: 3, identity: 'ephemeral', from_number: '+15550003333' }),
+      entry({ id: 4, outcome: 'pin_failed', pin_attempts: 1, from_number: '+15550004444' }),
+    ])
+    renderModal()
+    expect(await screen.findByText('Caller (PIN)')).toBeInTheDocument()
+    expect(screen.getByText('memory-mcp/memory, Read')).toBeInTheDocument()
+    expect(screen.getByText('User alice')).toBeInTheDocument()
+    expect(screen.getByText('Anonymous')).toBeInTheDocument()
+    // A refused call never had a session: no identity, no tools.
+    const refused = screen.getByText('+15550004444').closest('tr')!
+    expect(refused).toHaveTextContent('—')
   })
 
   it('empty log explains that PIN failures will show up here', async () => {

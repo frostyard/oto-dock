@@ -344,6 +344,11 @@ def test_bash_block_present_on_cli(temp_db):
     # Dev tools advertised
     assert "`python3`" in text
     assert "`pdftotext`" in text
+    # Local sandbox: HOME is a tmpfs → the workspace venv is the persistent
+    # package home (uv venvs ship no pip, hence `uv pip install --python`).
+    assert "HOME is a temporary filesystem" in text
+    assert "`uv venv .venv`" in text
+    assert "`uv pip install --python .venv/bin/python <pkg>`" in text
 
 
 def test_bash_block_present_on_codex(temp_db):
@@ -420,6 +425,10 @@ def test_env_admin_remote_block(temp_db):
     assert "paired by the platform admin" in text
     # Host-touching commands open for ops roles on remote satellite.
     assert "available here" in text
+    # A satellite has a real HOME — no tmpfs / workspace-venv steer.
+    assert "**Bash access**" in text
+    assert "HOME is a temporary filesystem" not in text
+    assert "`uv venv .venv`" not in text
 
 
 def test_env_user_remote_block(temp_db):

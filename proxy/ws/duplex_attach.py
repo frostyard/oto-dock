@@ -163,9 +163,9 @@ async def _resolve(bridge) -> "_AttachState | str":
         return st
 
     from core.session.session_manager import get_execution_layer
+    from storage.pg import run_db
     from ws.dashboard import _effective_agent_role
-    role = await asyncio.to_thread(
-        _effective_agent_role, bridge.sub, chat.get("agent") or "")
+    role = await run_db(_effective_agent_role, bridge.sub, chat.get("agent") or "")
     try:
         layer = get_execution_layer(
             chat.get("agent") or "",

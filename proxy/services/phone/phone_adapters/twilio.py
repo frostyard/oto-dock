@@ -247,7 +247,7 @@ class TwilioAdapter(PhoneServerAdapter):
         )
         canonical = str(number.get("phone_number") or did)
         logger.info(
-            f"twilio server {self.server_id}: number {canonical} → {webhook}"
+            f"twilio server {self.server_id}: route {route.get('id')} → {webhook}"
         )
         return RouteHandle(
             adapter_data={

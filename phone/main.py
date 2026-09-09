@@ -79,7 +79,11 @@ def _spawn_call_report(payload: dict) -> None:
 def _inbound_report(
     conn, resolution_uuid: str, route, caller_info: dict | None,
     *, outcome: str, pin_attempts: int, started_at: str, duration_s: int,
+    session_id: str = "",
 ) -> dict:
+    """``session_id`` names the warmed proxy session (empty when the call
+    never reached the agent) — the proxy joins the call's identity and the
+    tools it ran onto the log row from it."""
     caller_info = caller_info or {}
     return {
         "route_id": route.id or "",
@@ -95,6 +99,7 @@ def _inbound_report(
         "started_at": started_at,
         "ended_at": datetime.now(timezone.utc).isoformat(),
         "duration_s": duration_s,
+        "session_id": session_id or "",
     }
 
 
@@ -191,12 +196,15 @@ async def _run_call(
         # never warmed up); outbound rows come from CallManager's terminal
         # edge — never both, so one call is one row.
         if not is_outbound:
+            # ``pipeline.llm`` is None when the call never warmed a session
+            # (PIN refused, early hangup).
             _spawn_call_report(_inbound_report(
                 conn, resolution_uuid, route, caller_info,
                 outcome=outcome_override or pipeline.state.call_outcome,
                 pin_attempts=pipeline.state.pin_attempts,
                 started_at=started_at,
                 duration_s=int(time.monotonic() - t0),
+                session_id=getattr(pipeline.llm, "session_id", "") or "",
             ))
         logger.info(f"Call {resolution_uuid} ended ({len(_active_calls)} active calls)")
 

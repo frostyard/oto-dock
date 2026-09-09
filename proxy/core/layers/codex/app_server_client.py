@@ -30,7 +30,9 @@ import hashlib
 import json
 import logging
 import os
+import re
 import signal
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 # Stdlib-only (no proxy ``config`` import) so this module is vendored verbatim
@@ -437,3 +439,131 @@ class AppServerClient:
             await asyncio.wait_for(tk.wait(), timeout=5)
         except (OSError, asyncio.TimeoutError):
             pass
+
+
+# ---------------------------------------------------------------------------
+# Pre-turn MCP warm gate — one implementation for the proxy session and the
+# satellite twin (both drain ``notif_queue`` before their first turn).
+# ---------------------------------------------------------------------------
+
+# app-server's per-server startup notification (v2 ``McpServerStatusUpdated``):
+# params ``{threadId, name, status, error?, failureReason?}``; ``status`` is
+# ``starting`` first, then ``ready`` / ``failed`` / ``cancelled`` — Codex fails
+# a server itself at its ``startup_timeout_sec``. Identical on 0.149.1 and
+# 0.153.4 (0.153.x adds ``runtimeStatus`` next to it).
+MCP_STARTUP_METHOD = "mcpServer/startupStatus/updated"
+MCP_TERMINAL_STATUSES = frozenset({"ready", "failed", "cancelled"})
+
+# ``[mcp_servers.<name>]`` table headers (bare or quoted key); sub-tables such
+# as ``[mcp_servers.x.env]`` / ``[mcp_servers.x.http_headers]`` do not match.
+_MCP_TABLE_RE = re.compile(
+    r'^\s*\[mcp_servers\.(?:"([^"]+)"|([A-Za-z0-9_-]+))\]\s*$', re.MULTILINE,
+)
+
+
+def mcp_server_names_from_toml(toml_text: str) -> list[str]:
+    """The MCP server names a Codex config.toml declares, in order — the
+    servers the warm gate waits for."""
+    names: list[str] = []
+    for m in _MCP_TABLE_RE.finditer(toml_text or ""):
+        name = m.group(1) or m.group(2)
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+@dataclass
+class McpWarmResult:
+    """What the gate saw: every reported status, the expected servers still
+    without a terminal status when it returned, the reporters it had not
+    expected (Codex's own hosted MCPs, e.g. the ChatGPT apps connector — never
+    waited for), the wall time, and whether the daemon died meanwhile."""
+    statuses: dict[str, str] = field(default_factory=dict)
+    pending: list[str] = field(default_factory=list)
+    unexpected: list[str] = field(default_factory=list)
+    elapsed: float = 0.0
+    daemon_exited: bool = False
+
+    @property
+    def ready(self) -> list[str]:
+        return sorted(n for n, s in self.statuses.items() if s == "ready")
+
+    @property
+    def failed(self) -> list[str]:
+        return sorted(n for n, s in self.statuses.items() if s in ("failed", "cancelled"))
+
+
+async def wait_for_mcp_startup(
+    client: "AppServerClient",
+    expected: "list[str] | set[str] | tuple[str, ...]",
+    *,
+    cap_s: float,
+    poll_s: float = 0.5,
+    no_status_grace_s: float = 5.0,
+) -> McpWarmResult:
+    """Drain ``client.notif_queue`` until every EXPECTED server (the
+    ``[mcp_servers.*]`` the session wrote) has a terminal startup status, or
+    ``cap_s`` passes.
+
+    Codex sends the model the servers that are CONNECTED when a turn starts,
+    so a gate that leaves while servers are still ``starting`` costs the first
+    turn its tools and changes the tool list between turns — every prefix
+    cache misses, minutes of re-prefill on a local model (a Windows desktop
+    with 21 stdio servers on Ollama, 2026-09-08: turn 1 left with 4 servers,
+    73 → 323 tools, +66k tokens on turn 2). The previous gate stopped at the
+    first ``poll_s`` silence, which the burst-then-pause pattern of many stdio
+    servers satisfied long before they were up.
+
+    ``poll_s`` is the queue poll (and the quick exit for a session with no
+    expected servers). A daemon that reports nothing for the expected servers
+    within ``no_status_grace_s`` ends the wait early (a renamed notification on
+    a Codex bump, or only Codex's own hosted MCPs reporting) instead of burning
+    the cap. Anything else on the queue is pre-turn noise (thread/started,
+    status changes) and is dropped — the caller must be the queue's sole
+    consumer until it returns.
+    """
+    q = client.notif_queue
+    expected_set = {str(n) for n in expected if n}
+    statuses: dict[str, str] = {}
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    deadline = started + cap_s
+    daemon_exited = False
+
+    def _pending() -> set[str]:
+        return {
+            n for n in expected_set
+            if statuses.get(n, "starting") not in MCP_TERMINAL_STATUSES
+        }
+
+    def _expected_reported() -> bool:
+        return any(n in expected_set for n in statuses)
+
+    while True:
+        now = loop.time()
+        if now >= deadline:
+            break
+        try:
+            method, params = await asyncio.wait_for(
+                q.get(), timeout=min(poll_s, deadline - now),
+            )
+        except asyncio.TimeoutError:
+            if not _pending():
+                break  # quiet and nothing outstanding → warm
+            if not _expected_reported() and loop.time() - started >= no_status_grace_s:
+                break  # the daemon reports nothing for what we configured
+            continue
+        if method == "__daemon_exit__":
+            daemon_exited = True
+            break
+        if method == MCP_STARTUP_METHOD:
+            statuses[str(params.get("name") or "?")] = str(params.get("status") or "?")
+            if not _pending():
+                break
+    return McpWarmResult(
+        statuses=statuses,
+        pending=sorted(_pending()),
+        unexpected=sorted(set(statuses) - expected_set),
+        elapsed=loop.time() - started,
+        daemon_exited=daemon_exited,
+    )

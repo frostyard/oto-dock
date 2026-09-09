@@ -43,6 +43,28 @@ function fmtDuration(s: number | null): string {
   return `${Math.floor(s / 60)}m ${s % 60}s`
 }
 
+// The identity label stamped at warmup (`caller:<id>` / `caller-pin:<id>` /
+// `ephemeral` / `shared` / `user:<username>`); the number itself is in the
+// Number column, so the cell says WHO the session ran as.
+export function fmtIdentity(label: string): string {
+  if (!label) return '—'
+  const [kind, rest] = label.includes(':') ? [label.slice(0, label.indexOf(':')), label.slice(label.indexOf(':') + 1)] : [label, '']
+  switch (kind) {
+    case 'caller': return 'Caller'
+    case 'caller-pin': return 'Caller (PIN)'
+    case 'ephemeral': return 'Anonymous'
+    case 'shared': return 'Shared'
+    case 'user': return rest ? `User ${rest}` : 'User'
+    default: return label
+  }
+}
+
+// `mcp__memory-mcp__memory` → `memory-mcp/memory`; built-ins stay as-is.
+export function fmtTool(name: string): string {
+  const m = /^mcp__(.+?)__(.+)$/.exec(name)
+  return m ? `${m[1]}/${m[2]}` : name
+}
+
 export default function CallLogModal({ route, onClose }: {
   route: PhoneRoute
   onClose: () => void
@@ -62,7 +84,7 @@ export default function CallLogModal({ route, onClose }: {
           <div>
             <h2 className="font-semibold text-p-text">Call log</h2>
             <p className="text-xs text-p-text-light">
-              {route.name || route.id} — last 30 days, refreshes automatically
+              {route.name || route.id} — kept for the caller-data window, refreshes automatically
             </p>
           </div>
           <button onClick={onClose} className="text-p-text-secondary hover:text-p-text text-xl leading-none">&times;</button>
@@ -78,13 +100,15 @@ export default function CallLogModal({ route, onClose }: {
             </div>
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[560px] text-sm">
+              <table className="w-full min-w-[760px] text-sm">
                 <thead className="bg-p-bg text-left text-xs text-p-text-secondary uppercase tracking-wide border-b border-p-border-light">
                   <tr>
                     <th className="px-3 py-2">When</th>
                     <th className="px-3 py-2">Direction</th>
                     <th className="px-3 py-2">Number</th>
+                    <th className="px-3 py-2">Identity</th>
                     <th className="px-3 py-2">Outcome</th>
+                    <th className="px-3 py-2">Tools</th>
                     <th className="px-3 py-2 text-right">Duration</th>
                   </tr>
                 </thead>
@@ -100,6 +124,9 @@ export default function CallLogModal({ route, onClose }: {
                       <td className="px-3 py-2 font-mono text-p-text">
                         {(c.direction === 'inbound' ? c.from_number : c.to_number) || '(unknown)'}
                       </td>
+                      <td className="px-3 py-2 text-p-text-secondary whitespace-nowrap" title={c.identity || undefined}>
+                        {fmtIdentity(c.identity)}
+                      </td>
                       <td className="px-3 py-2">
                         <Badge variant={OUTCOME_TONE[c.outcome] ?? 'default'}>
                           {OUTCOME_LABEL[c.outcome] ?? c.outcome}
@@ -109,6 +136,10 @@ export default function CallLogModal({ route, onClose }: {
                             {c.pin_attempts} {c.pin_attempts === 1 ? 'attempt' : 'attempts'}
                           </span>
                         )}
+                      </td>
+                      <td className="px-3 py-2 text-xs text-p-text-secondary max-w-[220px] truncate"
+                        title={(c.tools_run ?? []).map(fmtTool).join(', ') || undefined}>
+                        {(c.tools_run ?? []).length ? (c.tools_run ?? []).map(fmtTool).join(', ') : <span className="text-p-text-light">—</span>}
                       </td>
                       <td className="px-3 py-2 text-right text-p-text-secondary whitespace-nowrap">
                         {fmtDuration(c.duration_s)}

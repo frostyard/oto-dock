@@ -36,6 +36,7 @@ from auth.providers import (
     require_auth,
     require_creator_interactive,
 )
+from services.infra.path_confinement import PathOutsideRoot, resolve_under
 from storage import agent_store, db_knowledge_libraries
 
 from api.agents._router import router
@@ -165,11 +166,15 @@ def _validate_subdir_on_disk(agent: str, sub: str) -> None:
 
 def _bulletin_file(agent: str, subdir: str, name: str) -> Path | None:
     """Host path of a library's source-resident bulletin, or None for an
-    unnamed library."""
+    unnamed library (or one whose name would leave ``knowledge/``)."""
     rel = db_knowledge_libraries.bulletin_rel(subdir, name)
     if not rel:
         return None
-    return config.get_agent_dir(agent) / "knowledge" / rel
+    knowledge = config.get_agent_dir(agent) / "knowledge"
+    try:
+        return resolve_under(knowledge / rel, knowledge)
+    except PathOutsideRoot:
+        return None
 
 
 def _has_bulletin(agent: str, subdir: str, name: str) -> bool:
@@ -349,14 +354,13 @@ async def set_knowledge_library(
                 # Tombstone the old path + record the new one; both fire
                 # the library projection, so mirrors and satellites follow
                 # the rename instead of resurrecting the old file.
-                from api.agents.files import (
-                    _record_platform_write, _tombstone_path,
-                )
+                from services.infra import file_bookkeeping
                 old_rel, new_rel = moved
                 asyncio.create_task(
-                    _tombstone_path(name, f"knowledge/{old_rel}"))
+                    file_bookkeeping.tombstone_path(name, f"knowledge/{old_rel}"))
                 asyncio.create_task(
-                    _record_platform_write(name, f"knowledge/{new_rel}", None))
+                    file_bookkeeping.record_platform_write(
+                        name, f"knowledge/{new_rel}", None))
         # `name` here is the AGENT slug (the path param); `label` is the
         # library's display name. Spelled out so the two never blur.
         created = await asyncio.to_thread(

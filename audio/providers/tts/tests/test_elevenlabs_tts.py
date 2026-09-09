@@ -286,7 +286,8 @@ async def test_reconnect_after_socket_death(fake_ws):
     assert len(fake_ws.paths) == 2
     conn2 = fake_ws.frames[1]
     assert conn2[0]["text"] == " "           # re-sent InitialiseContext
-    assert conn2[-1].get("flush") is True
+    assert conn2[-2].get("flush") is True
+    assert conn2[-1].get("close_context") is True   # closed at flush (2026-09-07)
 
 
 async def test_zero_audio_socket_death_resynthesizes(fake_ws):
@@ -314,7 +315,8 @@ async def test_zero_audio_socket_death_resynthesizes(fake_ws):
     conn2 = fake_ws.frames[1]
     assert conn2[0]["text"] == " "             # re-init on the new socket
     assert conn2[1]["text"] == "Hello there "  # the utterance replayed
-    assert conn2[-1].get("flush") is True
+    assert conn2[-2].get("flush") is True
+    assert conn2[-1].get("close_context") is True   # closed at flush (2026-09-07)
 
 
 async def test_no_is_final_ends_via_tail_guard(fake_ws):
@@ -387,7 +389,8 @@ async def test_context_cap_error_recycles_socket_and_replays(fake_ws):
     conn2 = fake_ws.frames[1]
     assert conn2[0]["text"] == " "             # re-init on the new socket
     assert conn2[1]["text"] == "Hello there "  # the utterance replayed
-    assert conn2[-1].get("flush") is True
+    assert conn2[-2].get("flush") is True
+    assert conn2[-1].get("close_context") is True   # closed at flush (2026-09-07)
 
 
 async def test_generic_error_frame_ends_and_closes_context(fake_ws):

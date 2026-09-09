@@ -155,11 +155,30 @@ def _effective_agent_role(user_sub: str, agent: str, fallback_user: dict | None 
     viewer). Reads live DB state so mid-session role changes take effect.
     Used wherever a session's execution target is (re)resolved so the layer
     matches the role the session was created with — a viewer on an admin-remote
-    agent otherwise resolves to a different layer than its config."""
+    agent otherwise resolves to a different layer than its config.
+
+    Two store reads: async handlers call it through ``run_db`` (or
+    ``_role_and_layer`` when the layer is resolved right after)."""
     live_user = task_store.get_user(user_sub) or fallback_user or {}
     if (live_user.get("role") or "") == "admin":
         return "admin"
     return task_store.get_user_agent_roles(user_sub).get(agent, "viewer")
+
+
+def _role_and_layer(
+    user_sub: str, agent: str, chat: dict | None, fallback_user: dict | None = None,
+) -> "tuple[str, ExecutionLayer]":
+    """Role + the chat's execution layer (its stored path + pinned target) in
+    ONE executor job: ``get_execution_layer`` reads remote_store and platform
+    settings for a remote target, so the pair belongs off the loop together."""
+    role = _effective_agent_role(user_sub, agent, fallback_user=fallback_user)
+    row = chat or {}
+    layer = get_execution_layer(
+        agent, execution_path=row.get("execution_path", ""),
+        user_sub=user_sub, role=role,
+        execution_target=row.get("execution_target") or "",
+    )
+    return role, layer
 
 
 def _task_continue_allowed(run: dict, *, effective_role: str, user_sub: str) -> bool:
@@ -283,7 +302,27 @@ def _host_to_sandbox_path(host_path: str, agent_dir: Path) -> str:
     return "/" + str(rel)
 
 
-def _extract_server_kicks(queue: asyncio.Queue) -> list[dict]:
+def _park_delegate_result(item: dict) -> bool:
+    """Persist an undrained ``task_result_prompt`` as a chat event + a durable
+    wake (close-rescue). Synchronous store work — run via ``run_db``."""
+    _cid = item.get("chat_id") or ""
+    _prompt = item.get("result_prompt") or ""
+    # The WS route leaves event persistence to the handler — which never ran
+    # for this item. Persist the bubble row here, then park the prompt for
+    # replay.
+    task_store.add_chat_message(_cid, "event", "",
+        event_type="delegate_result",
+        event_data=json.dumps({
+            "task_id": item.get("task_id", ""),
+            "task_name": item.get("task_name", ""),
+            "agent": item.get("delegate_agent", ""),
+            "output_text": item.get("output_text", ""),
+            "status": item.get("status", "completed"),
+        }))
+    return bool(task_store.append_pending_delegate_wake(_cid, _prompt))
+
+
+async def _extract_server_kicks(queue: asyncio.Queue) -> list[dict]:
     """Drain a dying connection's notify queue, keeping only `_server_kick`
     items (the close-rescue path). A kick is a freshly-spawned chat's durable FIRST TURN:
     it waits in the per-connection queue while the viewed chat's turn occupies
@@ -296,8 +335,13 @@ def _extract_server_kicks(queue: asyncio.Queue) -> list[dict]:
     durable wake on its chat so the next warmup/turn replays it. Everything
     else in the queue is live-push-only state that a reconnect re-derives; it
     is dropped exactly as a dead queue always did.
+
+    The queue drain itself is synchronous (one atomic step on the loop, see
+    the close path's comment); only the parking writes await the DB executor.
     """
+    from storage.pg import run_db
     kicks: list[dict] = []
+    to_park: list[dict] = []
     while True:
         try:
             item = queue.get_nowait()
@@ -308,32 +352,21 @@ def _extract_server_kicks(queue: asyncio.Queue) -> list[dict]:
         if item.get("type") == "_server_kick":
             kicks.append(item)
         elif item.get("type") == "task_result_prompt":
-            _cid = item.get("chat_id") or ""
-            _prompt = item.get("result_prompt") or ""
-            if _cid and _prompt:
-                try:
-                    # The WS route leaves event persistence to the handler —
-                    # which never ran for this item. Persist the bubble row
-                    # here, then park the prompt for replay.
-                    task_store.add_chat_message(_cid, "event", "",
-                        event_type="delegate_result",
-                        event_data=json.dumps({
-                            "task_id": item.get("task_id", ""),
-                            "task_name": item.get("task_name", ""),
-                            "agent": item.get("delegate_agent", ""),
-                            "output_text": item.get("output_text", ""),
-                            "status": item.get("status", "completed"),
-                        }))
-                    stored = task_store.append_pending_delegate_wake(_cid, _prompt)
-                    logger.info(
-                        f"WS dashboard close-rescue: delegate result for "
-                        f"chat={_cid[:8]} {'parked as wake' if stored else 'NOT parked'}"
-                    )
-                except Exception:
-                    logger.warning(
-                        f"WS dashboard close-rescue: failed to park delegate "
-                        f"result for chat={_cid[:8]}", exc_info=True,
-                    )
+            if item.get("chat_id") and item.get("result_prompt"):
+                to_park.append(item)
+    for item in to_park:
+        _cid = item.get("chat_id") or ""
+        try:
+            stored = await run_db(_park_delegate_result, item)
+            logger.info(
+                f"WS dashboard close-rescue: delegate result for "
+                f"chat={_cid[:8]} {'parked as wake' if stored else 'NOT parked'}"
+            )
+        except Exception:
+            logger.warning(
+                f"WS dashboard close-rescue: failed to park delegate "
+                f"result for chat={_cid[:8]}", exc_info=True,
+            )
     return kicks
 
 
@@ -483,6 +516,15 @@ def task_run_active(chat_id: str) -> bool:
         return False
 
 
+async def task_run_active_async(chat_id: str) -> bool:
+    """``task_run_active`` with its two run reads on the DB executor — for
+    the async handlers (non-task chats short-circuit without a job)."""
+    if not chat_id.startswith("task-"):
+        return False
+    from storage.pg import run_db
+    return await run_db(task_run_active, chat_id)
+
+
 def _resume_username_for_chat(
     cid_for_resume: str, agent_for_resume: str, viewer_username: str,
 ) -> str:
@@ -552,7 +594,11 @@ async def ws_dashboard_handler(websocket: WebSocket):
         return
 
     user_sub = payload["sub"]
-    user = task_store.get_user(user_sub)
+    # Connect-path store reads run off the loop (run_db): after a stall or a
+    # proxy restart EVERY dashboard reconnects at once, and a synchronous
+    # read here per socket would serialize the storm on the loop thread.
+    from storage.pg import run_db
+    user = await run_db(task_store.get_user, user_sub)
     if not user:
         await websocket.close(code=4001, reason="User not found")
         return
@@ -621,8 +667,9 @@ class DashboardConnection(
         self.user = user
 
     async def run(self) -> None:
+        from storage.pg import run_db
 
-        self.agent_roles = task_store.get_user_agent_roles(self.user_sub)
+        self.agent_roles = await run_db(task_store.get_user_agent_roles, self.user_sub)
         self.user_agents = list(self.agent_roles.keys())
         self.user_role = self.user["role"]
         self._last_authz_check = time.time()
@@ -715,7 +762,7 @@ class DashboardConnection(
             self.user_sub, self.notify_connection_id, self.notify_queue, platform="web",
         )
         # Send initial unread count so bell badge shows immediately
-        _initial_count = notification_store.get_unread_count(self.user_sub)
+        _initial_count = await run_db(notification_store.get_unread_count, self.user_sub)
         await self.websocket.send_json({"type": "notification_count", "count": _initial_count})
 
         # Replay in-flight MCP-install progress this user participates in, so a tab
@@ -767,7 +814,9 @@ class DashboardConnection(
             from ws import satellite as _satellite_ws
             await self.websocket.send_json({
                 "type": "satellite_update_sync",
-                "inflight": _satellite_ws.inflight_pushed_updates_for_user(self.user_sub),
+                "inflight": await run_db(
+                    _satellite_ws.inflight_pushed_updates_for_user, self.user_sub,
+                ),
             })
         except Exception:
             logger.exception("satellite-update reconcile-on-connect failed")
@@ -785,11 +834,21 @@ class DashboardConnection(
             from core.session.visibility import is_shared_chat_owner as _is_shared_owner
             _live_ids: list[str] = []
             _seen: set[str] = set()
+            _cids: list[str] = []
             for _cid in list(_pump_streaming()) + list(_isess.streaming_chat_ids()):
                 if not _cid or _cid in _seen:
                     continue
                 _seen.add(_cid)
-                _row = task_store.get_chat(_cid) or {}
+                _cids.append(_cid)
+
+            def _rows_for(ids: list[str]) -> dict[str, dict]:
+                return {c: (task_store.get_chat(c) or {}) for c in ids}
+
+            # ONE executor job for all rows (connect storm: N sockets × M
+            # streaming chats must not become N×M loop-side reads).
+            _rows = await run_db(_rows_for, _cids) if _cids else {}
+            for _cid in _cids:
+                _row = _rows.get(_cid) or {}
                 _owner = _row.get("user_sub") or ""
                 # task:: owners mirror chat_status_targets: scheduled
                 # agent-scope runs are visible to every user of the agent
@@ -926,12 +985,12 @@ class DashboardConnection(
             # goes headless in _spawn_tail — no gap. Honors the same
             # abort-during-spawn guard as the main-loop drain; turns run as
             # fire-and-forget tasks so connection cleanup isn't delayed.
-            for _kick in _extract_server_kicks(self.notify_queue):
+            for _kick in await _extract_server_kicks(self.notify_queue):
                 _kcid = _kick.get("chat_id", "")
                 _ksid = _kick.get("session_id")
                 if self._warmup_abort_chat == _kcid:
                     self._warmup_abort_chat = None
-                    _k_layer = self._resolve_layer_for_chat(_kcid)
+                    _k_layer = await self._resolve_layer_for_chat_async(_kcid)
                     if _k_layer and _ksid:
                         try:
                             await _k_layer.abort(_ksid)
@@ -1068,7 +1127,12 @@ class DashboardConnection(
         execution_path + pinned execution_target) — never the connection's
         viewed attributes. Used to drive a server turn on a chat this socket
         isn't viewing. Returns None if the chat is gone or its pinned remote is
-        offline (get_execution_layer raises) so the caller defers gracefully."""
+        offline (get_execution_layer raises) so the caller defers gracefully.
+
+        Synchronous: three store reads (chat row, role, and — for a remote
+        target — the machine row + platform settings inside
+        ``get_execution_layer``). Async callers on the loop use
+        ``_resolve_layer_for_chat_async`` so the reads run on the DB executor."""
         rec = task_store.get_chat(cid) if cid else None
         if not rec:
             return None
@@ -1085,6 +1149,14 @@ class DashboardConnection(
         except Exception as e:
             logger.warning(f"WS dashboard: cannot resolve layer for chat {cid}: {e}")
             return None
+
+    async def _resolve_layer_for_chat_async(self, cid: str) -> "ExecutionLayer | None":
+        """``_resolve_layer_for_chat`` with every store read on the DB
+        executor (one job: row + role + layer construction). The layers are
+        process-wide singletons and their constructors bind no loop, so
+        building one on a worker thread is safe."""
+        from storage.pg import run_db
+        return await run_db(self._resolve_layer_for_chat, cid)
 
     async def _task_pump_poll(self) -> bool:
         """Check if a new pump appeared (meeting pump or task turn).

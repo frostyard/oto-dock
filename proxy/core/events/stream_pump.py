@@ -14,12 +14,15 @@ _session_cumulative_cost) lives here and is imported by ws/dashboard.py.
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import time
 from datetime import datetime, timezone
 
 from storage import database as task_store
+from storage.pg import run_db
+from core.events import chat_writer
 from services.notifications import notification_manager
 from core.events.artifact_events import artifact_event_from_perm_item
 from core.session.session_state import (
@@ -98,6 +101,104 @@ _session_cumulative_cost: dict[str, float] = {}  # session_id -> last CLI cost
 _GOAL_UNSET = object()
 
 
+def _serialize_turn_rows(blocks: list[dict]) -> list[tuple[str, str, str, str]]:
+    """``(role, content, event_type, event_data)`` rows for the writer, built
+    ON THE LOOP: the block dicts are shared with live_state and keep changing
+    afterwards (a plan_review action, badge flags), and json.dumps on a worker
+    thread while the loop mutates one would raise mid-insert. The meeting
+    badge lookup is an agent_store cache read."""
+    rows: list[tuple[str, str, str, str]] = []
+    for block in blocks:
+        if block["type"] == "media_processing":
+            # Transient transcode skeleton — never persisted. If a turn ends
+            # while a transcode is still running, the placeholder is dropped
+            # rather than frozen into history.
+            continue
+        if block["type"] == "text":
+            meeting_agent = block.get("_meeting_agent")
+            event_data = ""
+            if meeting_agent:
+                from storage import agent_store
+                ad = agent_store.get_agent(meeting_agent)
+                event_data = json.dumps({
+                    "agent_slug": meeting_agent,
+                    "agent_display_name": (ad or {}).get("display_name", meeting_agent),
+                    "agent_color": (ad or {}).get("color", ""),
+                    "badge": "meeting",
+                })
+            rows.append(("assistant", block["content"], "", event_data))
+        else:
+            rows.append(("event", "", block["type"], json.dumps(block)))
+    return rows
+
+
+def _record_usage(chat_row: dict, snap: dict) -> None:
+    """Record one usage_records row for the LLM + one per (provider, model)
+    for any per-tool MCP costs accumulated this turn — from the cost job, on
+    the DB executor, with the pump's values snapshotted on the loop.
+
+    The LLM row is always written (even at $0 cost) so token counts and the
+    message_count survive — analytics depends on them. MCP rows are only
+    written when their cost is positive.
+    """
+    try:
+        from services.billing import usage_service
+        from config import get_model_provider
+
+        chat_model = chat_row.get("model", "")
+        llm_provider = get_model_provider(chat_model) or "anthropic"
+        llm_cost = max(0.0, round(snap["llm_cost_delta"], 6))
+
+        common = {
+            "user_sub": chat_row.get("user_sub"),
+            "agent": chat_row.get("agent", ""),
+            "scope": snap["scope"],
+            "source_type": snap["source_type"],
+            "source_id": snap["chat_id"],
+        }
+        # Agent scope must mean platform-paid. A Shared-only agent's human
+        # chat mounts agent scope but runs on the interacting USER's
+        # subscription (the chat row's owner is the synthetic agent::{slug},
+        # not a person) — bill it to the payer so it lands in their Usage
+        # tab, not the agent bucket. Platform-paid sources (tasks, phone,
+        # meetings, service sessions) acquire agent-scope and have no payer,
+        # so they are untouched.
+        if snap["scope"] == "agent" and snap["payer"]:
+            common["user_sub"] = snap["payer"]
+            common["scope"] = "user"
+
+        rows: list[dict] = [{
+            **common,
+            "cost_usd": llm_cost,
+            "input_tokens": snap["input_tokens"],
+            "output_tokens": snap["output_tokens"],
+            "cache_read": snap["cache_read"],
+            "cache_write": snap["cache_write"],
+            "message_count": 1,
+            "provider": llm_provider,
+            "model": chat_model,
+            "source_key": snap["sub_id"],
+        }]
+        for (provider, model), cost in snap["mcp_cost_by_key"].items():
+            if cost <= 0:
+                continue
+            rows.append({
+                **common,
+                "cost_usd": round(cost, 6),
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read": 0,
+                "cache_write": 0,
+                "message_count": 0,
+                "provider": provider,
+                "model": model,
+            })
+
+        usage_service.record_turn_usage(rows)
+    except Exception as e:
+        logger.error(f"Failed to record usage: {e}")
+
+
 class ChatStreamPump:
     """Decoupled stream processor for chat turns.
 
@@ -121,6 +222,8 @@ class ChatStreamPump:
         implementing_plan: str = "",
         scope: str = "user",
         source_type: str = "chat",
+        chat_owner: str = "",
+        chat_agent: str = "",
     ):
         self.chat_id = chat_id
         self.session_id = session_id
@@ -130,6 +233,12 @@ class ChatStreamPump:
         self.implementing_plan = implementing_plan
         self.scope = scope
         self.source_type = source_type
+        # The chat row's owner + agent when the caller already holds them
+        # (dashboard turns): the turn-start "streaming" broadcast then fires
+        # synchronously in _run, in the frame order viewers expect; other
+        # producers get it from the start job's result.
+        self._chat_owner = chat_owner
+        self._chat_agent = chat_agent
 
         self._ws_queues: list[asyncio.Queue] = []
         self._done = False
@@ -172,24 +281,26 @@ class ChatStreamPump:
         self._activity_touch = time.monotonic()
         self._pending_text: list[str] = []  # text chunks since last event
         self._turn_blocks: list[dict] = []  # ordered text segments + events
-        # Highest DB message id before this pump started — the id-based cutoff that
-        # excludes in-flight turn saves from chat_history on live reconnect. id-based
-        # (not a row count) so a *windowed* resume can still withhold the in-flight
-        # tail: a count can't index a 50-row page (see ws/dashboard.py truncation).
-        self._db_msg_cutoff_id = task_store.get_last_chat_message_id(chat_id)
-        # LLM chat-title generation (services/title_generator.py): arm the
-        # one-time title upgrade for chats not yet LLM-titled. Fired in the
-        # TEXT handler once the first response crosses _TITLE_CHAR_THRESHOLD,
-        # in the TOOL_USE handler at _TITLE_TOOL_THRESHOLD tool calls, or at
-        # PRODUCER_DONE for a short first response. Task chats title like
-        # every chat (they live in the sidebar's Task history view); only
-        # meetings are excluded. The atomic claim guarantees exactly-once
-        # across all fire points and any later turn.
-        _title_chat = task_store.get_chat(chat_id) or {}
-        self._title_armed = (
-            not chat_id.startswith("meeting-")
-            and not _title_chat.get("title_generated")
-        )
+        # Highest DB message id before this pump's first row — the id-based
+        # cutoff that excludes in-flight turn saves from chat_history on live
+        # reconnect (id-based, not a row count: a *windowed* resume can't index
+        # a 50-row page — see ws/dashboard.py truncation). None until the start
+        # job — a chat-lane read, so it is ordered after the previous pump's
+        # rows — lands: no row of this turn can exist before that, so None reads
+        # as "withhold nothing". Each save advances it as it lands.
+        self._db_msg_cutoff_id: int | None = None
+        # LLM chat-title generation (services/title_generator.py): the one-time
+        # title upgrade for chats not yet LLM-titled. Fired in the TEXT handler
+        # once the first response crosses _TITLE_CHAR_THRESHOLD, in the
+        # TOOL_USE handler at _TITLE_TOOL_THRESHOLD tool calls, or after the
+        # turn-end save for a short first response. Task chats title like every
+        # chat (they live in the sidebar's Task history view); only meetings
+        # are excluded. Armed by default — the service's atomic claim makes a
+        # redundant attempt a no-op — and disarmed by the start job when the
+        # row says the title was already generated.
+        self._title_armed = not chat_id.startswith("meeting-")
+        self._completed = False  # PRODUCER_DONE reached: all_done goes out after the drain
+        self._owner_sub = ""
         self._tool_seen = 0  # tool calls this pump — the title tool-count trigger
         self._active_tools: dict[str, dict] = {}
         self._pending_previews: dict[str, dict] = {}  # file_id -> latest preview (flushed at turn end)
@@ -351,15 +462,26 @@ class ChatStreamPump:
             await self._forward(
                 {"pump_type": "perm_question_prompt", "perm_data": perm_data},
             )
-            chat = task_store.get_chat(self.chat_id)
-            if (chat and self.source_type != "task"
-                    and not task_store.get_active_meeting_for_chat(self.chat_id)):
+            _q_cid = self.chat_id
+
+            def _row_meeting_label() -> tuple[dict | None, bool, str]:
+                row = task_store.get_chat(_q_cid)
+                if not row:
+                    return None, False, ""
+                return (
+                    row,
+                    bool(task_store.get_active_meeting_for_chat(_q_cid)),
+                    notification_manager.agent_label(row["agent"]) if row.get("agent") else "",
+                )
+
+            chat, _in_meeting, _label = await run_db(_row_meeting_label)
+            if chat and self.source_type != "task" and not _in_meeting:
                 qs = (perm_data.get("tool_input") or {}).get("questions") or []
                 first_q = (qs[0].get("question") if qs and isinstance(qs[0], dict)
                            else "") or "Waiting for your answer"
                 asyncio.create_task(notification_manager.fire_ephemeral(
                     chat["user_sub"],
-                    title=f"{notification_manager.agent_label(chat['agent'])} needs your input",
+                    title=f"{_label or chat.get('agent') or ''} needs your input",
                     body=first_q,
                     chat_id=self.chat_id,
                 ))
@@ -448,139 +570,271 @@ class ChatStreamPump:
             await self._forward({"pump_type": "ws_event", "event": evt})
         self._pending_previews.clear()
 
-    def _save_turn_blocks(self):
-        """Save all turn blocks to DB in order (preserves interleaving).
+    def _save_turn_blocks(self) -> asyncio.Future | None:
+        """Persist the turn blocks accumulated so far, in order, off the loop.
 
-        After saving, advances _db_msg_cutoff_id so that these messages are
-        included in chat_history on WS reconnect (not truncated as
-        in-progress streaming content).
+        The rows are serialised HERE (the block dicts keep mutating on the
+        loop afterwards — plan_review actions, live badges), the accumulator
+        is cleared, and ONE writer job per call goes on the chat's lane:
+        inserts → snapshot GC → the last message id. When the job lands the
+        id-based cutoff advances and exactly the live blocks it persisted are
+        trimmed from live_state, so a viewer reconnecting during the write
+        still sees the turn (live_state), and afterwards from chat_history —
+        never neither, never both. Returns the job's future, or None when
+        nothing was queued.
         """
         if self.chat_id in _recovery_suppress_flush:
             # This turn will be re-adopted + re-persisted from the satellite
             # after the restart — a shutdown flush here would duplicate it.
             self._turn_blocks.clear()
-            return
+            return None
         if not self._turn_blocks:
-            return
-        for block in self._turn_blocks:
-            if block["type"] == "media_processing":
-                # Transient transcode skeleton — never persisted. If a turn ends
-                # while a transcode is still running, the placeholder is dropped
-                # rather than frozen into history.
-                continue
-            if block["type"] == "text":
-                meeting_agent = block.get("_meeting_agent")
-                event_data = ""
-                if meeting_agent:
-                    from storage import agent_store
-                    ad = agent_store.get_agent(meeting_agent)
-                    event_data = json.dumps({
-                        "agent_slug": meeting_agent,
-                        "agent_display_name": (ad or {}).get("display_name", meeting_agent),
-                        "agent_color": (ad or {}).get("color", ""),
-                        "badge": "meeting",
-                    })
-                task_store.add_chat_message(self.chat_id, "assistant", block["content"],
-                                            event_data=event_data)
-            else:
-                task_store.add_chat_message(
-                    self.chat_id, "event", "",
-                    event_type=block["type"],
-                    event_data=json.dumps(block),
-                )
+            return None
+        rows = _serialize_turn_rows(self._turn_blocks)
         self._turn_blocks.clear()
         self._todo_block = None
-        if self._gc_snapshots_pending:
-            # The flushed preview rows are persisted now — prune this chat's
-            # unreferenced version-pinned snapshots (dismissed history etc.).
-            self._gc_snapshots_pending = False
-            try:
-                from services.media import preview_snapshots
-                preview_snapshots.gc_chat(self.chat_id)
-            except Exception:
-                logger.debug("preview snapshot GC failed", exc_info=True)
-        # Advance cutoff so incrementally saved content (completed meeting
-        # turns) is included in chat_history on reconnect, not truncated.
-        self._db_msg_cutoff_id = task_store.get_last_chat_message_id(self.chat_id)
-        # Clear live_blocks for the saved content — it's now in DB and will
-        # be sent via chat_history. Only unsaved content (current in-progress
-        # turn) should remain in live_blocks for live_state reconnection.
-        live = _chat_streaming_state.get(self.chat_id)
-        if live:
-            live["live_blocks"] = []
+        gc_pending, self._gc_snapshots_pending = self._gc_snapshots_pending, False
+        chat_id = self.chat_id
+        live = _chat_streaming_state.get(chat_id)
+        live_list = live.get("live_blocks") if live else None
+        live_len = len(live_list) if live_list is not None else 0
 
-    def _record_usage(self, chat_row: dict):
-        """Record one usage_records row for the LLM + one per (provider, model)
-        for any per-tool MCP costs accumulated this turn.
+        def _job() -> int:
+            for role, content, event_type, event_data in rows:
+                if role == "assistant":
+                    task_store.add_chat_message(chat_id, "assistant", content,
+                                                event_data=event_data)
+                else:
+                    task_store.add_chat_message(
+                        chat_id, "event", "",
+                        event_type=event_type, event_data=event_data,
+                    )
+            if gc_pending:
+                # The flushed preview rows are persisted now — prune this
+                # chat's unreferenced version-pinned snapshots (dismissed
+                # history etc.).
+                try:
+                    from services.media import preview_snapshots
+                    preview_snapshots.gc_chat(chat_id)
+                except Exception:
+                    logger.debug("preview snapshot GC failed", exc_info=True)
+            return task_store.get_last_chat_message_id(chat_id)
 
-        The LLM row is always written (even at $0 cost) so token counts and
-        the message_count survive — analytics depends on them. MCP rows are
-        only written when their cost is positive.
-        """
+        fut = chat_writer.submit(chat_id, _job, label="turn_blocks")
+
+        def _landed(f: asyncio.Future) -> None:
+            if f.cancelled() or f.exception() is not None:
+                return
+            # Advance the cutoff so the saved content (completed meeting
+            # turns included) comes from chat_history on reconnect, not
+            # truncated as in-flight.
+            self._db_msg_cutoff_id = max(self._db_msg_cutoff_id or 0, f.result() or 0)
+            # Trim exactly the blocks this job persisted; blocks appended
+            # since (the next speaker) stay live. A superseding pump replaces
+            # the live dict — then there is nothing of ours to trim.
+            cur = _chat_streaming_state.get(chat_id)
+            if (cur is not None and live_list is not None
+                    and cur.get("live_blocks") is live_list):
+                del live_list[:live_len]
+
+        fut.add_done_callback(_landed)
+        return fut
+
+    def _submit_chat_update(self, label: str, **fields) -> None:
+        """A chat-row write that must land in order with this turn's rows but
+        that nothing waits for (goal, compaction gauge, modes, thread id)."""
+        chat_id = self.chat_id
+        chat_writer.submit(
+            chat_id, functools.partial(task_store.update_chat, chat_id, **fields),
+            label=label,
+        )
+
+    def _submit_turn_start(self) -> None:
+        """Turn-start persistence, never awaited: the cutoff read + the row
+        that says whether the title was already generated (one lane job —
+        ordered after the previous pump's rows and before any of ours), plus
+        the resumed-task History open. The "streaming" sidebar dot fires
+        synchronously when the caller supplied the owner, else from the job.
+        A stalled lane must not stop this turn from streaming: the cutoff
+        stays None (withhold nothing) until the job lands."""
+        chat_id = self.chat_id
+        if self._chat_owner:
+            self._owner_sub = self._chat_owner
+            notification_manager.broadcast_chat_status(
+                self._owner_sub, chat_id, "streaming", agent=self._chat_agent,
+            )
+
+        def _job() -> tuple[int, dict]:
+            row = task_store.get_chat(chat_id) or {}
+            return task_store.get_last_chat_message_id(chat_id), row
+
+        def _started(f: asyncio.Future) -> None:
+            if f.cancelled() or f.exception() is not None:
+                return
+            cutoff, row = f.result()
+            self._db_msg_cutoff_id = max(self._db_msg_cutoff_id or 0, cutoff or 0)
+            if row.get("title_generated"):
+                self._title_armed = False
+            if not self._chat_owner:
+                # Light this chat's sidebar dot on every device of its owner
+                # — the authoritative turn-start signal, viewed or background.
+                # Shared-only chats (synthetic agent:: owner) fan out to every
+                # user of the agent via the agent arg.
+                self._owner_sub = row.get("user_sub") or ""
+                if self._owner_sub:
+                    notification_manager.broadcast_chat_status(
+                        self._owner_sub, chat_id, "streaming",
+                        agent=row.get("agent") or "",
+                    )
+
+        chat_writer.submit(chat_id, _job, label="turn_start").add_done_callback(_started)
+        if chat_id.startswith("task-run-") and self.source_type != "task":
+            # Dashboard-RESUMED task conversation (the scheduler's own runs are
+            # source_type == "task"): reflect the live turn in the Task History
+            # row, which otherwise freezes on its pre-resume terminal state.
+            # Terminal-states-only guard: never touch a run some other pump or
+            # the scheduler still owns. The matching close is the turn-end job.
+            chat_writer.submit(
+                chat_id,
+                functools.partial(
+                    task_store.update_latest_run_status_for_chat, chat_id, "running",
+                    only_from=("completed", "failed", "cancelled", "limit_exceeded"),
+                ),
+                label="run_open",
+            )
+
+    def _submit_cost_job(self) -> asyncio.Future | None:
+        """Persist cost + context + the usage rows, once per pump, as ONE lane
+        job: the total_cost read-modify-write and the usage rows are atomic
+        against any other writer of this chat. Fire on ANY token activity,
+        not only cost>0, so $0 turns (local / unpriced providers) still
+        persist token counts + message_count (analytics needs them). The
+        subscription attribution is snapshotted on the loop now — an engine
+        switch after the turn must not re-attribute it."""
+        has_activity = (self._total_cost_delta > 0
+                        or self._input_tokens or self._output_tokens)
+        if self.chat_id in _recovery_suppress_flush:
+            has_activity = False  # replay re-persists; don't double
+        if not has_activity or self._cost_saved:
+            return None
+        self._cost_saved = True
+        snap = self._usage_snapshot()
+        chat_id = self.chat_id
+
+        def _job() -> None:
+            chat_row = task_store.get_chat(chat_id)
+            if not chat_row:
+                return
+            old_cost = chat_row.get("total_cost") or 0
+            updates = {"total_cost": old_cost + snap["total_cost_delta"]}
+            if snap["context_used"] > 0:
+                updates["context_used"] = snap["context_used"]
+                updates["context_max"] = snap["context_max"]
+            if snap["cache_write"] > 0:
+                updates["cache_read"] = snap["cache_read"]
+                updates["cache_write"] = snap["cache_write"]
+                updates["output_tokens"] = snap["output_tokens"]
+            task_store.update_chat(chat_id, **updates)
+            _record_usage(chat_row, snap)
+
+        return chat_writer.submit(chat_id, _job, label="turn_cost")
+
+    def _usage_snapshot(self) -> dict:
+        """Plain values for the cost job. The subscription that served this
+        session is read NOW: the pool releases it on close/switch, which can
+        happen before the job runs."""
+        from services.engines import subscription_pool
+        snap = {
+            "session_id": self.session_id,
+            "chat_id": self.chat_id,
+            "scope": self.scope,
+            "source_type": self.source_type,
+            "total_cost_delta": self._total_cost_delta,
+            "llm_cost_delta": self._llm_cost_delta,
+            "input_tokens": self._input_tokens,
+            "output_tokens": self._output_tokens,
+            "cache_read": self._cache_read,
+            "cache_write": self._cache_write,
+            "context_used": self._context_used,
+            "context_max": self._context_max,
+            "mcp_cost_by_key": dict(self._mcp_cost_by_key),
+            "sub_id": "default",
+            "payer": None,
+        }
         try:
-            from services.billing import usage_service
-            from services.engines import subscription_pool
-            from config import get_model_provider
-
-            chat_model = chat_row.get("model", "")
-            llm_provider = get_model_provider(chat_model) or "anthropic"
-            llm_cost = max(0.0, round(self._llm_cost_delta, 6))
-
-            common = {
-                "user_sub": chat_row.get("user_sub"),
-                "agent": chat_row.get("agent", ""),
-                "scope": self.scope,
-                "source_type": self.source_type,
-                "source_id": self.chat_id,
-            }
-
-            # Attribute the LLM turn to the subscription that served it, so the pool
-            # can route new chats to the least-consumed account (headroom routing).
-            sub_id = subscription_pool.get_session_subscription(self.session_id) or "default"
-
-            # Agent scope must mean platform-paid. A Shared-only agent's human
-            # chat mounts agent scope but runs on the interacting USER's
-            # subscription (the chat row's owner is the synthetic agent::{slug},
-            # not a person) — bill it to the payer so it lands in their Usage
-            # tab, not the agent bucket. Platform-paid sources (tasks, phone,
-            # meetings, service sessions) acquire agent-scope and have no payer,
-            # so they are untouched.
+            # Attribute the LLM turn to the subscription that served it, so the
+            # pool can route new chats to the least-consumed account.
+            snap["sub_id"] = subscription_pool.get_session_subscription(self.session_id) or "default"
             if self.scope == "agent":
-                payer = subscription_pool.get_session_payer_sub(self.session_id)
-                if payer:
-                    common["user_sub"] = payer
-                    common["scope"] = "user"
+                snap["payer"] = subscription_pool.get_session_payer_sub(self.session_id)
+        except Exception:
+            logger.debug("usage snapshot: subscription lookup failed", exc_info=True)
+        return snap
 
-            rows: list[dict] = [{
-                **common,
-                "cost_usd": llm_cost,
-                "input_tokens": self._input_tokens,
-                "output_tokens": self._output_tokens,
-                "cache_read": self._cache_read,
-                "cache_write": self._cache_write,
-                "message_count": 1,
-                "provider": llm_provider,
-                "model": chat_model,
-                "source_key": sub_id,
-            }]
-            for (provider, model), cost in self._mcp_cost_by_key.items():
-                if cost <= 0:
-                    continue
-                rows.append({
-                    **common,
-                    "cost_usd": round(cost, 6),
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "cache_read": 0,
-                    "cache_write": 0,
-                    "message_count": 0,
-                    "provider": provider,
-                    "model": model,
-                })
+    async def _cost_billed_for(self, session_id: str) -> bool:
+        """``cost_billed`` for a metadata event: does this session's credential
+        cost real money (API key / relay → shown) or is it a subscription /
+        local-model activity estimate (→ hidden)? Resolved per event, on the
+        DB executor (never the loop): one pump can span queued turns and a
+        direct-llm provider switch re-binds the session between them, so a
+        per-pump cache would stamp the previous kind. A failure answers True
+        (show — today's behaviour)."""
+        from services.engines import subscription_pool
+        try:
+            return await run_db(subscription_pool.session_cost_billed, session_id)
+        except Exception:
+            logger.debug("cost_billed lookup failed", exc_info=True)
+            return True
 
-            usage_service.record_turn_usage(rows)
-        except Exception as e:
-            logger.error(f"Failed to record usage: {e}")
+    def _submit_turn_end_job(self) -> asyncio.Future:
+        """The turn's last lane job: ``last_response_at`` (after every message
+        row — the sidebar unread indicator), the resumed-task History close
+        (compare-and-set: only a turn this pump opened), and the chat row +
+        meeting flag + agent label the loop-side broadcasts consume — no
+        re-read on the loop."""
+        chat_id = self.chat_id
+        now_iso = datetime.now(timezone.utc).isoformat()
+        resumed_task = chat_id.startswith("task-run-") and self.source_type != "task"
+        aborted = self._abort_requested
+
+        def _job() -> tuple[dict | None, bool, str]:
+            with contextlib.suppress(Exception):
+                task_store.update_chat(chat_id, last_response_at=now_iso)
+            if resumed_task:
+                # The user stopping the turn reads as cancelled, everything
+                # else as completed. only_from=("running",): close ONLY a turn
+                # this pump opened — a wedged-pump reap stamps failed + reason
+                # before aborting us, and that verdict must survive.
+                try:
+                    task_store.update_latest_run_status_for_chat(
+                        chat_id, "cancelled" if aborted else "completed",
+                        only_from=("running",),
+                    )
+                except Exception as e:
+                    logger.debug("resumed-task run status close failed: %s", e)
+            chat = task_store.get_chat(chat_id)
+            if not chat:
+                return None, False, ""
+            meeting = bool(task_store.get_active_meeting_for_chat(chat_id))
+            label = notification_manager.agent_label(chat["agent"]) if chat.get("agent") else ""
+            return chat, meeting, label
+
+        return chat_writer.submit(chat_id, _job, label="turn_end")
+
+    async def _drain_writes(self) -> None:
+        """Await this chat's writer lane. Under a slow database the pump
+        coroutine parks here while the loop keeps serving everyone else; a
+        WARNING every 10 s names the wait (the loop watchdog cannot see a
+        wait that leaves the loop free)."""
+        waited = 0.0
+        while not await chat_writer.drain(self.chat_id, timeout=10.0):
+            if chat_writer.pending(self.chat_id) == 0:
+                break  # the lane was cancelled — nothing more will land
+            waited += 10.0
+            logger.warning(
+                f"ChatStreamPump chat={self.chat_id}: turn rows still landing "
+                f"after {waited:.0f}s — database slow?"
+            )
 
     async def _forward(self, item: dict):
         """Forward event to every attached WS subscriber."""
@@ -627,33 +881,12 @@ class ChatStreamPump:
         get_subagent_registry(self.session_id).chat_id = self.chat_id
         get_bg_command_registry(self.session_id).chat_id = self.chat_id
 
-        # Light this chat's sidebar dot on every device of its owner — the
-        # authoritative turn-start signal, viewed or background. The matching
-        # "ready" fires in the finally below when the turn genuinely ends.
-        # Shared-only chats (synthetic agent:: owner) fan out to every user of
-        # the agent via the agent arg.
-        owner_row = task_store.get_chat(self.chat_id) or {}
-        self._owner_sub = owner_row.get("user_sub") or ""
-        if self._owner_sub:
-            notification_manager.broadcast_chat_status(
-                self._owner_sub, self.chat_id, "streaming",
-                agent=owner_row.get("agent") or "",
-            )
-        if self.chat_id.startswith("task-run-") and self.source_type != "task":
-            # Dashboard-RESUMED task conversation (the scheduler's own runs are
-            # source_type == "task"): reflect the live turn in the Task History
-            # row, which otherwise freezes on its pre-resume terminal state.
-            # Terminal-states-only guard: never touch a run some other pump or
-            # the scheduler still owns. The matching close runs in the finally.
-            try:
-                task_store.update_latest_run_status_for_chat(
-                    self.chat_id, "running",
-                    only_from=("completed", "failed", "cancelled", "limit_exceeded"),
-                )
-            except Exception as e:
-                logger.debug("resumed-task run status open failed: %s", e)
-
         try:
+            # Inside the try: whatever the start job does, the finally below
+            # must run — a pump that never leaves _active_pumps is the
+            # stuck-chat failure class. The matching "ready" fires in the
+            # finally when the turn genuinely ends.
+            self._submit_turn_start()
             while True:
                 # Poll permission queue (non-blocking)
                 if self.perm_queue is not None:
@@ -677,7 +910,7 @@ class ChatStreamPump:
                 if _touch_now - self._activity_touch >= 60.0:
                     self._activity_touch = _touch_now
                     with contextlib.suppress(Exception):
-                        await asyncio.to_thread(task_store.touch_chat, self.chat_id)
+                        await run_db(task_store.touch_chat, self.chat_id)
 
                 if event.type == ERROR:
                     err_msg = event.data.get("message", "")
@@ -726,41 +959,31 @@ class ChatStreamPump:
                     for tool_evt in self._active_tools.values():
                         self._turn_blocks.append(tool_evt)
                     self._active_tools.clear()
-                    self._save_turn_blocks()
-                    # Persist cost + context. Fire on ANY token activity, not
-                    # only cost>0, so $0 turns (local / unpriced providers) still
-                    # persist token counts + message_count (analytics needs them).
-                    has_activity = (self._total_cost_delta > 0
-                                    or self._input_tokens or self._output_tokens)
-                    if self.chat_id in _recovery_suppress_flush:
-                        has_activity = False  # replay re-persists; don't double
-                    if has_activity and not self._cost_saved:
-                        self._cost_saved = True
-                        chat_row = task_store.get_chat(self.chat_id)
-                        if chat_row:
-                            old_cost = chat_row.get("total_cost") or 0
-                            updates = {"total_cost": old_cost + self._total_cost_delta}
-                            if self._context_used > 0:
-                                updates["context_used"] = self._context_used
-                                updates["context_max"] = self._context_max
-                            if self._cache_write > 0:
-                                updates["cache_read"] = self._cache_read
-                                updates["cache_write"] = self._cache_write
-                                updates["output_tokens"] = self._output_tokens
-                            task_store.update_chat(self.chat_id, **updates)
-                            self._record_usage(chat_row)
+                    save_fut = self._save_turn_blocks()
+                    self._submit_cost_job()
                     # LLM chat-title: a short first response never crossed the
-                    # streaming threshold — fire once at turn-end now that the
-                    # assistant message is persisted (the service reads the first
-                    # prompt + response from the DB). The atomic claim dedupes
-                    # against the threshold fire. One pump == one turn.
+                    # streaming threshold — fire once the turn-end save has
+                    # landed (the service reads the first prompt + response
+                    # from the DB). The atomic claim dedupes against the
+                    # threshold fire. One pump == one turn.
                     if self._title_armed:
                         self._title_armed = False
                         from services import title_generator
-                        asyncio.create_task(
-                            title_generator.request_chat_title(self.chat_id)
-                        )
-                    await self._forward({"pump_type": "all_done"})
+                        _title_cid = self.chat_id
+
+                        def _fire_title(_f=None) -> None:
+                            asyncio.create_task(
+                                title_generator.request_chat_title(_title_cid)
+                            )
+
+                        if save_fut is not None:
+                            save_fut.add_done_callback(_fire_title)
+                        else:
+                            _fire_title()
+                    # all_done goes out from the finally, after this turn's rows
+                    # have landed: "done" means "persisted" to the queue drain
+                    # and the resume re-send.
+                    self._completed = True
                     break
 
                 if event.type == QUEUE_TURN:
@@ -781,8 +1004,16 @@ class ChatStreamPump:
                             "agent_color": (ad or {}).get("color", ""),
                             "badge": "meeting prompt",
                         })
-                    task_store.add_chat_message(self.chat_id, "user", event.data["text"],
-                                                event_data=event_data_str)
+                    # Lane-ordered after the blocks saved above; the frame is
+                    # the live echo, not a read.
+                    chat_writer.submit(
+                        self.chat_id,
+                        functools.partial(
+                            task_store.add_chat_message, self.chat_id, "user",
+                            event.data["text"], event_data=event_data_str,
+                        ),
+                        label="queue_turn",
+                    )
                     await self._forward({"pump_type": "queue_turn", "text": event.data["text"]})
                     continue
 
@@ -793,12 +1024,21 @@ class ChatStreamPump:
                     # the framed prompt carry the provenance), forwarded live
                     # so the sender's transcript shows the chip at delivery.
                     from ws import artifact_interactions as _ai
+                    _art_rows = [
+                        (_ai.event_type(it), _ai.event_row_json(it))
+                        for it in event.data.get("interactions", [])
+                    ]
+                    _art_cid = self.chat_id
+
+                    def _art_job(_rows=_art_rows) -> None:
+                        for _etype, _edata in _rows:
+                            task_store.add_chat_message(
+                                _art_cid, "event", "", event_type=_etype, event_data=_edata,
+                            )
+
+                    if _art_rows:
+                        chat_writer.submit(_art_cid, _art_job, label="artifact_turn")
                     for it in event.data.get("interactions", []):
-                        task_store.add_chat_message(
-                            self.chat_id, "event", "",
-                            event_type=_ai.event_type(it),
-                            event_data=_ai.event_row_json(it),
-                        )
                         frame = _ai.ws_frame(it, self.chat_id)
                         frame["pump_type"] = frame.pop("type")
                         await self._forward(frame)
@@ -834,103 +1074,89 @@ class ChatStreamPump:
             for tool_evt in self._active_tools.values():
                 self._turn_blocks.append(tool_evt)
             self._save_turn_blocks()
-
-            has_activity = (self._total_cost_delta > 0
-                            or self._input_tokens or self._output_tokens)
-            if self.chat_id in _recovery_suppress_flush:
-                has_activity = False  # replay re-persists cost; don't double
-            if has_activity and not self._cost_saved:
-                self._cost_saved = True
-                chat_row = task_store.get_chat(self.chat_id)
-                if chat_row:
-                    old_cost = chat_row.get("total_cost") or 0
-                    updates = {"total_cost": old_cost + self._total_cost_delta}
-                    if self._context_used > 0:
-                        updates["context_used"] = self._context_used
-                        updates["context_max"] = self._context_max
-                    if self._cache_write > 0:
-                        updates["cache_read"] = self._cache_read
-                        updates["cache_write"] = self._cache_write
-                        updates["output_tokens"] = self._output_tokens
-                    task_store.update_chat(self.chat_id, **updates)
-                    self._record_usage(chat_row)
+            self._submit_cost_job()
 
             if self.implementing_plan:
-                task_store.update_chat_plan_status(
-                    self.chat_id, self.implementing_plan, "implemented",
+                chat_writer.submit(
+                    self.chat_id,
+                    functools.partial(
+                        task_store.update_chat_plan_status,
+                        self.chat_id, self.implementing_plan, "implemented",
+                    ),
+                    label="plan_status",
                 )
 
-            # Clear live state + deregister (only if we're still the current pump).
-            # EXCEPTION: while background subagents are still running, keep a
-            # reduced live-state residual — the running-agent badges only — so a
-            # reconnect between this turn's end and the nudge turn still renders
-            # them. The turn's text/widgets are already persisted to the DB
-            # (saved above at PRODUCER_DONE), so we DROP live_blocks to avoid
-            # double-rendering against chat history; the status bar's active_agents
-            # is the only thing the DB can't reconstruct mid-flight. Each agent's
-            # badge clears via mark_subagent_done as it finishes; the nudge turn's
-            # pump pops the state fully when has_pending is finally False.
             # Supersession guard: a NEWER pump may already own this chat — an
             # abort + fast resend starts the next turn's pump while this one is
-            # still unwinding. Only the still-current pump may tear down shared
-            # per-chat state or declare the chat ready below; a late pop /
-            # "ready" broadcast from the aborted pump would wipe the new turn's
-            # live state and flip the live UI idle mid-turn (the session_id
-            # check alone doesn't cover Codex, where abort keeps the daemon and
-            # the next turn reuses the same session_id).
+            # still unwinding. Only the still-current pump may stamp the turn
+            # end, tear down shared per-chat state or declare the chat ready
+            # below; a late pop / "ready" broadcast from the aborted pump would
+            # wipe the new turn's live state and flip the live UI idle mid-turn
+            # (the session_id check alone doesn't cover Codex, where abort
+            # keeps the daemon and the next turn reuses the same session_id).
             was_active_pump = _active_pumps.get(self.chat_id) is self
-            live = _chat_streaming_state.get(self.chat_id)
-            if was_active_pump and live and live.get("session_id") == self.session_id:
-                if (get_subagent_registry(self.session_id).has_pending
-                        or get_bg_command_registry(self.session_id).has_pending):
-                    live["streaming"] = False
-                    live["live_blocks"] = []
-                    live["active_tools"] = []
-                    live["pending_permission"] = None
-                    live["thinking_active"] = False
-                    live["thinking_text"] = ""
-                    live["thinking_tokens"] = 0
-                    live["todos"] = []
-                    live["active_agents"] = [
-                        a for a in live.get("active_agents", []) if a.get("active")
-                    ]
-                    live["active_delegates"] = [
-                        d for d in live.get("active_delegates", []) if d.get("active")
-                    ]
-                    live["active_commands"] = [
-                        c for c in live.get("active_commands", []) if c.get("active")
-                    ]
-                else:
-                    _chat_streaming_state.pop(self.chat_id, None)
-            if was_active_pump:
-                del _active_pumps[self.chat_id]
-                # A response (possibly partial, on abort) landed on this chat —
-                # stamp it for the sidebar unread indicator. Superseded pumps
-                # skip (the newer pump owns the chat's lifecycle).
-                with contextlib.suppress(Exception):
-                    task_store.update_chat(
-                        self.chat_id,
-                        last_response_at=datetime.now(timezone.utc).isoformat(),
-                    )
-                if self.chat_id.startswith("task-run-") and self.source_type != "task":
-                    # Close the resumed-task History row (mirror of the
-                    # 'running' flip at turn start): the user stopping the
-                    # turn reads as cancelled, everything else as completed.
-                    # only_from=("running",): close ONLY a turn this pump
-                    # opened — a wedged-pump reap stamps failed + reason
-                    # before aborting us, and that verdict must survive.
-                    try:
-                        task_store.update_latest_run_status_for_chat(
-                            self.chat_id,
-                            "cancelled" if self._abort_requested else "completed",
-                            only_from=("running",),
-                        )
-                    except Exception as e:
-                        logger.debug("resumed-task run status close failed: %s", e)
+            end_fut = self._submit_turn_end_job() if was_active_pump else None
+            end_row: dict | None = None
+            end_meeting = False
+            end_label = ""
+            still_active = was_active_pump
+            try:
+                # Every row of this turn is committed before the pump leaves
+                # _active_pumps, forwards all_done and declares the chat ready
+                # — "done" means "persisted" to the post-turn queue drain and
+                # the resume re-send. The loop stays free meanwhile.
+                await self._drain_writes()
+                if end_fut is not None and not end_fut.cancelled() and end_fut.exception() is None:
+                    end_row, end_meeting, end_label = end_fut.result()
+                if self._completed:
+                    await self._forward({"pump_type": "all_done"})
+            finally:
+                # Shared-state teardown runs whatever happened above (a
+                # cancellation inside the drain must not leave the pump
+                # registered as live). Re-check ownership: a newer pump may
+                # have registered during the drain.
+                # Clear live state + deregister (only if we're still the
+                # current pump). EXCEPTION: while background subagents are
+                # still running, keep a reduced live-state residual — the
+                # running-agent badges only — so a reconnect between this
+                # turn's end and the nudge turn still renders them. The
+                # turn's text/widgets are in the DB now (drained above), so
+                # live_blocks are dropped to avoid double-rendering against
+                # chat history; the status bar's active_agents is the only
+                # thing the DB can't reconstruct mid-flight. Each agent's
+                # badge clears via mark_subagent_done as it finishes; the
+                # nudge turn's pump pops the state fully when has_pending is
+                # finally False.
+                still_active = _active_pumps.get(self.chat_id) is self
+                live = _chat_streaming_state.get(self.chat_id)
+                if still_active and live and live.get("session_id") == self.session_id:
+                    if (get_subagent_registry(self.session_id).has_pending
+                            or get_bg_command_registry(self.session_id).has_pending):
+                        live["streaming"] = False
+                        live["live_blocks"] = []
+                        live["active_tools"] = []
+                        live["pending_permission"] = None
+                        live["thinking_active"] = False
+                        live["thinking_text"] = ""
+                        live["thinking_tokens"] = 0
+                        live["todos"] = []
+                        live["active_agents"] = [
+                            a for a in live.get("active_agents", []) if a.get("active")
+                        ]
+                        live["active_delegates"] = [
+                            d for d in live.get("active_delegates", []) if d.get("active")
+                        ]
+                        live["active_commands"] = [
+                            c for c in live.get("active_commands", []) if c.get("active")
+                        ]
+                    else:
+                        _chat_streaming_state.pop(self.chat_id, None)
+                if still_active:
+                    del _active_pumps[self.chat_id]
 
-            # Signal any remaining subscribers
-            for q in list(self._ws_queues):
-                q.put_nowait({"pump_type": "pump_ended"})
+                # Signal any remaining subscribers
+                for q in list(self._ws_queues):
+                    q.put_nowait({"pump_type": "pump_ended"})
 
             # Fire the ephemeral turn-complete signal — but NOT while background
             # subagents are still running. When the LLM spawns bg agents and ends
@@ -942,7 +1168,7 @@ class ChatStreamPump:
             # notification_manager decides foreground (in-app onDone ping) vs
             # backgrounded (FCM vibration) — we just gate on "genuinely done".
             try:
-                if not was_active_pump:
+                if not still_active:
                     # Superseded by a newer pump for this chat: it broadcast
                     # "streaming" at its _run entry, so OUR "ready" would land
                     # after it and clear the live dot/stop button mid-turn.
@@ -957,7 +1183,7 @@ class ChatStreamPump:
                         f"background subagents still running (nudge turn will fire it)"
                     )
                 else:
-                    self._fire_end_of_turn()
+                    self._fire_end_of_turn(end_row, end_meeting, end_label)
             except Exception:
                 pass  # Don't break pump cleanup for notification failure
 
@@ -965,12 +1191,12 @@ class ChatStreamPump:
             # a library (mirror or source) passes no proxy chokepoint — kick
             # the projector now so the agent's own change lands before it
             # reports, instead of waiting for the 5-minute sweep. No-op for
-            # agents without library rows (one indexed SELECT).
+            # agents without library rows (one indexed SELECT). Uses the row
+            # the turn-end job returned — no loop-side read.
             try:
-                from services.knowledge import library_projector
-                _chat_row = task_store.get_chat(self.chat_id)
-                if _chat_row and _chat_row.get("agent"):
-                    library_projector.schedule_reconcile_for_agent(_chat_row["agent"])
+                if end_row and end_row.get("agent"):
+                    from services.knowledge import library_projector
+                    library_projector.schedule_reconcile_for_agent(end_row["agent"])
             except Exception:
                 pass
 
@@ -979,17 +1205,19 @@ class ChatStreamPump:
                 f"blocks={len(self._turn_blocks)}, plan={self.implementing_plan or 'none'}"
             )
 
-    def _fire_end_of_turn(self) -> None:
+    def _fire_end_of_turn(self, chat: dict | None, in_meeting: bool,
+                          agent_label: str) -> None:
         """The turn genuinely ended: clear the sidebar dot on every device (a
         background chat has no other live signal), then fire the origin-routed
-        end-of-turn alert. The alert is skipped during meetings (per-speaker
-        turn ends are not completions) and for scheduled task runs
-        (``source_type == "task"``) — a task's completion alert is its
-        ``notification_mode`` contract, and an extra "finished" push on top is
-        noise. A continued (re-warmed) task chat runs through the dashboard
-        pump (``source_type == "chat"``) and keeps the normal per-turn signal —
-        it is the only completion signal those follow-up turns have."""
-        chat = task_store.get_chat(self.chat_id)
+        end-of-turn alert. ``chat`` / ``in_meeting`` / ``agent_label`` come from
+        the turn-end job (read after the rows landed). The alert is skipped
+        during meetings (per-speaker turn ends are not completions) and for
+        scheduled task runs (``source_type == "task"``) — a task's completion
+        alert is its ``notification_mode`` contract, and an extra "finished"
+        push on top is noise. A continued (re-warmed) task chat runs through
+        the dashboard pump (``source_type == "chat"``) and keeps the normal
+        per-turn signal — it is the only completion signal those follow-up
+        turns have."""
         if not chat:
             return
         notification_manager.broadcast_chat_status(
@@ -998,10 +1226,10 @@ class ChatStreamPump:
         )
         if self.source_type == "task":
             return
-        if not task_store.get_active_meeting_for_chat(self.chat_id):
+        if not in_meeting:
             asyncio.create_task(notification_manager.fire_ephemeral(
                 chat["user_sub"],
-                title=f"{notification_manager.agent_label(chat['agent'])} finished",
+                title=f"{agent_label or chat.get('agent') or ''} finished",
                 body="Response ready",
                 chat_id=self.chat_id,
             ))
@@ -1289,6 +1517,10 @@ class ChatStreamPump:
                             await self._forward({"pump_type": "ws_event", "event": {
                                 "type": "mcp_cost",
                                 "cost_usd": hit.amount,
+                                # A tool fee is money whatever credential the
+                                # LLM runs on — the gauge shows it even on a
+                                # subscription / local-model chat.
+                                "cost_billed": True,
                                 "provider": hit.provider,
                                 "model": hit.model,
                                 "tool": plain_tool,
@@ -1456,7 +1688,7 @@ class ChatStreamPump:
             if action == "enter":
                 set_session_mode(self.session_id, "plan")
                 if self.chat_id:
-                    task_store.update_chat(self.chat_id, permission_mode="plan")
+                    self._submit_chat_update("plan_mode", permission_mode="plan")
             # exit is handled by plan_review_response (implement sets acceptEdits/default)
 
         elif event.type == TODO_UPDATE:
@@ -1505,8 +1737,8 @@ class ChatStreamPump:
             if live:
                 live["goal"] = goal
             if changed and self.chat_id:
-                task_store.update_chat(
-                    self.chat_id, thread_goal=json.dumps(goal) if goal else None)
+                self._submit_chat_update(
+                    "thread_goal", thread_goal=json.dumps(goal) if goal else None)
 
         elif event.type == CONTEXT_COMPACT:
             # Context compression event (CLI auto-compact, Codex compaction, etc.)
@@ -1529,7 +1761,7 @@ class ChatStreamPump:
                     if ed.get("context_max"):
                         self._context_max = int(ed["context_max"])
                     if self.chat_id:
-                        task_store.update_chat(self.chat_id, context_used=post)
+                        self._submit_chat_update("context_used", context_used=post)
 
         elif event.type == SYSTEM:
             subtype = ed.get("subtype", "")
@@ -1620,15 +1852,23 @@ class ChatStreamPump:
             # Persist Codex thread_id for resume after proxy restart
             codex_tid = ed.get("codex_thread_id")
             if codex_tid and self.chat_id:
-                task_store.update_chat(self.chat_id, codex_thread_id=codex_tid)
+                self._submit_chat_update("codex_thread_id", codex_thread_id=codex_tid)
                 return  # internal metadata — don't forward to WS or save as turn block
 
+            # Display-only flag: the chat hides the cost line + gauge for a
+            # subscription / local-model turn. Stamped here, the one place
+            # every emitter (CLI, Codex, direct, satellite, meetings) passes
+            # through, so it rides the WS frame AND the persisted row. A
+            # meeting turn names the speaker's session (each participant
+            # runs on its own account); accounting below is untouched.
+            cost_billed = await self._cost_billed_for(ed.get("session_id") or self.session_id)
             is_delta = ed.get("cost_is_delta") or ed.get("_meeting_cost")
             if is_delta:
                 # Cost is already a per-turn delta (Direct LLM, Codex, meetings).
                 # Use directly — don't touch cumulative tracking.
                 turn_cost = ed.get("cost_usd", 0)
-                meta_event = {"type": "metadata", "cost_usd": turn_cost}
+                meta_event = {"type": "metadata", "cost_usd": turn_cost,
+                              "cost_billed": cost_billed}
                 # Preserve context/cache/duration fields if present
                 for k in ("context_used", "context_max", "cache_read",
                           "cache_write", "input_tokens", "output_tokens",
@@ -1650,7 +1890,7 @@ class ChatStreamPump:
                 self._last_session_cost = session_cost
                 _session_cumulative_cost[self.session_id] = session_cost
                 # Forward per-turn cost (not cumulative)
-                meta_event = {**ed, "cost_usd": turn_cost}
+                meta_event = {**ed, "cost_usd": turn_cost, "cost_billed": cost_billed}
                 await self._forward(
                     {"pump_type": "ws_event", "event": {"type": "metadata", **meta_event}},
                 )
@@ -1823,7 +2063,12 @@ class ChatStreamPump:
                     old_snap = block.get("snapshot_id") or ""
                     if old_snap and old_snap != evt.get("snapshot_id"):
                         from services.media import preview_snapshots
-                        preview_snapshots.delete_snapshot(self.chat_id, old_snap)
+                        chat_writer.submit(
+                            self.chat_id,
+                            functools.partial(preview_snapshots.delete_snapshot,
+                                              self.chat_id, old_snap),
+                            label="snapshot_delete",
+                        )
                     self._turn_blocks[i] = evt
                     replaced = True
                     break
@@ -1924,7 +2169,12 @@ class ChatStreamPump:
                     plan_filename = f"plan-{perm_data['request_id'][:8]}.md"
             self._plan_filename = plan_filename
             if self.chat_id and plan_content:
-                task_store.add_chat_plan(self.chat_id, plan_filename, plan_content)
+                chat_writer.submit(
+                    self.chat_id,
+                    functools.partial(task_store.add_chat_plan, self.chat_id,
+                                      plan_filename, plan_content),
+                    label="chat_plan",
+                )
             enriched = {**perm_data, "filename": plan_filename}
             # Save plan_review event for DB history reconstruction
             self._flush_pending_text()
@@ -1937,7 +2187,7 @@ class ChatStreamPump:
             await self._queue_or_show_permission(enriched)
         elif evt_type == "mode_restored":
             mode = perm_data.get("mode", "default")
-            task_store.update_chat(self.chat_id, permission_mode=mode)
+            self._submit_chat_update("mode_restored", permission_mode=mode)
             await self._forward({"pump_type": "perm_mode_restored", "mode": mode})
 
 

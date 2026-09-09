@@ -28,30 +28,25 @@ Unified event format across layers:
 """
 
 import logging
-import logging.handlers
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 import config
+from core import log_queue
 from startup import lifespan
 from middleware import register_middlewares
 
 # --- Logging ---
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        # Self-rotating: 20 MB x (1 live + 5 backups) = 120 MB hard cap.
-        # No external logrotate dependency (proxy.log grew unbounded before).
-        logging.handlers.RotatingFileHandler(
-            str(config.BASE_DIR / "proxy.log"),
-            maxBytes=20 * 1024 * 1024, backupCount=5,
-        ),
-    ],
+# stderr + a self-rotating file: 20 MB x (1 live + 5 backups) = 120 MB hard
+# cap, no external logrotate dependency (proxy.log grew unbounded before).
+# Every write happens on log_queue's writer thread — nothing may write a
+# log line from the event loop (see that module).
+log_queue.configure(
+    log_path=config.BASE_DIR / "proxy.log",
+    max_bytes=20 * 1024 * 1024, backup_count=5,
 )
 logger = logging.getLogger("claude-proxy")
 
@@ -303,10 +298,22 @@ if __name__ == "__main__":
         logger.info(f"Agents: (schema not yet initialized — {type(e).__name__})")
     logger.info(f"Working dir: {config.AGENTS_DIR}")
     logger.info("MCP configs: per-agent (in agents/<name>/mcp-config.json)")
+    # uvicorn re-raises the SIGTERM/SIGINT it served once its graceful
+    # shutdown is done (the process exits by the signal, so atexit never
+    # runs) — with this as the restored handler the log queue is drained
+    # before the default disposition ends the process.
+    import signal
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(_sig, log_queue.exit_signal_handler)
     uvicorn.run(
         app, host=config.HOST, port=config.PORT, log_level="info",
         timeout_keep_alive=2,
         access_log=True,
+        # No uvicorn-owned handlers: its default config installs synchronous
+        # stream handlers (one access line per request, written on the
+        # loop). With none, the uvicorn loggers propagate to the root queue
+        # handler and take the root format (timestamped, off the loop).
+        log_config=None,
         # Use the modern sans-I/O websockets implementation, NOT uvicorn's
         # default legacy one. The legacy impl (websockets/legacy/protocol.py)
         # asserts in `_drain_helper` when two coroutines drain the socket at

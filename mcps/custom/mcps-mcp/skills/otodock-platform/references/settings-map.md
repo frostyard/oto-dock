@@ -28,7 +28,8 @@ Tabs: **General · Integrations · Remote Machines · AI Engines · Audio · Usa
   shown once).
 - **Remote Machines**: **Pair Machine**; per machine — remove, filesystem access
   (home-only vs full), **Device control** grants (computer / browser / app connectors),
-  "Run these agents on this machine". Hidden if the build lacks the feature; replaced
+  the browser control's **Browser mode** (Dedicated profile / My own browser + the
+  Playwright Extension token), "Run these agents on this machine". Hidden if the build lacks the feature; replaced
   by a notice if an admin disabled user pairing.
 - **AI Engines**: connect Claude / ChatGPT subscriptions; per account — status,
   **Reconnect**, Remove, **Personal use** toggle; admins also see **Agent pool**.

@@ -268,6 +268,7 @@ class InteractiveSession:
         transcript_kind: str = "claude",
         prompt_in_argv: bool = False,
         tui_theme: str = "dark",
+        chat_row: dict | None = None,
     ) -> None:
         self.session_id = session_id
         self.chat_id = chat_id
@@ -352,13 +353,24 @@ class InteractiveSession:
         # every chat; only meeting- is excluded (here and in the service).
         armed = bool(chat_id) and not chat_id.startswith("meeting-")
         if armed:
-            try:
-                from storage import database as task_store
-                armed = not (task_store.get_chat(chat_id) or {}).get("title_generated")
-            except Exception:
-                logger.debug("interactive %s: title-arm lookup failed",
-                             session_id[:8], exc_info=True)
+            if chat_row is None:
+                # Construction without a pre-loaded row (tests, legacy
+                # callers): one synchronous read. The spawn paths pass
+                # ``chat_row`` (loaded via run_db) so this never runs on the
+                # event loop in production (storage/pg.py rule).
+                try:
+                    from storage import database as task_store
+                    chat_row = task_store.get_chat(chat_id) or {}
+                except Exception:
+                    logger.debug("interactive %s: title-arm lookup failed",
+                                 session_id[:8], exc_info=True)
+                    chat_row = {}
+            armed = not chat_row.get("title_generated")
         self._title_armed = armed
+        # Pre-seed the chat owner from the same row so ``_chat_owner()`` (the
+        # turn-end broadcast identity) never has to read the DB lazily on the
+        # loop. Consumed below where the attribute is initialised.
+        self._chat_owner_seed = (chat_row or {}).get("user_sub") or ""
         self._title_chars = 0   # accumulated tail-batch counters (first turn)
         self._title_tools = 0
         self._title_timer: Optional[asyncio.TimerHandle] = None
@@ -474,7 +486,9 @@ class InteractiveSession:
         # The chat ROW's owner (lazy) — for shared-only agents it is the
         # synthetic agent::<slug>, which the status broadcast fans out to
         # every user of the agent; self.user_sub would reach only one.
-        self._chat_owner_sub: str | None = None
+        # Seeded from the spawn-time chat row (loaded off-loop) so the lazy
+        # DB fallback in ``_chat_owner`` never fires on the loop in production.
+        self._chat_owner_sub: str | None = self._chat_owner_seed or None
         # Composer-dirty heuristic for the injection gates: printable viewer
         # input (terminal replies + mouse reports excluded) not yet submitted.
         # Never inject into a non-empty composer — the paste + CR would submit
@@ -1227,34 +1241,51 @@ class InteractiveSession:
         if not self.chat_id or self.chat_id.startswith("meeting-"):
             return
         try:
+            from datetime import datetime, timezone
             from services.notifications import notification_manager
-            try:
-                from datetime import datetime, timezone
+            from storage.pg import db_executor
+
+            _chat_id = self.chat_id
+            _owner = self._chat_owner()
+            _mark_read = bool(self.otodock_attached)
+            _now_iso = datetime.now(timezone.utc).isoformat()
+            _sid = self.session_id[:8]
+
+            def _stamp_job() -> None:
+                # ONE ordered executor job: ``last_response_at`` first, then
+                # the read mark — two separate jobs could land reversed and
+                # leave an otodock-attached chat showing unread. Per-turn DB
+                # writes never run on the loop thread (storage/pg.py rule).
                 from storage import database as task_store
-                task_store.update_chat(
-                    self.chat_id,
-                    last_response_at=datetime.now(timezone.utc).isoformat(),
-                )
-            except Exception:
-                pass
-            notification_manager.broadcast_chat_status(
-                self._chat_owner(), self.chat_id, "ready",
-                agent=self.agent_name,
-            )
-            if self.otodock_attached:
-                # The response just rendered on a live otodock terminal — that
-                # IS the read (the dashboard's visible-tab rule, terminal
-                # edition). Without this the fixed unread dot lingers until
-                # someone opens the chat in the dashboard. Detached-at-turn-end
-                # chats keep the dot: nobody saw the answer.
+                task_store.update_chat(_chat_id, last_response_at=_now_iso)
+                if _mark_read:
+                    # The response just rendered on a live otodock terminal —
+                    # that IS the read (the dashboard's visible-tab rule,
+                    # terminal edition). Without this the fixed unread dot
+                    # lingers until someone opens the chat in the dashboard.
+                    # Detached-at-turn-end chats keep the dot: nobody saw it.
+                    task_store.mark_chat_read(_chat_id, _owner)
+
+            def _stamp_done(fut) -> None:
                 try:
-                    from storage import database as task_store
-                    task_store.mark_chat_read(self.chat_id, self._chat_owner())
-                    notification_manager.broadcast_chat_read(
-                        self._chat_owner(), self.chat_id, agent=self.agent_name,
-                    )
+                    fut.result()
                 except Exception:
-                    pass
+                    logger.debug("interactive %s: turn-end stamp failed", _sid,
+                                 exc_info=True)
+
+            # Loop closing → the stamp is best-effort.
+            with contextlib.suppress(RuntimeError):
+                self._loop.run_in_executor(db_executor(), _stamp_job).add_done_callback(
+                    _stamp_done,
+                )
+            notification_manager.broadcast_chat_status(
+                _owner, _chat_id, "ready", agent=self.agent_name,
+            )
+            if _mark_read:
+                with contextlib.suppress(Exception):
+                    notification_manager.broadcast_chat_read(
+                        _owner, _chat_id, agent=self.agent_name,
+                    )
         except Exception:
             logger.exception(
                 "interactive %s: turn-status broadcast failed", self.session_id[:8]
@@ -2141,6 +2172,21 @@ async def _redeliver_pending(sess: "InteractiveSession", items: list[dict]) -> N
             )
 
 
+async def _load_chat_row(chat_id: str) -> dict:
+    """Spawn-time chat row read on the DB executor (title-arm + owner seed
+    for the constructor). Best-effort: ``{}`` on any failure."""
+    if not chat_id:
+        return {}
+    from storage import database as task_store
+    from storage.pg import run_db
+    try:
+        return (await run_db(task_store.get_chat, chat_id)) or {}
+    except Exception:
+        logger.debug("interactive: chat row load failed for %s", chat_id[:8],
+                     exc_info=True)
+        return {}
+
+
 def persist_drained_artifact(chat_id: str, item: dict) -> Optional[int]:
     """Persist one drained display/file-tools artifact as a pump-shaped
     chat_messages event row — the interactive twin of the headless pump's
@@ -2370,6 +2416,7 @@ async def register(
         rows=rows, cols=cols,
         transcript_kind=transcript_kind, prompt_in_argv=prompt_in_argv,
         tui_theme=tui_theme,
+        chat_row=await _load_chat_row(chat_id),
     )
 
     async def _make_local_pty(s: "InteractiveSession"):
@@ -2430,6 +2477,7 @@ async def register_remote(
         rows=rows, cols=cols,
         transcript_kind=transcript_kind, prompt_in_argv=prompt_in_argv,
         tui_theme=tui_theme,
+        chat_row=await _load_chat_row(chat_id),
     )
 
     async def _make_remote_pty(s: "InteractiveSession"):

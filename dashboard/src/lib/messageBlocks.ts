@@ -5,6 +5,35 @@ import { cleanUserMessageText } from './transcriptCleanup'
 // Single source of truth shared by AgentChat (live chat + task chats)
 // (task run view) — both reconstruct history and live-state through these.
 
+/**
+ * `cost_billed` off a metadata event/row. Only an explicit `false` (the turn
+ * ran on a subscription or a local model) hides the cost; rows persisted
+ * before the flag existed carry none and keep showing it.
+ */
+export function costBilledOf(evt: { cost_billed?: unknown }): boolean | undefined {
+  if (evt.cost_billed === false) return false
+  return evt.cost_billed === true ? true : undefined
+}
+
+/**
+ * Whether the chat-level cost gauge shows: the NEWEST persisted turn's flag.
+ * The session binding is deleted when a session closes, so the persisted
+ * metadata row is the only place the credential kind survives a reload.
+ * `true` when no loaded turn carries the flag (fresh chat, pre-flag history).
+ */
+export function latestCostBilled(dbMessages: any[]): boolean {
+  for (let i = dbMessages.length - 1; i >= 0; i--) {
+    const m = dbMessages[i]
+    if (m?.role !== 'event' || m.event_type !== 'metadata' || !m.event_data) continue
+    try {
+      return costBilledOf(JSON.parse(m.event_data)) !== false
+    } catch {
+      return true
+    }
+  }
+  return true
+}
+
 /** Convert a live_state inline_block to a MessageBlock for reconnect rendering. */
 export function liveBlockToMessageBlock(ib: any): MessageBlock | null {
   switch (ib.type) {
@@ -46,7 +75,7 @@ export function liveBlockToMessageBlock(ib: any): MessageBlock | null {
     case 'thinking':
       return { type: 'thinking', content: ib.content || '', collapsed: true, done: true }
     case 'metadata':
-      return { type: 'metadata', costUsd: ib.cost_usd ?? 0, durationMs: ib.duration_ms ?? 0 }
+      return { type: 'metadata', costUsd: ib.cost_usd ?? 0, durationMs: ib.duration_ms ?? 0, costBilled: costBilledOf(ib) }
     case 'plan_mode':
       return { type: 'plan', action: ib.action || 'enter', toolInput: ib.tool_input }
     case 'system':
@@ -168,7 +197,7 @@ export function eventToBlock(evt: any, dbMessageId?: number): MessageBlock | nul
     case 'system':
       return { type: 'system', subtype: evt.subtype || '', message: evt.message, agentName: evt.agent_display_name || evt.agent, agentColor: evt.agent_color }
     case 'metadata':
-      return { type: 'metadata', costUsd: evt.cost_usd ?? 0, durationMs: evt.duration_ms ?? evt.duration_api_ms ?? 0 }
+      return { type: 'metadata', costUsd: evt.cost_usd ?? 0, durationMs: evt.duration_ms ?? evt.duration_api_ms ?? 0, costBilled: costBilledOf(evt) }
     case 'bg_nudge':
       return { type: 'system', subtype: 'bg_agents_completed' }
     case 'bg_command_nudge':

@@ -73,8 +73,10 @@ _CODEX_RUNTIME_GLOBS = ("*.sqlite*",)
 # local-session copies carry REAL secrets and platform paths, so they must
 # never be synced here, and ours must never flow back. Mirrors
 # proxy/core/remote/file_sync.py — the two sets MUST stay identical.
+# ``models.json`` is the per-session model catalog of a local-model session
+# (config.toml points at it with a host-absolute path; each host writes its own).
 _CODEX_HOST_LOCAL_FILES = frozenset({
-    "config.toml", "AGENTS.md", "hooks.json", "auth.json",
+    "config.toml", "AGENTS.md", "hooks.json", "auth.json", "models.json",
 })
 
 

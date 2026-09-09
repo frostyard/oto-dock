@@ -22,9 +22,9 @@ export default function PermissionDialog({
   const inputStr =
     typeof toolInput === 'string' ? toolInput : JSON.stringify(toolInput, null, 2)
 
-  // Show command for Bash tool, file path for Read/Write/Edit
+  // Show command for Bash tool, file path for Read/Write/Edit/Delete
   const isBash = toolName === 'Bash'
-  const isFileOp = ['Read', 'Write', 'Edit'].includes(toolName)
+  const isFileOp = ['Read', 'Write', 'Edit', 'Delete'].includes(toolName)
   const displayInput = isBash
     ? toolInput?.command || inputStr
     : isFileOp

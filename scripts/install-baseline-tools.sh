@@ -355,8 +355,8 @@ install_sympy() {
 # via the matching env vars (compose.sh passes the VERSIONS.md values in);
 # _install_pinned_cli upgrades an existing install to the exact pin rather than
 # skipping it.
-CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION:-2.1.258}"
-CODEX_VERSION="${CODEX_VERSION:-0.149.1}"
+CLAUDE_CODE_VERSION="${CLAUDE_CODE_VERSION:-2.1.263}"
+CODEX_VERSION="${CODEX_VERSION:-0.153.4}"
 
 # Extract the bare x.y.z from a CLI's --version output ("2.1.177 (Claude Code)",
 # "codex-cli 0.139.0").

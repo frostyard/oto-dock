@@ -2,7 +2,7 @@
   "name": "schedules-mcp",
   "label": "Schedules",
   "description": "Scheduled, one-time, and trigger-fired background tasks, each pinnable to its own model / execution layer",
-  "version": "1.2.1",
+  "version": "1.2.3",
   "category": "core",
 
   "server": {
@@ -26,7 +26,7 @@
     "PROXY_TASK_SCOPE": "${session.task_scope}"
   },
 
-  "exclude_from": [],
+  "exclude_from": ["external"],
 
   "skills": [
     {
@@ -34,6 +34,13 @@
       "loading": "always",
       "file": "skills/task-scheduling.md",
       "description": "When to use scheduled/one-time/trigger tasks vs in-session, scope, completion notifications, self-continuations",
+      "default_exclude_from": []
+    },
+    {
+      "id": "task-scheduling-guide",
+      "loading": "on_demand",
+      "file": "skills/task-scheduling-guide/SKILL.md",
+      "description": "Parameter shapes and worked detail for the schedules tools — notification modes, cron and interval schedules, self-continuations, editing and reading back tasks, model pinning, trigger-only tasks, timezone rules. Use before creating or editing a scheduled task.",
       "default_exclude_from": []
     }
   ],

@@ -292,7 +292,7 @@ def _make_agent():
 def _fanout_calls(monkeypatch):
     """Capture workspace_fanout.fan_out_write calls instead of hitting satellites.
 
-    Restore publishes through ``_push_file_write_to_remote`` (the same helper
+    Restore publishes through ``file_bookkeeping.push_file_write`` (the same helper
     every other platform write uses), which skips the network push when the
     agent has no fan-out candidates — so the gate is forced open here to keep
     exercising the push. The bookkeeping half of that helper (tombstone
@@ -578,7 +578,7 @@ async def test_restore_publishes_like_every_other_write(_fanout_calls, monkeypat
     async def _rec(agent_slug, rel_path, writer):
         seen.append((agent_slug, rel_path, writer))
 
-    monkeypatch.setattr("api.agents.files._record_platform_write", _rec)
+    monkeypatch.setattr("services.infra.file_bookkeeping.record_platform_write", _rec)
     from api.agents.agents import restore_recover_bin, RecoverRestoreRequest
     e = rb.capture(AGENT, "workspace/back.txt", b"data", "deleted")
     await restore_recover_bin(

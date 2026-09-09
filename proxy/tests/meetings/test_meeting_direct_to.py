@@ -53,3 +53,36 @@ def test_non_string_non_list_returns_none():
 def test_never_raises_on_junk():
     for junk in ("{not json", "[unterminated", "null", "{}", "[]", ",,,"):
         parse(junk)  # must not raise; routing junk is filtered downstream
+
+
+# ---------------------------------------------------------------------------
+# The MCP's own contract: the result text carries the turn rule
+# ---------------------------------------------------------------------------
+#
+# The tool result is the next thing the model reads after routing. It must say
+# that the turn is over and that the replies arrive in the NEXT turn — the
+# 2026-09-09 moderator that polled for a reply inside its own turn had only
+# "Response directed to: …" to go on.
+
+import asyncio
+
+from tests._paths import CUSTOM_MCPS, load_mcp_server
+
+
+def _server():
+    return load_mcp_server(CUSTOM_MCPS / "meetings-mcp")
+
+
+def test_direct_to_result_says_the_turn_is_over():
+    srv = _server()
+    text = asyncio.run(srv.call_tool("direct_to", {"agents": ["mod"]}))[0].text
+    assert text.startswith("Response directed to: mod")
+    assert "stop now" in text and "next turn" in text
+
+
+def test_tool_descriptions_carry_the_turn_rule():
+    srv = _server()
+    tools = {t.name: t.description for t in asyncio.run(srv.list_tools())}
+    assert "ENDS your turn" in tools["direct_to"]
+    assert "NEXT turn" in tools["direct_to"]
+    assert "BEFORE calling this" in tools["end_meeting"]

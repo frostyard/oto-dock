@@ -130,3 +130,35 @@ def test_verified_literal_path_refuses_symlink(tmp_path):
     outside.mkdir()
     os.symlink(outside, root / "knowledge" / ".credentials")
     assert _verified_literal_path(real, "knowledge", ".credentials") is None
+
+
+def test_oauth_materialization_refuses_traversal_agent_name(tmp_path, monkeypatch):
+    """The destination root is ``AGENTS_DIR/<agent>``: a name that would leave
+    the agents tree materializes nothing and returns None, while a real slug
+    lands the token under the agent."""
+    from types import SimpleNamespace
+    import config
+    from services.mcp import mcp_registry
+    from services.oauth import credential_resolver as cr
+
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path / "agents")
+    token_dir = tmp_path / "tokens"
+    token_dir.mkdir()
+    (token_dir / "acct.json").write_text("{}")
+    manifest = SimpleNamespace(
+        name="workspace", credentials=SimpleNamespace(oauth={"provider_id": "google"}),
+    )
+    monkeypatch.setattr(mcp_registry, "get_manifest", lambda name: manifest)
+    monkeypatch.setattr(
+        mcp_registry, "get_credentials_dirs", lambda name: [("TOKEN_DIR", "google")])
+    monkeypatch.setattr(
+        cr, "_bound_token_source", lambda *a, **k: (token_dir, "acct", "alice"))
+
+    assert cr._resolve_oauth_mcp(
+        "workspace", {}, "user-1", "user", agent_name="../escape") is None
+    assert not (tmp_path / "escape").exists()
+
+    dest = tmp_path / "agents" / "pa" / "users" / "alice" / ".credentials" / "google"
+    out = cr._resolve_oauth_mcp("workspace", {}, "user-1", "user", agent_name="pa")
+    assert out == {"TOKEN_DIR": str(dest)}
+    assert (dest / "acct.json").read_text() == "{}"

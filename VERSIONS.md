@@ -9,7 +9,7 @@ This file is the **single source of truth** for all runtime versions used by the
 ## Platform version
 
 ```
-OTODOCK_VERSION=1.5.0
+OTODOCK_VERSION=1.6.0
 ```
 
 The platform's own version. Bumped on every minor/major release. Released versions follow semver (`v1.0.0`, `v1.0.1`, `v1.0.2`).
@@ -38,8 +38,8 @@ UV_VERSION=0.11.24
 NPM_VERSION=11.16.0
 PNPM_VERSION=11.9.0
 SYMPY_VERSION=1.14.0
-CLAUDE_CODE_VERSION=2.1.258
-CODEX_VERSION=0.149.1
+CLAUDE_CODE_VERSION=2.1.263
+CODEX_VERSION=0.153.4
 GH_VERSION=2.94.0
 BUBBLEWRAP_VERSION=0.6.1
 BUBBLEWRAP_MIN_VERSION=0.6.0
@@ -52,7 +52,7 @@ Notes:
 - **Node**: minimum is 22 LTS. We default to 24.18.0 (current LTS — "Krypton" — as of platform v1.0.0). Capacitor 8 requires Node 22+.
 - **pnpm**: installed via `npm install -g pnpm@${PNPM_VERSION}` by the installer (faster Node package manager for some MCP authors / agent workflows). v11 is the current major (new store format + supply-chain defaults).
 - **sympy**: symbolic maths in the agents' python (the file-tools maths workflow). Installed by the baseline installers pip-first into whatever `python3` resolves to (exact pin); externally-managed system pythons (PEP 668) fall back to the distro package (`python3-sympy` / brew `sympy`), whose version floats with the distro — presence beats an exact pin there.
-- **Claude Code**: 2.1.258 (2026-09-02). Claude Fable 5.1 — the platform's default Claude model since 2026-09-02 — REQUIRES ≥2.1.251 (older CLIs 400 on the model); satellites reconcile installed CLIs to this pin on reconnect (pin-and-freeze), so a pin bump here propagates to the fleet without a satellite release.
+- **Claude Code**: 2.1.263 (2026-09-08; the 2.1.258 → 2.1.263 review is in `CLAUDE-CODE-CLI.md`). Claude Fable 5.1 — the platform's default Claude model since 2026-09-02 — REQUIRES ≥2.1.251 (older CLIs 400 on the model); satellites reconcile installed CLIs to this pin on reconnect (pin-and-freeze), so a pin bump here propagates to the fleet without a satellite release.
 - **GitHub CLI**: `GH_VERSION` is a reference value only — the installer adds the cli.github.com apt repo and installs the **latest** `gh` (no pin).
 - **Bubblewrap**: distro-provided (`apt install bubblewrap`), **not** pinned to an exact version — `BUBBLEWRAP_VERSION` is an informational reference (Ubuntu 22.04 LTS ships 0.6.1; Debian 12 ships ~0.8; latest upstream is 0.11.2). `BUBBLEWRAP_MIN_VERSION` (0.6.0) is the **documented floor** — the realistic oldest supported host (Ubuntu 22.04 LTS ships 0.6.1) for the namespace/seccomp/mount features the sandbox uses. It is documentation, *not* yet a runtime gate (no `bwrap --version` preflight); adding one is an optional polish. Don't raise it higher (0.8+ would exclude Ubuntu 22.04 LTS, still supported to 2027).
 - **passt / pasta**: provides the user-mode network stack that wraps **every** local agent sandbox in an isolated network namespace (always on — there is no toggle). Date-versioned upstream (`YYYY_MM_DD.<short-sha>`); `PASST_MIN_VERSION` is a *feature* floor (the build must support `--no-map-gw` + per-port `-T` forwarding), not a staleness pin — leave it unless a needed feature lands in a newer build. The startup preflight checks pasta's **presence** + that an unprivileged user+net namespace can be created (hard-fails the proxy boot if `pasta`/`ip`/`bwrap` are missing or namespaces are blocked), not its version. **Not in Ubuntu 22.04 (jammy) main** — `scripts/install-baseline-tools.sh` installs it as a HARD requirement, auto-fetching the upstream **static** build from `https://passt.top/builds/` on jammy; Debian 12 (bookworm) / Ubuntu 23.10+ ship it as `apt install passt`. The proxy Dockerfile installs `passt iproute2 bubblewrap`.
@@ -132,7 +132,7 @@ The platform runs against **exact** Claude Code / Codex CLI versions. `CLAUDE_CO
   - Satellites apply the same freeze on their side (`satellite/cli_session.py` writes `autoUpdates: false`; the satellite env carries `DISABLE_AUTOUPDATER=1`).
 - The proxy host itself is checked at boot by `core/sandbox.cli_version_preflight()` — **warn-only** (logs drift so an operator can re-run the installer; never blocks startup).
 
-**To bump a CLI version:** edit `CLAUDE_CODE_VERSION` / `CODEX_VERSION` above, update the matching defaults in `scripts/install-baseline-tools.{sh,ps1}` and the doc references (`CLAUDE-CODE-CLI.md`, `CODEX.md`), restart the proxy (re-reads the pin) → satellites self-reconcile on reconnect. **Codex bumps require a live app-server smoke test** (its turn/thread surface is only re-verified by hand — see `CODEX.md`). **Claude bumps: re-check the TUI diff colors** against `dashboard/src/lib/ptyBrandColors.ts` — the dashboard terminal brand-tints the file-edit rows by rewriting the theme's exact truecolor triples, which are read from the pinned binary; a change degrades silently to the stock colors (grep the new binary for `diffAdded:"rgb(`).
+**To bump a CLI version:** edit `CLAUDE_CODE_VERSION` / `CODEX_VERSION` above, update the matching defaults in `scripts/install-baseline-tools.{sh,ps1}` and the doc references (`CLAUDE-CODE-CLI.md`, `CODEX.md`), restart the proxy (re-reads the pin) → satellites self-reconcile on reconnect. **Codex bumps require a live app-server smoke test** (its turn/thread surface is only re-verified by hand — see `CODEX.md`) **and a refresh of the local-model catalog's instructions text**: `proxy/core/layers/codex/codex_base_instructions.md` must equal `codex-rs/models-manager/prompt.md` at the new tag (`https://raw.githubusercontent.com/openai/codex/rust-v<pin>/codex-rs/models-manager/prompt.md`), with the length/hash constants in `proxy/tests/session/test_codex_local_model_catalog.py` and the tag in `codex_base_instructions.NOTICE` updated (see `CODEX.md` "Binary + version"). **Claude bumps: re-check the TUI diff colors** against `dashboard/src/lib/ptyBrandColors.ts` — the dashboard terminal brand-tints the file-edit rows by rewriting the theme's exact truecolor triples, which are read from the pinned binary; a change degrades silently to the stock colors (grep the new binary for `diffAdded:"rgb(`).
 
 ## Downstream community repos
 
@@ -146,7 +146,7 @@ Tagged releases of the `OtoDock/community-mcps` and `OtoDock/community-agents` r
 ## Protocol versions
 
 ```
-SATELLITE_VERSION=0.5.114
+SATELLITE_VERSION=0.5.118
 MIN_SATELLITE_VERSION=0.5.76
 ```
 

@@ -412,7 +412,14 @@ async def send_files(
     ``services/delegation/file_transfer``. Passive by design: no turn is
     spawned on the target and there is no active notice — its sessions
     see ``workspace/inbox/<source>/…`` in their workspace listing, and
-    context travels IN the files (README pattern, taught by the skill)."""
+    context travels IN the files (README pattern, taught by the skill).
+
+    A session executing on a remote machine has its sources read through
+    from the satellite first (``prefetch_remote_sources``): the workspace
+    syncs at turn boundaries, so without it a file written this turn 404s
+    and a file modified this turn ships stale bytes. When a path is still
+    missing afterwards the 404 names the machine that could not provide it
+    — the tool result must never read as "the tool is broken"."""
     u = require_auth(user)
     if not req.paths:
         raise HTTPException(400, "`paths` must name at least one file or directory.")
@@ -425,11 +432,27 @@ async def send_files(
             x_agent_name=x_agent_name,
         )
     )
-    result = await asyncio.to_thread(
-        lambda: file_transfer.perform_send_files(
-            authz, paths=req.paths, dest_dir=req.dest_dir, note=req.note,
+    unavailable: list[str] = []
+    if u.session_id:
+        unavailable = await file_transfer.prefetch_remote_sources(
+            u.session_id, authz, req.paths,
         )
-    )
+    try:
+        result = await asyncio.to_thread(
+            lambda: file_transfer.perform_send_files(
+                authz, paths=req.paths, dest_dir=req.dest_dir, note=req.note,
+            )
+        )
+    except file_transfer.MissingSourcePath as e:
+        if e.raw not in unavailable:
+            raise
+        machine = await file_transfer.remote_source_label(u.session_id)
+        raise HTTPException(
+            status_code=404,
+            detail=f"'{e.raw}' is not in the platform copy of your workspace "
+                   f"and the remote machine {machine} could not provide it "
+                   "(offline, or the file does not exist there)",
+        ) from None
     _schedule_transfer_fanout(
         authz.target_agent, result.landed, origin_user_sub=authz.owner_sub,
     )

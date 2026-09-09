@@ -517,6 +517,31 @@ def claim_title_generation(chat_id: str) -> tuple[bool, str | None]:
         return True, row["title"]
 
 
+def set_chat_title_if_unset(chat_id: str, title: str) -> bool:
+    """The deterministic first-message title: ONE conditional write, so a
+    rename that landed meanwhile (a REST rename, the LLM upgrade) wins over
+    it. Returns whether the row was written; the FTS row is rebuilt only on
+    an actual write."""
+    if not title:
+        return False
+    now = datetime.now(timezone.utc).isoformat()
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE chats SET title=%s, updated_at=%s "
+            "WHERE id=%s AND (title IS NULL OR title='')",
+            (title, now, chat_id),
+        )
+        conn.commit()
+        if cur.rowcount > 0:
+            try:
+                _rebuild_chat_search_row(conn, chat_id)
+                conn.commit()
+            except Exception:
+                logger.warning("chat_search rebuild failed for %s", chat_id,
+                               exc_info=True)
+        return cur.rowcount > 0
+
+
 def update_chat_title_cas(chat_id: str, new_title: str,
                           expected_title: str | None) -> bool:
     """Conditional title write for the LLM upgrade's final step.
@@ -561,6 +586,22 @@ def get_retention_candidate_chats(cutoff_iso: str) -> list[dict]:
                   AND updated_at < %s""",
             (cutoff_iso,),
         ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_phone_chats(cutoff_iso: str | None = None) -> list[dict]:
+    """Phone conversations (``source_type='phone'``) — all of them, or only
+    those untouched since ``cutoff_iso``. The caller-data retention sweep and
+    "Forget all" delete them whole (rows, messages, session files) —
+    services/infra/external_retention.py."""
+    sql = ("SELECT id, agent, session_id, codex_thread_id, updated_at FROM chats "
+           "WHERE source_type = 'phone'")
+    params: list = []
+    if cutoff_iso:
+        sql += " AND updated_at < %s"
+        params.append(cutoff_iso)
+    with get_conn() as conn:
+        rows = conn.execute(sql + " ORDER BY updated_at", params).fetchall()
         return [dict(r) for r in rows]
 
 
@@ -789,6 +830,27 @@ def get_last_user_message_author(chat_id: str) -> str:
             (chat_id,),
         ).fetchone()
     return (row["author_sub"] or "") if row else ""
+
+
+def list_tool_names(chat_id: str) -> list[str]:
+    """Distinct tool names a chat ran, in first-use order — the persisted
+    tool blocks (``event_type='tool'``; the phone call log's audit trail).
+    Same TEXT-column caution as ``get_last_todo_snapshot``: parse in Python."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT event_data FROM chat_messages "
+            "WHERE chat_id=%s AND event_type='tool' ORDER BY id",
+            (chat_id,),
+        ).fetchall()
+    names: list[str] = []
+    for row in rows:
+        try:
+            name = json.loads(row["event_data"] or "{}").get("name") or ""
+        except (ValueError, TypeError, AttributeError):
+            continue
+        if name and name not in names:
+            names.append(str(name))
+    return names
 
 
 def get_last_todo_snapshot(chat_id: str) -> list[dict]:

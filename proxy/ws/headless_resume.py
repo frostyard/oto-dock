@@ -128,7 +128,8 @@ async def resume_dead_session_headless(
         clear_session_liveness(dead_sid, reason="resume_failed")
         sid = str(uuid.uuid4())
 
-    effective_role = _effective_agent_role(user_sub, agent, fallback_user=user)
+    from storage.pg import run_db
+    effective_role = await run_db(_effective_agent_role, user_sub, agent, fallback_user=user)
     task_identity = None
     if chat_id.startswith("task-"):
         run = task_store.get_run(chat_id.removeprefix("task-"))

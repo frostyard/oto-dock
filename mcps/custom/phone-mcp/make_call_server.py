@@ -151,8 +151,9 @@ async def list_tools() -> list[Tool]:
             name="answer_call_question",
             description=(
                 "Answer a pending question from the caller agent during a call. "
-                "The caller agent asked a [QUESTION:] and is waiting on hold. "
-                "Send the answer so the caller can continue the conversation."
+                "The caller agent asked a [QUESTION:] and is waiting for your answer "
+                "while it keeps the phone conversation going — the other person is NOT "
+                "put on hold. Send the answer so the caller can use it."
             ),
             inputSchema={
                 "type": "object",
@@ -219,7 +220,7 @@ async def _handle_make_call(arguments: dict) -> list[TextContent]:
             text="Error: phone_number and task_description are required.",
         )]
 
-    logger.debug(f"Making call to {phone_number}: {task_description}")
+    logger.debug(f"Making call: {task_description}")
 
     try:
         async with httpx.AsyncClient(
@@ -307,9 +308,10 @@ async def _handle_wait_for_call(arguments: dict) -> list[TextContent]:
                     parts.append("")
                 parts.append(
                     "---\n"
-                    "The caller agent is on hold waiting for your answer. "
+                    "The caller agent is waiting for your answer; the call stays live and "
+                    "it keeps the other person engaged meanwhile (nobody is on hold). "
                     f"Use `answer_call_question` with call_id `{call_id}` to respond. "
-                    "**Answer quickly — the person is waiting on the phone.**"
+                    "**Answer quickly — the caller gives up after about 40 seconds.**"
                 )
                 return [TextContent(type="text", text="\n".join(parts))]
             elif event in ("completed", "failed"):

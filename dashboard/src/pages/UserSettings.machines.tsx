@@ -3,6 +3,9 @@ import { useAuth } from '../contexts/AuthContext'
 import { useMyRemoteMachines, usePairMyMachine, useDeleteMyMachine, useSetMyRemoteTarget, useRemoveMyRemoteTarget, useSetMyAllowFullFs, useSetMyDeviceGrants, DEVICE_CAPABILITY_INFO, type PairResult } from '../api/remoteMachines'
 import RemoteBadge from '../components/RemoteBadge'
 import PairInstallCommand from '../components/PairInstallCommand'
+import {
+  BrowserModeSelect, BrowserTokenField, browserModeDesc, browserModeOf,
+} from '../components/BrowserModeControls'
 
 export function MyMachinesSection() {
   const { user } = useAuth()
@@ -210,33 +213,44 @@ export function MyMachinesSection() {
                     </p>
                   )}
                   <div className="flex flex-col gap-1">
-                    {DEVICE_CAPABILITY_INFO.map(cap => (
-                      <label
-                        key={cap.key}
-                        className="inline-flex items-center gap-1.5 text-xs text-p-text cursor-pointer"
-                      >
-                        <input
-                          type="checkbox"
-                          checked={(m.device_grants ?? []).includes(cap.key)}
-                          disabled={setDeviceGrants.isPending}
-                          onChange={e => {
-                            const on = e.target.checked
-                            if (on && !window.confirm(
-                              `Grant "${cap.label}" on ${m.name}?\n\n` +
-                              'This lets your agents drive real input/output on this ' +
-                              'machine — it can click system/sudo prompts and use a ' +
-                              'browser with your saved logins.',
-                            )) return
-                            const next = new Set(m.device_grants ?? [])
-                            if (on) { next.add(cap.key) } else { next.delete(cap.key) }
-                            setDeviceGrants.mutate({ machineId: m.id, grants: [...next] })
-                          }}
-                          className="rounded-sm"
-                        />
-                        <span className="font-medium">{cap.label}</span>
-                        <span className="text-p-text-light">— {cap.desc}</span>
-                      </label>
-                    ))}
+                    {DEVICE_CAPABILITY_INFO.map(cap => {
+                      const on = (m.device_grants ?? []).includes(cap.key)
+                      const isBrowser = cap.key === 'browser'
+                      // The Browser-control row carries its mode selector while
+                      // granted, and its description follows the selected mode.
+                      const desc = isBrowser && on ? browserModeDesc(browserModeOf(m)) : cap.desc
+                      return (
+                        <div key={cap.key} className="flex flex-col">
+                          <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-p-text">
+                            <label className="inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap">
+                              <input
+                                type="checkbox"
+                                checked={on}
+                                disabled={setDeviceGrants.isPending}
+                                onChange={e => {
+                                  const next_on = e.target.checked
+                                  if (next_on && !window.confirm(
+                                    `Grant "${cap.label}" on ${m.name}?\n\n` +
+                                    'This lets your agents drive real input/output on this ' +
+                                    'machine — it can click system/sudo prompts and use a ' +
+                                    'browser with your saved logins.',
+                                  )) return
+                                  const next = new Set(m.device_grants ?? [])
+                                  if (next_on) { next.add(cap.key) } else { next.delete(cap.key) }
+                                  setDeviceGrants.mutate({ machineId: m.id, grants: [...next] })
+                                }}
+                                className="rounded-sm"
+                              />
+                              <span className="font-medium">{cap.label}</span>
+                            </label>
+                            {isBrowser && on && <BrowserModeSelect machine={m} scope="me" />}
+                            <span className="text-p-text-light">— {desc}</span>
+                          </div>
+                          {/* Own mode's token block belongs to this row, not to the list. */}
+                          {isBrowser && on && <BrowserTokenField machine={m} scope="me" />}
+                        </div>
+                      )
+                    })}
                   </div>
                 </div>
               )}

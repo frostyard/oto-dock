@@ -9,7 +9,7 @@ You have display tools available to show visual content directly in the chat:
 - `send_url`: clickable links the user should open in their browser (for video links use `display_video` instead — it embeds them).
 - `send_file`: downloadable files (reports, data exports, generated files).
 
-Always use these tools proactively — the user cannot see images, video, audio, URLs, or files unless you explicitly send them via these tools. Parameter details live on the tools themselves; this skill covers routing judgment. The **miniapp-authoring skill** carries the full authoring contracts (backchannel + theme events, mini-app dashboards, action buttons, live data panels, feeds, file pins) — read it whenever you are about to build or update a `display_ui` artifact, mini-app, or dashboard.
+Always use these tools proactively — the user cannot see images, video, audio, URLs, or files unless you explicitly send them via these tools. Parameter details live on the tools themselves; this skill covers routing judgment. The **miniapp-authoring skill** carries the full authoring contracts (backchannel + theme events, mini-app dashboards, action buttons, live data panels, feeds, file pins) — load it with the Skill tool whenever you are about to build or update a `display_ui` artifact, mini-app, or dashboard.
 
 ### Media routing rules
 
@@ -19,13 +19,11 @@ Always use these tools proactively — the user cannot see images, video, audio,
 
 ### When to reach for `display_ui`
 
-It's occasion-driven, not a default: dense or comparative data that reads better as a real chart or styled table than markdown; a stat summary worth presenting as a dashboard card; a visual explanation (timeline, flow, before/after); a moment worth celebrating with a tasteful animation; or a small self-contained interactive (calculator, unit converter, what-if slider, sortable table, tabbed view). Plain prose or a markdown table is still right for simple answers.
+It's occasion-driven, not a default: dense or comparative data that reads better as a real chart or styled table than markdown; a stat summary worth presenting as a dashboard card; a visual explanation (timeline, flow, before/after); a moment worth celebrating with a tasteful animation; or a small self-contained interactive (calculator, unit converter, what-if slider, sortable table, tabbed view). Plain prose or a markdown table is still right for simple answers. Three levels of ambition, all supported: **display** (one-way), **self-contained interactivity** (inputs, client-side calculation), and the **chat backchannel** (`window.otodock.send(payload)` delivers a user gesture back to you as a new framed input) — contracts and snippets in the miniapp-authoring skill.
 
-Three levels of ambition, all fully supported: **display** (charts, tables, cards, animated SVG — one-way), **self-contained interactivity** (inputs, sliders, client-side calculation inside the sandbox), and the **chat backchannel** (`window.otodock.send(payload)` delivers a user gesture back to you as a new framed input). The authoring contracts, snippets, and styling rules for all three live in the miniapp-authoring skill.
+### Iterating — edit the file, don't resend the html
 
-### Iterating — Edit the file, don't resend the html
-
-The ack returns the artifact's file path. To update an artifact you already displayed: **Edit that file directly** (normal file edit), then call `display_ui` with ONLY `save_path` (omit `html`) — the file's current content is re-read and goes live. Resending full `html` is only for the first creation or a total rewrite; for a small change it makes the user wait while you regenerate the whole file. Two re-display modes: `display: true` (default — re-appears at the newest chat position, older copy collapses to a chip) for turn-based updates; `display: false` (silent in-place refresh, no new chat block) for many small updates mid-turn. Reuse an existing artifact whenever the update is the point — don't rebuild from scratch or paste a near-duplicate.
+The ack returns the artifact's file path. To update an artifact you already displayed: **Edit that file directly**, then call `display_ui` with ONLY `save_path` (omit `html`) — the file's current content is re-read and goes live. Resending full `html` is only for the first creation or a total rewrite. `display: true` (default) re-appears at the newest chat position; `display: false` refreshes silently in place for many small updates mid-turn. Reuse an existing artifact whenever the update is the point — don't rebuild from scratch or paste a near-duplicate.
 
 ### Standing surfaces — offer, don't wait to be asked
 

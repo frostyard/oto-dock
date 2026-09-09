@@ -18,6 +18,7 @@ SECRET_COLUMNS = (
     "pairing_token_hash",
     "pairing_token_created_at",
     "machine_secret_hash",
+    "browser_extension_token_enc",
 )
 
 
@@ -83,6 +84,25 @@ def test_default_machine_for_agent_clean(machine, temp_db):
     row = remote_store.get_default_machine_for_agent("probe-agent")
     assert row is not None and row["id"] == machine["id"]
     _assert_clean(row)
+
+
+def test_browser_token_never_rides_a_row_but_flags_presence(machine):
+    # The own-browser token is stored encrypted and read back ONLY by the
+    # targeted get_target_browser_settings SELECT; every row reader strips
+    # the ciphertext and exposes a presence flag instead.
+    remote_store.set_device_grants(machine["id"], ["browser"])
+    remote_store.set_browser_mode(machine["id"], "own")
+    remote_store.set_browser_extension_token(machine["id"], "tok-" + "x" * 40)
+    for row in (
+        remote_store.get_remote_machine(machine["id"]),
+        next(r for r in remote_store.get_all_remote_machines() if r["id"] == machine["id"]),
+    ):
+        _assert_clean(row)
+        assert row["browser_extension_token_set"] is True
+        assert row["browser_mode"] == "own"
+    settings = remote_store.get_target_browser_settings("admin_remote", machine["id"])
+    assert settings.mode == "own"
+    assert settings.extension_token == "tok-" + "x" * 40
 
 
 def test_verifiers_still_work_after_stripping(machine):

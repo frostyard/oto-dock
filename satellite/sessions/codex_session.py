@@ -21,7 +21,9 @@ from typing import TYPE_CHECKING
 
 from ..host import env_hygiene, path_translator
 from ..transport import file_sync
-from .._vendored.app_server_client import AppServerClient, AppServerError
+from .._vendored.app_server_client import (
+    AppServerClient, AppServerError, mcp_server_names_from_toml, wait_for_mcp_startup,
+)
 from .._vendored.codex_approvals import (
     approval_for_sandbox, build_sandbox_policy, make_server_request_handler,
 )
@@ -33,13 +35,19 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("satellite")
 
-# Best-effort MCP warm-gate before the first turn (bounded). Lean-start:
-# quiescence trimmed 1.5s→0.5s — the daemon stays warm for the session and
-# `thread/start` returns before MCPs finish, so the gate is a first-turn nicety;
-# a shorter silence threshold shaves ~1s off cold first-token. Keep in lock-step
-# with the proxy twin (proxy/core/layers/codex/session.py).
-_WARM_QUIESCENCE_S = 0.5
+# Bounded MCP warm-gate before the first turn: the vendored
+# ``app_server_client.wait_for_mcp_startup`` (shared with the proxy) waits
+# until every server the session configured has a terminal startup status —
+# see its docstring. The caps bound a server that hangs past Codex's own
+# startup_timeout_sec: 15 s on hosted models; 90 s on a local model, where a
+# changed tool list means minutes of re-prefill (covers the remote MCP startup
+# floor of 60 s; the proxy's start ack budget allows for it). The policy
+# constants live here and in proxy/core/layers/codex/session.py — keep them in
+# lock-step.
+_WARM_POLL_S = 0.5
 _WARM_CAP_S = 15.0
+_WARM_CAP_LOCAL_MODEL_S = 90.0
+_WARM_NO_STATUS_S = 5.0
 
 
 def _format_time() -> str:
@@ -54,12 +62,15 @@ def _write_codex_hooks(codex_dir: Path) -> None:
     ``{"hooks": {"<Event>": [{"matcher": "", "hooks":
     [{"type": "command", "command": <cmd>, "timeout": <s>}]}]}}``. The OLD shape
     here was a LIST ``[{event, matcher, commands}]`` — Codex's strict parser
-    rejected it (``failed to parse hooks config … trailing characters``). That was
-    harmless for the ``-p`` app-server (it leaves ``[features] hooks`` OFF and gates
-    via the JSON-RPC approval bridge), but the interactive Codex TUI sets
-    ``[features] hooks = true`` so it actually loads this file → the permission
-    FLOOR silently failed to load. Uses ``codex_hook_command()`` — on Windows
-    a quote-free .cmd wrapper, because Codex's cmd.exe /C hook runner cannot
+    rejected it (``failed to parse hooks config … trailing characters``) and the
+    permission FLOOR silently failed to load. Who runs it: the interactive
+    Codex TUI (``--dangerously-bypass-hook-trust``) and, from 0.5.118, the
+    ``-p`` app-server for UNATTENDED sessions (``codex_hooks_floor`` in the
+    start payload → thread-level ``bypass_hook_trust``; see
+    ``CodexSession._thread_overrides``). Attended dashboard chats leave the
+    file dormant (a user-layer hook runs only when trusted) and gate through
+    the JSON-RPC approval bridge. Uses ``codex_hook_command()`` — on Windows a
+    quote-free .cmd wrapper, because Codex's cmd.exe /C hook runner cannot
     re-parse the quoted two-token form (exit-1 on every call otherwise)."""
     def _hook(script: str, timeout: int) -> dict:
         return {
@@ -131,6 +142,170 @@ def _validate_config_toml(text: str, path: Path) -> None:
         logger.error("generated codex config.toml is INVALID (%s): %s", path, e)
 
 
+# File name of the per-session model catalog inside CODEX_HOME (twin of the
+# proxy's ``local_model_catalog.CATALOG_FILE_NAME``).
+MODEL_CATALOG_FILE_NAME = "models.json"
+
+# config.toml [tools] table every Codex session gets (twin of the proxy's
+# ``layer._CODEX_TOOLS_TABLE``): Codex 0.152.0 made the update_plan tool
+# opt-in (default off) — without it the daemon never emits turn/plan/updated
+# and the dashboard's TODO checklist silently disappears. Valid on older
+# Codex too (where on was the default).
+CODEX_TOOLS_TABLE = "[tools]\nupdate_plan = { enabled = true }"
+
+# Header every headless (app-server) remote Codex session gets — the twin of
+# the local ``layer._write_config_toml`` header and of the interactive
+# satellite writer (``codex_pty_session._build_codex_config_toml``). Before
+# 0.5.118 the headless writer emitted none of it, so a paired machine ran
+# Codex's defaults: the 32 KiB ``project_doc_max_bytes`` cap silently dropped
+# the tail of a platform AGENTS.md (persona + memory + skills + knowledge),
+# Codex's own memory subsystem ran next to otodock memory (the single source
+# of memory truth; there is no ``.codex/memories/`` wipe on a satellite), and
+# every daemon start cloned OpenAI's curated-plugins repo (``plugins`` below).
+# Root keys must precede every ``[table]`` header.
+CODEX_HEADLESS_ROOT_KEYS = "project_doc_max_bytes = 300000"
+CODEX_MEMORIES_TABLE = "[memories]\nuse_memories = false\ngenerate_memories = false"
+
+
+def features_table(hooks_floor: bool, mcp_toml: str) -> "tuple[str, str]":
+    """The ONE ``[features]`` table of a headless config.toml, plus the MCP
+    TOML with its own leading ``[features]`` block lifted out.
+
+    Returns ``(features_block, mcp_toml_rest)``. The block always carries
+    ``plugins = false`` (lean start, see ``CODEX_HEADLESS_ROOT_KEYS``), adds
+    ``hooks = true`` when this session runs the PreToolUse permission floor
+    (``codex_hooks_floor`` in the start payload — the key is default-on
+    upstream, explicit on purpose), and keeps every key of a ``[features]``
+    block the proxy prepends to the MCP TOML (``default_mode_request_user_input``
+    for headless dashboard chats). Merging is what keeps the file valid: two
+    ``[features]`` tables are a duplicate key Codex rejects, after which the
+    app-server "uses defaults" and drops every MCP. Comments and blank lines
+    of the lifted block are dropped; a key already present is not repeated.
+    """
+    lines = mcp_toml.split("\n") if mcp_toml else []
+    keys: list[str] = ["plugins = false"]
+    rest = mcp_toml
+    if lines and lines[0].strip() == "[features]":
+        end = len(lines)
+        for i in range(1, len(lines)):
+            stripped = lines[i].strip()
+            if stripped.startswith("[") and stripped != "[features]":
+                end = i
+                break
+        for raw in lines[1:end]:
+            line = raw.strip()
+            if line and not line.startswith("#"):
+                keys.append(line)
+        rest = "\n".join(lines[end:]).strip() if end < len(lines) else ""
+    if hooks_floor:
+        keys.append("hooks = true")
+    seen: set[str] = set()
+    unique: list[str] = []
+    for key in keys:
+        name = key.split("=", 1)[0].strip()
+        if name in seen:
+            continue
+        seen.add(name)
+        unique.append(key)
+    return "[features]\n" + "\n".join(unique), rest
+
+
+def _esc_toml(v: str) -> str:
+    return v.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def local_provider_toml(local: "dict | None", codex_dir: "Path | None" = None) -> "tuple[str, str]":
+    """Codex config.toml lines for a local OpenAI-compatible endpoint the proxy
+    carried in the start payload (``local_model_provider``: ``base_url`` plus the
+    optional ``env_key`` naming the child-env variable that holds its bearer,
+    ``stream_idle_timeout_ms`` and the optional ``catalog_json``).
+
+    Returns ``(root_lines, table)``: ``model_provider = "oto_local"`` (and, with
+    a catalog, ``model_catalog_json = "<codex_dir>/models.json"`` — the file
+    ``write_or_drop_model_catalog`` writes) are ROOT keys and must precede every
+    ``[table]`` header; the ``[model_providers.oto_local]`` table may close the
+    file. Twin of the proxy's ``_write_config_toml`` provider block —
+    ``wire_api`` MUST be ``"responses"`` (codex-rs dropped the "chat" wire),
+    ``env_key`` is emitted ONLY when the endpoint is keyed (codex-rs refuses a
+    provider whose ``env_key`` names an unset variable) and the idle timeout
+    only when the proxy sent one (a local model prefills at CPU speed; Codex's
+    5-minute default killed a first turn before its first token). ``("", "")``
+    without an endpoint, so a hosted session never inherits a provider.
+    """
+    base_url = str((local or {}).get("base_url") or "").strip()
+    if not base_url:
+        return "", ""
+
+    root = ['model_provider = "oto_local"']
+    if codex_dir is not None and str((local or {}).get("catalog_json") or "").strip():
+        # Codex requires an ABSOLUTE path here (a relative agents_dir in
+        # satellite.conf would otherwise reject the whole config.toml).
+        catalog_path = os.path.abspath(str(Path(codex_dir) / MODEL_CATALOG_FILE_NAME))
+        root.append(f'model_catalog_json = "{_esc_toml(catalog_path)}"')
+    lines = [
+        "[model_providers.oto_local]",
+        'name = "Local"',
+        f'base_url = "{_esc_toml(base_url)}"',
+        'wire_api = "responses"',
+    ]
+    try:
+        idle_ms = int((local or {}).get("stream_idle_timeout_ms") or 0)
+    except (TypeError, ValueError):
+        idle_ms = 0
+    if idle_ms > 0:
+        lines.append(f"stream_idle_timeout_ms = {idle_ms}")
+    env_key = str((local or {}).get("env_key") or "").strip()
+    if env_key:
+        lines.append(f'env_key = "{_esc_toml(env_key)}"')
+    return "\n".join(root), "\n".join(lines)
+
+
+def write_or_drop_model_catalog(codex_dir: Path, local: "dict | None") -> None:
+    """``models.json`` follows the start payload exactly: write the proxy-built
+    per-session model catalog (``local_model_provider.catalog_json`` — the entry
+    that makes Codex defer its MCP tools on an Ollama model) owner-only, or
+    remove a previous session's file when this session carries none (CODEX_HOME
+    persists per agent and user; config.toml no longer points at it, so the
+    directory stays honest)."""
+    path = codex_dir / MODEL_CATALOG_FILE_NAME
+    text = str((local or {}).get("catalog_json") or "")
+    if text.strip():
+        path.write_text(text, encoding="utf-8")
+        chmod_private(path)
+        return
+    with contextlib.suppress(OSError):
+        path.unlink()
+
+
+def write_or_drop_auth_json(codex_dir: Path, auth_json: "dict | None") -> None:
+    """``auth.json`` follows the start payload exactly. With ``auth_json`` (a
+    ChatGPT OAuth session) write it owner-only; WITHOUT it (an API key or a
+    local endpoint) remove a previous session's file from this persistent
+    CODEX_HOME — Codex would otherwise load the stale, refresh-neutralized
+    token and loop on refreshing it every request ("Failed to refresh token:
+    400 … refresh_token: empty string", verified 2026-09-07 on a local-endpoint
+    session that followed a ChatGPT one)."""
+    auth_path = codex_dir / "auth.json"
+    if auth_json:
+        auth_path.write_text(json.dumps(auth_json, indent=2))
+        # Live OAuth tokens — keep them owner-only (the satellite host can be
+        # multi-user; default umask would leave them world-readable).
+        chmod_private(auth_path)
+        return
+    with contextlib.suppress(OSError):
+        auth_path.unlink()
+
+
+def chmod_private(path: Path) -> None:
+    """Owner-only for a config file that carries per-session bearers (MCP
+    cap-tokens, the session JWT, a local endpoint's URL) — the proxy locks its
+    own config.toml 0600 the same way. No-op on Windows (no POSIX bits)."""
+    if sys.platform == "win32":
+        return
+    with contextlib.suppress(OSError):
+        path.chmod(0o600)
+
+
 def _write_codex_hook_scripts(codex_dir: Path, scripts: dict[str, str]) -> None:
     """Write hook scripts sent by the proxy into the .codex/ dir."""
     if not scripts:
@@ -199,6 +374,23 @@ class CodexSession:
         # Side-taps on the forwarder stream (compact() watches for its
         # completion signals here without stealing the sole-consumer role).
         self._sniffers: list[asyncio.Queue] = []
+        # The [mcp_servers.*] this session's config.toml declares (the warm
+        # gate waits for each) and whether the model is a local endpoint (the
+        # longer warm cap). Set by start() from the written config.
+        self._mcp_server_names: list[str] = []
+        self._local_model: bool = bool(
+            ((config.get("local_model_provider") or {}).get("base_url") or "").strip()
+        )
+        # The proxy decides which sessions run permission_gate.py as the
+        # app-server's PreToolUse hook (UNATTENDED client types: task / phone /
+        # meeting / trigger / internal — helpers.codex_hooks_floor; satellite
+        # >= 0.5.118). Under `approvalPolicy: never` the approval bridge never
+        # fires, so without the floor such a session is gated by the prompt
+        # rules only. Three pieces, each per session: `[features] hooks = true`
+        # in config.toml, `bypass_hook_trust` on the thread (Codex runs a
+        # user-layer hook only when trusted — the operative switch on a shared
+        # CODEX_HOME), and the deny-only / no-forward hook env below.
+        self._hooks_floor: bool = bool(config.get("codex_hooks_floor"))
 
     async def start(self) -> None:
         """Write config files, spawn the app-server daemon, open/resume thread."""
@@ -252,15 +444,33 @@ class CodexSession:
             toml_content = _inject_display_env_toml(toml_content)
             from .mcp_interceptor import wrap_interceptor_in_mcp_config_toml
             toml_content = wrap_interceptor_in_mcp_config_toml(toml_content)
-            _validate_config_toml(toml_content, self._codex_dir / "config.toml")
-            (self._codex_dir / "config.toml").write_text(toml_content)
-        auth_json = self.config.get("auth_json")
-        if auth_json:
-            auth_path = self._codex_dir / "auth.json"
-            auth_path.write_text(json.dumps(auth_json, indent=2))
-            # Live OAuth tokens — keep them owner-only (the satellite host can be
-            # multi-user; default umask would leave them world-readable).
-            auth_path.chmod(0o600)
+        # ALWAYS write config.toml: CODEX_HOME persists across sessions of the
+        # same (agent, user) and file sync never resets it, so a hosted session
+        # after a local-endpoint one must not inherit the provider block (nor
+        # stale MCP sections). Root keys first (the headless header's
+        # project_doc_max_bytes, then the provider's model_provider /
+        # model_catalog_json), then the tables: [tools] (the plan tool stays
+        # on), [memories] off, the ONE [features] table (lean start, the hook
+        # floor when the proxy asked for it, and whatever [features] keys the
+        # proxy prepended to its MCP TOML — lifted out AFTER the MCP transforms
+        # above, so their input is unchanged), the MCP sections, and the
+        # provider table last (none of the MCP transforms sees it).
+        local_provider = self.config.get("local_model_provider")
+        root_line, provider_table = local_provider_toml(local_provider, self._codex_dir)
+        features, mcp_sections = features_table(self._hooks_floor, toml_content.strip())
+        parts = [p for p in (
+            CODEX_HEADLESS_ROOT_KEYS, root_line, CODEX_TOOLS_TABLE, CODEX_MEMORIES_TABLE,
+            features, mcp_sections, provider_table,
+        ) if p]
+        config_text = "\n\n".join(parts) + "\n"
+        self._mcp_server_names = mcp_server_names_from_toml(config_text)
+        config_path = self._codex_dir / "config.toml"
+        if config_text:
+            _validate_config_toml(config_text, config_path)
+        write_or_drop_model_catalog(self._codex_dir, local_provider)
+        config_path.write_text(config_text)
+        chmod_private(config_path)
+        write_or_drop_auth_json(self._codex_dir, self.config.get("auth_json"))
         _write_codex_hooks(self._codex_dir)
 
         # Off-thread — a big agent tree's hash walk must not stall the event
@@ -280,8 +490,17 @@ class CodexSession:
         env["CODEX_HOME"] = str(self._codex_dir)
         env["OTO_SESSION_ID"] = self.session_id
         # Interpreter for the Windows .cmd hook wrappers (codex_hook_command).
-        # hooks.json is TUI-only, but the file is written for both paths.
         env["OTO_HOOK_PY"] = sys.executable
+        if self._hooks_floor:
+            # The hook processes inherit the daemon env. Codex's PreToolUse
+            # hook rejects permissionDecision:"allow", so permission_gate.py
+            # emits JSON only to DENY; the PostToolUse forwarder stays quiet
+            # (the JSON-RPC stream already carries every tool result — a
+            # forward would render each card twice). Assigned, not defaulted:
+            # a stray operator variable must not win. Twin of the local
+            # layer's _build_env; the interactive TUI path sets DENY_ONLY too.
+            env["OTO_HOOK_DENY_ONLY"] = "1"
+            env["OTO_HOOK_NO_FORWARD"] = "1"
         env.setdefault("PYTHONUTF8", "1")
         env.setdefault("PYTHONIOENCODING", "utf-8")
         # Per-session secret files (SSH keys + OAuth token files) — see
@@ -661,7 +880,9 @@ class CodexSession:
         # we route — over the loopback tunnel → /v1/hooks/permission — through
         # the proxy's decide_tool_permission. turn/start re-asserts these per
         # turn with the structured sandboxPolicy. (No bwrap on the satellite;
-        # Codex's own sandbox is the FS boundary.)
+        # Codex's own sandbox is the FS boundary.) Under `never` nothing fires,
+        # so unattended sessions run the PreToolUse hook floor instead — the
+        # hook posts to the same endpoint over the same tunnel.
         sandbox_mode = self.config.get("sandbox_mode", "workspace-write")
         overrides: dict = {
             "approvalPolicy": approval_for_sandbox(sandbox_mode),
@@ -672,6 +893,14 @@ class CodexSession:
             overrides["model"] = self.config["model"]
         if self.config.get("effort"):
             overrides["effort"] = self.config["effort"]
+        if self._hooks_floor:
+            # Codex runs a user-layer hooks.json only when trusted; the
+            # app-server has no CLI flag for it (the TUI's
+            # --dangerously-bypass-hook-trust), the per-thread `config` map is
+            # the switch (codex-rs app-server/src/config_manager.rs). Sent on
+            # thread/start AND thread/resume (same dict). The platform wrote
+            # the hook it is trusting. Twin of the local _thread_overrides.
+            overrides["config"] = {"bypass_hook_trust": True}
         return overrides
 
     async def _decide_permission_remote(self, tool_name: str, tool_input: dict) -> dict:
@@ -812,20 +1041,29 @@ class CodexSession:
                 logger.warning(f"Codex state reset: couldn't delete {path.name}: {e}")
 
     async def _warm_mcps(self) -> None:
+        """Wait for the session's MCP servers (the ``[mcp_servers.*]`` this
+        session wrote) to finish starting before the first turn — the shared
+        ``wait_for_mcp_startup``, with the local-model cap when the session
+        runs on a local endpoint. Twin of the proxy's
+        ``CodexAppServerSession._warm_mcps``."""
         if self._client is None:
             return
-        import time as _time
-        q = self._client.notif_queue
-        statuses: dict[str, str] = {}
-        deadline = _time.monotonic() + _WARM_CAP_S
-        while _time.monotonic() < deadline:
-            try:
-                method, params = await asyncio.wait_for(q.get(), timeout=_WARM_QUIESCENCE_S)
-            except asyncio.TimeoutError:
-                break
-            if method == "__daemon_exit__":
-                return
-            if method == "mcpServer/startupStatus/updated":
-                statuses[params.get("name", "?")] = params.get("status", "?")
-        failed = [n for n, s in statuses.items() if s == "failed"]
-        logger.info(f"Codex MCP warm-up ({self.session_id}): {len(statuses)} server(s), failed={failed}")
+        cap = _WARM_CAP_LOCAL_MODEL_S if self._local_model else _WARM_CAP_S
+        res = await wait_for_mcp_startup(
+            self._client, self._mcp_server_names, cap_s=cap,
+            poll_s=_WARM_POLL_S, no_status_grace_s=_WARM_NO_STATUS_S,
+        )
+        if res.daemon_exited:
+            return
+        extra = f" unexpected={res.unexpected}" if res.unexpected else ""
+        if res.pending:
+            logger.warning(
+                f"Codex MCP warm-up ({self.session_id}) hit the {cap:.0f}s cap after "
+                f"{res.elapsed:.1f}s: still starting={res.pending} ready={res.ready} "
+                f"failed={res.failed}{extra}"
+            )
+        else:
+            logger.info(
+                f"Codex MCP warm-up ({self.session_id}) done in {res.elapsed:.1f}s: "
+                f"ready={res.ready} failed={res.failed}{extra}"
+            )

@@ -2,11 +2,13 @@
 machines API, bounded and race-safe.
 
 The satellite reports per-CLI ``{version, path}`` after every reconcile pass;
-the proxy merges it into the connection's capabilities and persists a
-SNAPSHOT (json.dumps on a worker thread must never iterate a dict the event
-loop can still mutate), re-persisting the fresh connection's capabilities if
-a reconnect replaced the connection mid-persist. The machines API carries
-``cli_pins`` per machine so the dashboard can judge drift.
+the proxy merges it into the connection's capabilities and hands a SNAPSHOT
+to the per-machine persister's ``caps`` lane (json.dumps on the DB executor
+must never iterate a dict the event loop can still mutate). The lane is
+newest-wins per machine, so a register() snapshot and a cli_status re-report
+can never land out of order — whichever was requested last is what stands.
+The machines API carries ``cli_pins`` per machine so the dashboard can judge
+drift.
 """
 
 import types
@@ -45,6 +47,7 @@ async def test_cli_status_merges_and_persists_snapshot(monkeypatch):
         "claude": {"version": "2.1.220", "path": "/usr/bin/claude"},
         "codex": {"version": "0.145.0", "path": "/usr/bin/codex"},
     }})
+    assert await cm.drain_persists()
 
     assert conn.capabilities["cli_status"]["claude"]["version"] == "2.1.220"
     assert len(persists) == 1
@@ -69,6 +72,7 @@ async def test_cli_status_bounds_untrusted_input(monkeypatch):
         "codex": "not-a-dict",
         "evil-key": {"version": "x"},
     }})
+    assert await cm.drain_persists()
 
     clis = conn.capabilities["cli_status"]
     assert set(clis) == {"claude"}          # whitelist: codex invalid, evil-key dropped
@@ -78,34 +82,34 @@ async def test_cli_status_bounds_untrusted_input(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_cli_status_repersists_fresh_connection_after_race(monkeypatch):
-    """If a reconnect replaces the connection while the persist runs, the
-    fresh connection's capabilities are re-persisted so the stale thread
-    write never stands as the last one."""
+async def test_cli_status_snapshot_never_overtakes_a_newer_register(monkeypatch):
+    """The reconnect race, lane edition: a cli_status snapshot from the OLD
+    connection and the fresh register()'s snapshot go through the same
+    newest-wins lane, so the LAST requested snapshot is the one that stands —
+    never the stale one landing after a newer write (the old two-thread
+    to_thread pair could)."""
     from core.remote.satellite_connection import SatelliteConnectionManager
 
     cm = SatelliteConnectionManager()
     old = _conn({"gen": "old"})
     fresh = _conn({"gen": "fresh"})
     cm._connections["m"] = old
+    persists = _capture_persists(monkeypatch)
 
-    from storage import remote_store
-    persists = []
-
-    def _persist(machine_id, caps):
-        persists.append(dict(caps))
-        # First (stale) persist: simulate the reconnect landing meanwhile.
-        if len(persists) == 1:
-            cm._connections["m"] = fresh
-
-    monkeypatch.setattr(remote_store, "update_machine_capabilities", _persist)
-
+    # Stale report (old connection) queued first…
     await cm.handle_message("m", {"type": "cli_status", "clis": {
         "claude": {"version": "2.1.220", "path": "/usr/bin/claude"},
     }})
+    # …then the reconnect's register-time snapshot for the same machine.
+    cm._connections["m"] = fresh
+    cm.persist_lane("m", "caps", dict(fresh.capabilities))
+    assert await cm.drain_persists()
 
-    assert len(persists) == 2
-    assert persists[1]["gen"] == "fresh"
+    assert persists, "nothing persisted"
+    assert persists[-1][1]["gen"] == "fresh"
+    # Coalescing: the two requests may collapse into one write, but the
+    # stale snapshot can never be the last one written.
+    assert all(c[1]["gen"] == "fresh" for c in persists[-1:])
 
 
 def _app() -> FastAPI:

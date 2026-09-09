@@ -69,6 +69,15 @@ export interface RemoteMachine {
   // on this machine. Empty/absent = all blocked. Defaults to [] at pairing
   // for both admin- and user-paired machines (granted only by explicit toggle).
   device_grants?: string[]
+  // Which browser the browser-control MCP drives on this machine:
+  // 'dedicated' (the per-agent profile, default) or 'own' (the OS user's
+  // signed-in Chrome/Edge/Brave through the Playwright Extension). Only
+  // meaningful while 'browser' is granted; revoking that grant resets it.
+  browser_mode?: 'dedicated' | 'own'
+  // Whether an extension token is stored for own mode (the token itself is
+  // never returned). Without one every session asks for a click in the
+  // browser and unattended sessions cannot use it.
+  browser_extension_token_set?: boolean
   // Proxy-side concurrent-session override. null = use the
   // satellite's own reported recommendation. The satellite still hard-caps
   // at its physical max regardless of this value.
@@ -195,7 +204,9 @@ export const useSetMaxSessions = () => {
 // DEVICE_CAPABILITIES set.
 export const DEVICE_CAPABILITY_INFO: { key: string; label: string; desc: string }[] = [
   { key: 'computer', label: 'Computer control', desc: 'mouse, keyboard & screen' },
-  { key: 'browser', label: 'Browser control', desc: 'control your local persistent browser' },
+  // The granted row swaps this for the selected mode's description
+  // (components/BrowserModeControls.tsx browserModeDesc).
+  { key: 'browser', label: 'Browser control', desc: 'drive a real browser on this machine' },
   { key: 'app', label: 'App connectors', desc: 'control a running desktop app' },
 ]
 
@@ -222,6 +233,63 @@ export const useSetDeviceGrants = () => {
       }
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['remote-machines'] }),
+  })
+}
+
+// Own-browser mode + extension token. One hook each for both grant UIs:
+// `scope` picks the admin route (admin-paired machines) or the owner route
+// (the caller's user-paired machines) and the machine list to refresh.
+export type MachineScope = 'admin' | 'me'
+const machinePath = (scope: MachineScope, machineId: string) =>
+  scope === 'admin'
+    ? `/v1/admin/remote-machines/${machineId}`
+    : `/v1/users/me/remote-machines/${machineId}`
+const machinesKey = (scope: MachineScope) =>
+  scope === 'admin' ? ['remote-machines'] : ['my-remote-machines']
+
+export const useSetBrowserMode = (scope: MachineScope) => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (
+      { machineId, mode }: { machineId: string; mode: 'dedicated' | 'own' },
+    ) => {
+      const res = await apiFetch(`${machinePath(scope, machineId)}/browser-mode`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode }),
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: 'Failed' }))
+        throw new Error(err.detail || 'Failed to update the browser mode')
+      }
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: machinesKey(scope) }),
+  })
+}
+
+// `token: null` forgets the stored token.
+export const useSetBrowserToken = (scope: MachineScope) => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (
+      { machineId, token }: { machineId: string; token: string | null },
+    ) => {
+      const res = await apiFetch(
+        `${machinePath(scope, machineId)}/browser-token`,
+        token === null
+          ? { method: 'DELETE' }
+          : {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token }),
+          },
+      )
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: 'Failed' }))
+        throw new Error(err.detail || 'Failed to update the extension token')
+      }
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: machinesKey(scope) }),
   })
 }
 

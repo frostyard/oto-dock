@@ -80,10 +80,28 @@ class UserContext:
     # session-JWT callers (agent subprocesses); empty for master key and
     # dashboard cookie sessions.
     agent: str = ""
+    # External routes (``core/session/external_identity.py``): the session
+    # token's ``ext`` claim — ``"<channel>:<id>"``, id-less ``"<channel>:"``
+    # or ``"<channel>:ephemeral:<sid>"`` — set on every phone-minted token.
+    # ``external_channel`` / ``external_id`` are its parsed parts (id "" when
+    # withheld or shared). See ``is_external``.
+    external_claim: str = ""
+    external_channel: str = ""
+    external_id: str = ""
 
     @property
     def is_admin(self) -> bool:
         return self.role == "admin"
+
+    @property
+    def is_external(self) -> bool:
+        """True for a session on an external route whose caller is NOT a
+        platform user (the token carries ``ext`` and no real ``user_sub``).
+        Such a principal reaches only the endpoints its tools use
+        (``auth/external_endpoints.py``), never delegates, and has no shared
+        memory. A route tied to a platform user mints ``ext`` too (audit
+        trail) but its caller IS that user — not external."""
+        return bool(self.external_claim) and self.is_no_user_session
 
     @property
     def kind(self) -> PrincipalKind:
@@ -372,6 +390,7 @@ async def get_current_user(request: Request) -> UserContext | None:
                 sid = session_payload.get("sid") or ""
                 agent_name = session_payload.get("agent") or ""
                 user_sub = session_payload.get("user_sub") or ""
+                ext = _parse_external_claim(session_payload.get("ext") or "")
                 if user_sub:
                     user = task_store.get_user(user_sub)
                     if user:
@@ -388,6 +407,7 @@ async def get_current_user(request: Request) -> UserContext | None:
                             is_api_key=True,
                             session_id=sid,
                             agent=agent_name,
+                            **ext,
                         )
                 # No-user session (phone / trigger / scheduled agent-scope /
                 # meeting service): a low-privilege agent principal. NOT admin —
@@ -404,6 +424,7 @@ async def get_current_user(request: Request) -> UserContext | None:
                     is_api_key=True,
                     session_id=sid,
                     agent=agent_name,
+                    **ext,
                 )
 
     # 2. Session cookie → decode JWT → fetch user from DB
@@ -436,6 +457,25 @@ async def get_current_user(request: Request) -> UserContext | None:
                 )
 
     return None
+
+
+def _parse_external_claim(claim: str) -> dict[str, str]:
+    """``UserContext`` kwargs for a session token's ``ext`` claim. A malformed
+    claim (the proxy signed it, so that is a bug) is logged and treated as
+    absent — the token then has no external standing at all."""
+    if not claim:
+        return {}
+    try:
+        from core.session.external_identity import parse_claim
+        channel, ident, _ephemeral = parse_claim(claim)
+    except ValueError:
+        logger.error("Session token carries a malformed external claim: %r", claim)
+        return {}
+    return {
+        "external_claim": claim,
+        "external_channel": channel,
+        "external_id": ident,
+    }
 
 
 # --- Permission helpers ---

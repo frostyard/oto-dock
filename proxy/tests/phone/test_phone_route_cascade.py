@@ -101,6 +101,20 @@ def test_create_inbound_provisions_and_persists(cascade):
     assert ("provision", body["id"]) in state.calls
 
 
+def test_create_ignores_the_client_role(cascade):
+    """The per-route role selector was removed (2026-09-08): callers are
+    always viewers, so a ``role`` from an older client is accepted and
+    written as viewer."""
+    client, _state = cascade
+    s = _verified_server(client)
+    r = client.post("/v1/admin/phone/routes", json={
+        "direction": "inbound", "name": "main", "agent": "pa",
+        "did": "+30212", "phone_server_id": s["id"], "role": "manager",
+    })
+    assert r.status_code == 200, r.text
+    assert r.json()["role"] == "viewer"
+
+
 def test_create_on_unverified_server_409(cascade):
     client, state = cascade
     s = client.post("/v1/admin/phone-servers", json={"name": "pbx"}).json()  # pending

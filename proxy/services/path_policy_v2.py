@@ -161,6 +161,7 @@ _WINDOWS_DRIVE_RE = re.compile(r"^([a-zA-Z]):[\\/]")
 # treated identically (handled in the classifier).
 _SANDBOX_VIRTUAL_SEGMENTS = (
     "users", "workspace", "knowledge", "config", "screenshots",
+    "caller",   # an external caller's tree (local sessions only — never synced)
 )
 
 # Schemes / prefixes that mean "definitely NOT a filesystem path".
@@ -338,18 +339,11 @@ def _is_session_runtime_path(normalized: str, ctx: PathPolicyContext) -> bool:
     root) can never name this session's UUID. Widening-only — callers MUST
     run the credential / agent-config / cross-user / .env denies first.
     """
-    root = ctx.claude_runtime_root
-    sid = ctx.cli_session_id
-    if not root or not sid:
-        return False
-    if not _is_under(normalized, root, ctx.target_os):
-        return False
-    c = _normalize_for_compare(normalized, ctx.target_os).rstrip("/")
-    p = _normalize_for_compare(root, ctx.target_os).rstrip("/")
-    rel = c[len(p):].strip("/")
-    if not rel:
-        return False  # the root itself is not the session's tree
-    return sid.lower() in rel.split("/")
+    from services import path_roles  # lazy — mirrors the other path_roles uses
+    return path_roles.is_session_runtime_path(
+        normalized, ctx.claude_runtime_root, ctx.cli_session_id,
+        case_insensitive=ctx.target_os in ("windows", "darwin"),
+    )
 
 
 def _virtual_to_satellite_host(

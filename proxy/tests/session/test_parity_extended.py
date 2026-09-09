@@ -556,7 +556,7 @@ def test_codex_effort_collapses_xhigh_and_max():
     assert map_effort_to_codex("xhigh") == "xhigh"
     assert map_effort_to_codex("max") == "xhigh"  # pre-5.6 collapse
     assert map_effort_to_codex("max", "gpt-5.6-sol") == "max"  # 5.6 unlock
-    assert map_effort_to_codex("ultra", "gpt-5.6-sol") == "ultra"  # Sol/Terra only
+    assert map_effort_to_codex("ultra", "gpt-5.6-sol") == "ultra"  # Sol/Terra/Astra
     assert map_effort_to_codex("ultra", "gpt-5.6-luna") == "max"  # Luna ceiling
 
 

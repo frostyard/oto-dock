@@ -66,3 +66,17 @@ def clear(agent_slug: str, rel_path: str) -> None:
             "DELETE FROM file_author WHERE agent_slug=%s AND rel_path=%s",
             (agent_slug, rel_path),
         )
+
+
+def purge_prefix(agent_slug: str, rel_prefix: str) -> int:
+    """Forget every author row under a directory prefix (a removed caller
+    tree — services/infra/external_retention.py). Returns rows removed."""
+    from storage.file_tombstones_store import _like_prefix
+    with get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM file_author WHERE agent_slug=%s "
+            "AND rel_path LIKE %s ESCAPE '\\'",
+            (agent_slug, _like_prefix(rel_prefix)),
+        )
+        conn.commit()
+        return cur.rowcount

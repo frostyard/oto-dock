@@ -36,6 +36,10 @@ from ..sessions.codex_session import (
     _validate_config_toml, _write_codex_hook_scripts, _write_codex_hooks,
 )
 from ..config import otodock_dir
+from ..sessions.codex_session import (
+    CODEX_TOOLS_TABLE, chmod_private, local_provider_toml, write_or_drop_auth_json,
+    write_or_drop_model_catalog,
+)
 from .pty_session_base import BasePtySession
 
 logger = logging.getLogger("satellite")
@@ -65,7 +69,10 @@ def _read_session_meta(path: str) -> dict | None:
     return None
 
 
-def _build_codex_config_toml(trusted_cwd: str, mcp_toml: str) -> str:
+def _build_codex_config_toml(
+    trusted_cwd: str, mcp_toml: str, local_provider: "dict | None" = None,
+    codex_dir: "Path | None" = None,
+) -> str:
     """Build the interactive `codex` config.toml — satellite twin of the proxy's
     ``core.layers.codex.layer._write_config_toml(interactive=True, trusted_cwd=…)``.
 
@@ -75,6 +82,11 @@ def _build_codex_config_toml(trusted_cwd: str, mcp_toml: str) -> str:
       - ``check_for_update_on_startup`` off — the TUI's update prompt would break the
         version pin (`npm install -g` on Enter); ``suppress_unstable_features_warning``
         pairs with the request_user_input feature flag below;
+      - ``model_provider = "oto_local"`` + ``[model_providers.oto_local]`` — ONLY when
+        the start payload carries ``local_model_provider`` (a local OpenAI-compatible
+        endpoint; see ``local_provider_toml``; with a ``catalog_json`` also the root
+        ``model_catalog_json`` key pointing at ``<codex_dir>/models.json``). The root
+        keys sit with the other root keys, the table after ``[projects]``;
       - ``[memories]`` off — the otodock memory system is the single source of truth;
       - ``[features] plugins = false`` — skip Codex's curated-plugins startup sync (lean-start);
       - ``[features] hooks = true`` — run the PreToolUse ``permission_gate`` FLOOR (the
@@ -85,6 +97,7 @@ def _build_codex_config_toml(trusted_cwd: str, mcp_toml: str) -> str:
         (Windows codex may normalise to forward slashes; the set collapses to one on Unix).
     KEEP IN SYNC with the proxy's ``_write_config_toml``.
     """
+    root_line, provider_table = local_provider_toml(local_provider, codex_dir)
     parts = [
         "project_doc_max_bytes = 300000",
         # Root keys stay above the first [table] header. check_for_update
@@ -93,6 +106,10 @@ def _build_codex_config_toml(trusted_cwd: str, mcp_toml: str) -> str:
         # warning our request_user_input flag would otherwise print.
         "check_for_update_on_startup = false",
         "suppress_unstable_features_warning = true",
+    ]
+    if root_line:
+        parts.append(root_line)
+    parts += [
         "[memories]",
         "use_memories = false",
         "generate_memories = false",
@@ -103,12 +120,17 @@ def _build_codex_config_toml(trusted_cwd: str, mcp_toml: str) -> str:
         # TUI only — this builder never serves headless); the proxy-side
         # rollout tailer folds the pending call to a question-parked turn.
         "default_mode_request_user_input = true",
+        # Codex 0.152.0 made update_plan opt-in — keep the plan tool on
+        # (twin of the proxy's _CODEX_TOOLS_TABLE and the headless writer).
+        CODEX_TOOLS_TABLE,
     ]
     if trusted_cwd:
         for key in {trusted_cwd, trusted_cwd.replace("\\", "/")}:
             esc = key.replace("\\", "\\\\").replace('"', '\\"')
             parts.append(f'[projects."{esc}"]')
             parts.append('trust_level = "trusted"')
+    if provider_table:
+        parts.append(provider_table)
     if mcp_toml.strip():
         # The remote ``startup_timeout_sec`` floor (and per-MCP overrides for
         # heavy servers like google-workspace) is applied PROXY-side in
@@ -217,15 +239,16 @@ class CodexPtySession(BasePtySession):
         # hooks FLOOR, and the cwd-trust that skips Codex's "Do you trust this
         # directory?" prompt) is added here, keyed by the SATELLITE-absolute cwd.
         # Needed even with no MCP servers.
-        config_toml_text = _build_codex_config_toml(str(self._cwd), toml_content)
+        local_provider = self.config.get("local_model_provider")
+        config_toml_text = _build_codex_config_toml(
+            str(self._cwd), toml_content,
+            local_provider=local_provider, codex_dir=self._codex_dir,
+        )
         _validate_config_toml(config_toml_text, self._codex_dir / "config.toml")
+        write_or_drop_model_catalog(self._codex_dir, local_provider)
         (self._codex_dir / "config.toml").write_text(config_toml_text)
-        auth_json = self.config.get("auth_json")
-        if auth_json:
-            auth_path = self._codex_dir / "auth.json"
-            auth_path.write_text(json.dumps(auth_json, indent=2))
-            # Live OAuth tokens — owner-only (multi-user satellite host).
-            auth_path.chmod(0o600)
+        chmod_private(self._codex_dir / "config.toml")
+        write_or_drop_auth_json(self._codex_dir, self.config.get("auth_json"))
         _write_codex_hooks(self._codex_dir)
 
         # --- env (mirror CodexSession + the bare-TUI interactive vars) --------

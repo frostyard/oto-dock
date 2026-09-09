@@ -3,7 +3,7 @@
   "server_name": "display",
   "label": "Display",
   "description": "Display images, files, audio, video, and URLs in chat",
-  "version": "1.13.0",
+  "version": "1.13.2",
   "category": "core",
 
   "server": {
@@ -22,7 +22,7 @@
   "env": {},
   "agent_env": {},
 
-  "exclude_from": ["phone", "terminal"],
+  "exclude_from": ["phone", "terminal", "external"],
 
   "tool_arg_paths": {
     "display_images": {

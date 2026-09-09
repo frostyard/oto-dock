@@ -266,6 +266,21 @@ if not PHONE_API_SECRET:
 # honoured ONLY from those hops.
 TRUSTED_PROXIES = [s.strip() for s in _cfg("TRUSTED_PROXY", "").split(",") if s.strip()]
 
+# Event-loop stall watchdog (core/loop_watchdog.py): a daemon thread logs the
+# loop thread's stack when the loop stops ticking for longer than this many
+# seconds, and counts stalls for GET /health ``loop``. 0 disables it. Added
+# after the 2026-09-03 stall, whose blocking frame had to be reconstructed
+# from health-probe gaps because nothing in the frozen window was logged.
+LOOP_WATCHDOG_THRESHOLD_S = float(_cfg("LOOP_WATCHDOG_THRESHOLD_S", "2.0") or 0)
+
+# Per-sandbox cap on the RAM-backed ``/tmp`` tmpfs (bwrap ``--size``), in MB.
+# ``/tmp`` is the agent's HOME (package caches, model downloads) and the CLI's
+# runtime root; every local sandbox has its own, so an uncapped fleet can
+# commit N × RAM/2. Bounded by half the host's RAM at use (never looser than
+# the kernel default); 0 disables; ignored where bubblewrap lacks ``--size``
+# (0.6.1). See core/sandbox/sandbox.py::tmpfs_cap_mb.
+SANDBOX_TMP_SIZE_MB = int(_cfg("SANDBOX_TMP_SIZE_MB", "4096") or 0)
+
 # Universal per-file size cap: ONE knob for the satellite sync engine (manifest
 # + push/pull legs) AND every dashboard/chat upload (both hit POST /v1/upload).
 # Satellites learn the sync cap via the auth_result policy handshake — the proxy
@@ -591,7 +606,8 @@ def _scan_workspace(agent_dir: Path, agent_name: str, *,
                     username: str | None = None,
                     role: str = "manager",
                     sandboxed: bool = True,
-                    mount_shared: bool = True) -> str | None:
+                    mount_shared: bool = True,
+                    external_home: str = "") -> str | None:
     """Scan an agent's directories and return a formatted tree.
 
     Returns ``None`` if no folder is visible to this session. Otherwise
@@ -662,6 +678,10 @@ def _scan_workspace(agent_dir: Path, agent_name: str, *,
         rendered_bytes += len(line) + 1
         _walk(root, 1, 1)
 
+    # An external caller's own tree (mounted at /caller) comes first.
+    if external_home:
+        for sub in ("workspace", "context"):
+            _emit_root(f"/caller/{sub}/", Path(external_home) / sub)
     # Agent-scope (no username): /workspace/ + /knowledge/
     if not username:
         _emit_root("/workspace/", agent_dir / "workspace")
@@ -741,12 +761,18 @@ def _render_memory_scope(root, *, virtual: str, budget: int,
 
 
 def _render_memory_sections(model: str, agent_dir: Path, *,
-                            username: str | None, role: str) -> str | None:
+                            username: str | None, role: str,
+                            external: bool = False,
+                            external_home: str = "") -> str | None:
     """The `# Memory` prompt section: capture directive + per-scope content.
 
     Scope loading matrix: user-scoped sessions get agent + user memory;
     agent-scoped sessions (no username) get agent memory only. A viewer's
-    agent scope is read-only. Returns None when memory is fully disabled.
+    agent scope is read-only. An EXTERNAL session (a phone caller who is not
+    a platform user) never gets the agent memory; with a caller tree
+    (``external_home``) the caller's own memory is its user scope — same
+    toggles and mode clamp as a user's. Returns None when memory is fully
+    disabled.
     """
     from services.memory import memory_file
     from storage import agent_store, memory_store
@@ -766,9 +792,10 @@ def _render_memory_sections(model: str, agent_dir: Path, *,
         settings.get("agent_memory_enabled")
         and toggles.get("agent_memory_enabled")
         and _mode_agent_ok
+        and not external
     )
     user_enabled = bool(
-        username
+        (external_home if external else username)
         and settings.get("user_memory_enabled")
         and toggles.get("user_memory_enabled")
         and _mode_user_ok
@@ -795,7 +822,13 @@ def _render_memory_sections(model: str, agent_dir: Path, *,
             "agent: operational facts, conventions, workflows, shared "
             "project state."
         )
-    if user_enabled:
+    if user_enabled and external:
+        scope_lines.append(
+            "- `/memories/user/` — private to this caller: their "
+            "preferences, context, facts about them. Nothing else on this "
+            "line is remembered."
+        )
+    elif user_enabled:
         scope_lines.append(
             f"- `/memories/user/` — private to {username}: their "
             "preferences, context, facts about them."
@@ -839,7 +872,14 @@ def _render_memory_sections(model: str, agent_dir: Path, *,
             )
             + "\n"
         )
-    if user_enabled:
+    if user_enabled and external:
+        root = Path(external_home) / "context" / "memory"
+        parts.append(
+            "\n## Caller memory (private to this caller)\n\n"
+            + _render_memory_scope(root, virtual="/memories/user", budget=budget)
+            + "\n"
+        )
+    elif user_enabled:
         root = memory_file.scope_root(agent_dir, "user", username)
         parts.append(
             f"\n## User memory ({username})\n\n"
@@ -944,8 +984,20 @@ def build_agent_prompt(model: str, *,
                        is_remote: bool = False,
                        target_has_display: bool | None = None,
                        target_device_grants: set[str] | None = None,
-                       mount_shared: bool = True) -> str | None:
+                       mount_shared: bool = True,
+                       execution_path: str = "",
+                       skip_http_mcps: bool = False,
+                       external: bool = False,
+                       external_home: str = "") -> str | None:
     """Build the full system prompt for an agent.
+
+    ``external`` = an EXTERNAL session (a phone caller who is not a platform
+    user): the MCP catalog, the inline skills and the skill catalog drop the
+    MCPs such a session never attaches (``mcp_registry.session_exclusion_reason``),
+    the "Unavailable Tools" list omits the external rules themselves, and the
+    shared agent memory is never injected. ``external_home`` (the caller's
+    own tree, mounted at /caller) makes the caller's memory the user scope
+    and auto-loads the caller's context docs — the per-user shape, re-rooted.
 
     Section order:
 
@@ -954,6 +1006,7 @@ def build_agent_prompt(model: str, *,
       3. ``# Auto-Loaded Documentation`` — ``config/context/*`` knowledge files
       4. ``# Available Tools (MCPs)`` — catalog of enabled MCPs (one-liners)
       5. ``# MCP Tool Skills`` — per-MCP deep-dive docs from manifests
+      5b. ``# Skills`` — on-demand skill catalog (Direct-LLM sessions only)
       6. ``# MCP Dynamic Context`` — runtime-generated context per MCP
       7. ``# User Context (Personal)`` — ``users/{u}/context/*`` personal docs
       8. ``# Workspace`` — live directory tree (role-filtered)
@@ -985,6 +1038,14 @@ def build_agent_prompt(model: str, *,
             run it — i.e. on a satellite that has granted the capability.
             Fail-closed defaults keep ``satellite_only`` / device-capability
             MCPs out of local-session prompts.
+        execution_path: ``"claude-code-cli"`` / ``"codex-cli"`` /
+            ``"direct-llm"`` / ``""``. Only ``"direct-llm"`` changes the
+            output: it appends the ``# Skills`` catalog (the CLI engines index
+            their materialized skills dir themselves).
+        skip_http_mcps: leave sidecar (HTTP-transport) MCPs out of the MCP
+            catalog, the inline skills and the skill catalog — a phone
+            Direct-LLM session never connects them, so the prompt must not
+            describe tools it cannot reach.
     """
     if not is_safe_agent_name(model):
         return None  # unsafe agent name → treat as unknown agent
@@ -1053,6 +1114,8 @@ def build_agent_prompt(model: str, *,
             model, context=client_type or "",
             is_remote=is_remote, target_has_display=target_has_display,
             target_device_grants=target_device_grants,
+            skip_http_mcps=skip_http_mcps,
+            external=external,
         )
         if catalog:
             parts.append("\n\n---\n\n" + catalog)
@@ -1068,6 +1131,8 @@ def build_agent_prompt(model: str, *,
             model, context=client_type or "",
             is_remote=is_remote, target_has_display=target_has_display,
             target_device_grants=target_device_grants,
+            skip_http_mcps=skip_http_mcps,
+            external=external,
         )
         # Only "always" skills inline; "on_demand" skills reach CLI sessions
         # as materialized skill folders (core/sandbox/skills_materializer)
@@ -1084,6 +1149,33 @@ def build_agent_prompt(model: str, *,
             for skill_id, content in inline:
                 parts.append(f"\n{content}")
 
+    # On-demand skill catalog — Direct-LLM sessions only. The CLI engines
+    # index the materialized skills dir themselves (their own Skill tool);
+    # the direct layer has a client-side `Skill` builtin instead, so the
+    # prompt lists what it can load (name + description, one line each).
+    if execution_path == "direct-llm":
+        with contextlib.suppress(Exception):
+            from services.mcp import mcp_registry
+            catalog = mcp_registry.get_skill_catalog_for_agent(
+                model, context=client_type or "",
+                is_remote=is_remote, target_has_display=target_has_display,
+                target_device_grants=target_device_grants,
+                skip_http_mcps=skip_http_mcps,
+                external=external,
+            )
+            if catalog:
+                parts.append(
+                    "\n\n---\n\n"
+                    "# Skills\n\n"
+                    "On-demand skills for this session. Load one with the "
+                    "`Skill` tool (its full instructions come back as the "
+                    "result) before doing that kind of work:\n\n"
+                )
+                parts.append("\n".join(
+                    f"- `{sid}` — {desc}" if desc else f"- `{sid}`"
+                    for sid, desc in catalog
+                ))
+
     # Dynamic MCP context (runtime-generated, only for assigned MCPs)
     if dynamic_contexts:
         parts.append("\n\n---\n\n# MCP Dynamic Context\n")
@@ -1096,15 +1188,25 @@ def build_agent_prompt(model: str, *,
     # _MAX_DOC_BYTES / _MAX_TOTAL_DOC_BYTES pattern in _read_agent_files.
     _USER_CTX_MAX_FILE_BYTES = 256 * 1024     # 256 KB per file
     _USER_CTX_MAX_TOTAL_BYTES = 1024 * 1024   # 1 MB across all user-ctx files
-    if username:
+    # An external caller's context docs (their tree's context/) load the same
+    # way — the per-user shape, re-rooted.
+    user_ctx_dir = None
+    if external_home:
+        user_ctx_dir = Path(external_home) / "context"
+    elif username:
         user_ctx_dir = agent_dir / "users" / username / "context"
+    if user_ctx_dir is not None:
         if user_ctx_dir.is_dir():
             ctx_files = sorted(user_ctx_dir.glob("*.md"))
             if ctx_files:
                 parts.append(
                     "\n\n---\n\n"
-                    "# User Context (Personal)\n\n"
-                    "These personal documents are loaded for the current user only.\n"
+                    + ("# Caller Context\n\n"
+                       "These notes about the current caller are loaded for "
+                       "this caller only.\n"
+                       if external_home else
+                       "# User Context (Personal)\n\n"
+                       "These personal documents are loaded for the current user only.\n")
                 )
                 running_bytes = 0
                 skipped: list[tuple[str, int, str]] = []  # (name, size, reason)
@@ -1144,6 +1246,7 @@ def build_agent_prompt(model: str, *,
     with contextlib.suppress(Exception):
         memory_section = _render_memory_sections(
             model, agent_dir, username=username, role=role,
+            external=external, external_home=external_home,
         )
         if memory_section:
             parts.append(memory_section)
@@ -1159,7 +1262,8 @@ def build_agent_prompt(model: str, *,
 
     # Workspace and user directory listing
     ws_listing = _scan_workspace(agent_dir, model, username=username, role=role,
-                                 sandboxed=sandboxed, mount_shared=mount_shared)
+                                 sandboxed=sandboxed, mount_shared=mount_shared,
+                                 external_home=external_home)
     if ws_listing:
         parts.append(
             "\n\n---\n\n"
@@ -1168,21 +1272,40 @@ def build_agent_prompt(model: str, *,
             f"```\n{ws_listing}\n```\n"
         )
         # Path guidance uses sandbox-relative paths
-        if username:
+        if external_home:
+            parts.append("\nFiles for this caller go to `/caller/workspace/`.")
+            if role != "viewer":
+                parts.append(" Shared output goes to `/workspace/`.")
+        elif external and role == "viewer":
+            parts.append("\nThis session has no writable folder.")
+        elif username:
             parts.append(f"\nUser files go to `/users/{username}/workspace/`.")
             if role != "viewer":
                 parts.append(" Agent-scoped output goes to `/workspace/`.")
         else:
             parts.append("\nAgent-scoped output goes to `/workspace/`.")
 
-    # Excluded MCPs section (tools unavailable in this session)
-    if excluded_mcps:
+    # Excluded MCPs section (tools unavailable in this session). On an
+    # external session the entries that ARE the external rules are left
+    # out: a caller-facing prompt must not enumerate the platform's
+    # management surface (there is nothing the model could "configure").
+    listed_exclusions = dict(excluded_mcps or {})
+    if external and listed_exclusions:
+        with contextlib.suppress(Exception):
+            from services.mcp.mcp_registry import (
+                EXTERNAL_CONTEXT_REASON, EXTERNAL_DENIED_REASON,
+            )
+            listed_exclusions = {
+                k: v for k, v in listed_exclusions.items()
+                if v not in (EXTERNAL_DENIED_REASON, EXTERNAL_CONTEXT_REASON)
+            }
+    if listed_exclusions:
         parts.append(
             "\n\n---\n\n"
             "# Unavailable Tools\n\n"
             "The following MCP servers are NOT available in this session:\n"
         )
-        for mcp_name, reason in sorted(excluded_mcps.items()):
+        for mcp_name, reason in sorted(listed_exclusions.items()):
             parts.append(f"- **{mcp_name}**: {reason}")
         parts.append(
             "\nDo not attempt to use tools from these servers. "
@@ -1237,6 +1360,39 @@ def get_jwt_expiry_hours() -> int:
 # Max output tokens for Direct LLM API responses (all providers).
 DIRECT_LLM_MAX_TOKENS = int(_cfg("DIRECT_LLM_MAX_TOKENS", "8192"))
 
+# The API the OpenAI provider speaks on the Direct LLM path
+# (core/layers/providers/openai_adapter.py): "responses" (default) is the
+# Responses API — reasoning effort together with function tools, streamed
+# reasoning summaries, stateless (store: false); "chat" pins the provider to
+# Chat Completions, where OpenAI rejects effort next to tools (the pre-1.5.1
+# behaviour — an escape hatch, a restart applies it). A custom base URL on
+# the openai provider and the OpenAI-compatible providers (Groq, Ollama,
+# LM Studio, …) always use chat completions regardless.
+DIRECT_LLM_OPENAI_API = _cfg("DIRECT_LLM_OPENAI_API", "responses").strip().lower()
+if DIRECT_LLM_OPENAI_API not in ("responses", "chat"):
+    DIRECT_LLM_OPENAI_API = "responses"
+# Output budget of a Responses request that carries reasoning: there
+# ``max_output_tokens`` INCLUDES the reasoning tokens, so DIRECT_LLM_MAX_TOKENS
+# alone would let a high-effort answer exhaust its budget while thinking. The
+# larger of the two applies; the hosted relay clamps at its own ceiling.
+DIRECT_LLM_OPENAI_REASONING_MAX_TOKENS = int(
+    _cfg("DIRECT_LLM_OPENAI_REASONING_MAX_TOKENS", "32768")
+)
+
+# Deferred tool loading on Direct LLM sessions
+# (core/layers/direct/tool_catalog.py). "auto" (default) keeps the MCP tool
+# schemas out of the request — behind a client-side `tool_search` tool and a
+# compact catalog in the prompt — when the deferrable schemas exceed the
+# threshold (≈ tokens, JSON bytes / 4); "on" always defers; "off" sends every
+# schema on every request (the pre-1.5.1 behaviour). Manifests opt an MCP out
+# of deferral with `always_load: true` (memory-mcp in the bundled set).
+DIRECT_LLM_TOOL_SEARCH = _cfg("DIRECT_LLM_TOOL_SEARCH", "auto").strip().lower()
+if DIRECT_LLM_TOOL_SEARCH not in ("auto", "on", "off"):
+    DIRECT_LLM_TOOL_SEARCH = "auto"
+DIRECT_LLM_TOOL_SEARCH_THRESHOLD_TOKENS = int(
+    _cfg("DIRECT_LLM_TOOL_SEARCH_THRESHOLD_TOKENS", "6000")
+)
+
 # When true, the shared MCP installer will attempt to install missing system
 # packages (libmagic, libreoffice, etc.) via the local package manager using
 # sudo. Default: false — the installer only warns and produces a clear error
@@ -1262,7 +1418,7 @@ MCP_AUTO_INSTALL_SYSTEM_DEPS = _cfg("MCP_AUTO_INSTALL_SYSTEM_DEPS", "").lower() 
 #     supported on Opus 4.7+ (Anthropic, incl. 4.8) and the OpenAI gpt-5 family.
 #     Models without support silently fall back to "max" at wire time via the
 #     failsafe in each execution layer — see get_model_supports_xhigh().
-#   - "ultra" (Codex, gpt-5.6 Sol/Terra only) is max reasoning PLUS Codex-native
+#   - "ultra" (Codex: gpt-5.6 Sol/Terra and GPT-6 Astra) is max reasoning PLUS Codex-native
 #     proactive multi-agent orchestration (parallel sub-agent workstreams inside
 #     one turn). Offered per-model via supports_ultra / get_model_supports_ultra()
 #     and mapped in core/layers/codex/helpers.map_effort_to_codex; every other
@@ -1373,9 +1529,10 @@ MODEL_REGISTRY: dict[str, dict] = {
     # --- OpenAI models ---
     # All gpt-5 family entries set supports_xhigh: True. Effort mapping:
     # pre-5.6 models top out at wire "xhigh" (platform "max" clamps there);
-    # the GPT-5.6 family adds wire "max" — and "ultra" (Sol/Terra only,
-    # supports_ultra below): Codex-native proactive multi-agent orchestration
-    # on top of max reasoning — see core/layers/codex/helpers.map_effort_to_codex.
+    # the GPT-5.6 family and GPT-6 add wire "max" — and "ultra" (Sol/Terra
+    # and Astra, supports_ultra below): Codex-native proactive multi-agent
+    # orchestration on top of max reasoning (Astra delegates at xhigh) — see
+    # core/layers/codex/helpers.map_effort_to_codex.
     #
     # GPT-5.6 family (2026-07-09): Sol = frontier (replaces the retired
     # gpt-5.5 builtin at the same price), Terra = 5.5-class capability at
@@ -1412,12 +1569,38 @@ MODEL_REGISTRY: dict[str, dict] = {
         "supports_xhigh": True,
         "supports_ultra": True,   # Codex "ultra": max reasoning + proactive multi-agent
     },
+    # GPT-6 Astra (2026-09-03; API id gpt-6-astra, no alias, no snapshots): a
+    # NEW model next to the 5.6 family, not a rename — the 5.6 rows stay and
+    # no MODEL_SUCCESSORS entry. OpenAI's flagship and Codex's own bundled
+    # default since 0.153.4; listed SECOND here on purpose so the codex-cli
+    # "Auto" default (registry order) stays on Sol — Astra costs 2.5× Sol on
+    # an API key, and moving every unpinned agent is the operator's call.
+    # Context: the same 272k pricing-tier line as the 5.6 family (1.05M real:
+    # 922k in + 128k out; input beyond 272k bills the whole request at
+    # 2× input / 1.5× output — $20 / $75 there). Prices per 1M verified
+    # 2026-09-08 (developers.openai.com/api/docs/models/gpt-6-astra):
+    # $10 in, $50 out, $12.50 cache write, $1 cached read. codex-cli only for
+    # now: the hosted relay prices per model and has no Astra row yet, so a
+    # direct-llm listing would fail hosted installs — add the layer with the
+    # relay row. Reasoning: low/medium/high/xhigh/max on the API; Codex adds
+    # "ultra" (delegation at xhigh — multi_agent_reasoning_effort — not max).
+    "gpt-6-astra": {
+        "label": "GPT-6 Astra",
+        "provider": "openai",
+        "context_window": 272_000,
+        "pricing": (10.0, 50.0, 12.50, 1.00),  # per 1M: (input, output, cache_write, cache_read)
+        "layers": ["codex-cli"],
+        "supports_reasoning": True,
+        "supports_xhigh": True,
+        "supports_ultra": True,   # Codex "ultra": proactive multi-agent on top of xhigh reasoning
+    },
     "gpt-5.6-terra": {
         "label": "GPT-5.6 Terra",
         "provider": "openai",
         "context_window": 272_000,   # corrected from 1M — see the family window note above
         "pricing": (2.0, 12.0, 2.50, 0.20),  # 2026-07-30 cut ($2.50/$15 → $2/$12), permanent
         "layers": ["codex-cli", "direct-llm"],
+        "server_tools": True,   # OpenAI's built-in web_search (Responses API, direct-llm)
         "supports_reasoning": True,
         "supports_xhigh": True,
         "supports_ultra": True,   # codex-cli only — the dashboard offers Ultra
@@ -1429,10 +1612,11 @@ MODEL_REGISTRY: dict[str, dict] = {
         "context_window": 272_000,   # corrected from 1M — see the family window note above
         "pricing": (0.20, 1.20, 0.25, 0.02),  # 2026-07-30 cut ($1/$6 → $0.20/$1.20, −80%), permanent
         "layers": ["codex-cli", "direct-llm"],
+        "server_tools": True,   # OpenAI's built-in web_search (Responses API, direct-llm)
         "supports_reasoning": True,
         "supports_xhigh": True,
         # No supports_ultra: OpenAI's own model manifest caps Luna (the fast/
-        # cheap tier) at "max" — ultra is a Sol/Terra capability.
+        # cheap tier) at "max" — ultra is a Sol/Terra/Astra capability.
     },
     # (Older GPT-5.x builtins — gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex
     # — were retired with the 5.6 family: the three 5.6 tiers cover the same
@@ -1470,7 +1654,11 @@ MODEL_REGISTRY: dict[str, dict] = {
 
 
 def model_supports_server_tools(model: str) -> bool:
-    """Check if a model supports Anthropic server-side tools (web_search, web_fetch)."""
+    """Whether the Direct LLM engine offers the provider's own server-run tools
+    on this model: Anthropic ``web_search`` / ``web_fetch``
+    (``EXECUTION_PATH_BUILTIN_TOOLS``), OpenAI's built-in ``web_search`` on the
+    Responses API. Registry builtins only — an admin-added model stays False
+    (a custom OpenAI id may be a gateway that rejects the tool)."""
     entry = MODEL_REGISTRY.get(model)
     return entry.get("server_tools", False) if entry else False
 
@@ -1504,8 +1692,8 @@ def get_model_supports_xhigh(model: str) -> bool:
 def get_model_supports_ultra(model: str) -> bool:
     """Return True if the model accepts the platform's "ultra" effort level.
 
-    Ultra is Codex-only (gpt-5.6 Sol/Terra): max reasoning plus Codex-native
-    proactive multi-agent orchestration. Registry-only on purpose — custom
+    Ultra is Codex-only (gpt-5.6 Sol/Terra, GPT-6 Astra): max reasoning plus
+    Codex-native proactive multi-agent orchestration. Registry-only on purpose — custom
     admin-added models have no supports_ultra column (the wire clamp in
     map_effort_to_codex is prefix-based, so a custom "gpt-5.6-sol-*" id still
     maps correctly; the dashboard just won't offer the option). Unknown
@@ -1516,10 +1704,13 @@ def get_model_supports_ultra(model: str) -> bool:
     return bool(entry.get("supports_ultra", False)) if entry else False
 
 
-def get_model_provider(model: str) -> str:
+def get_model_provider(model: str, layer: str = "") -> str:
     """Resolve the provider for a model ID.
 
-    Resolution order: MODEL_REGISTRY → DB execution_layer_models → prefix heuristics.
+    Resolution order: MODEL_REGISTRY → DB execution_layer_models → prefix
+    heuristics. ``layer`` scopes the DB lookup to that layer's rows (a model
+    id discovered on codex-cli lives in codex-cli rows); empty = any layer,
+    first match (usage attribution and titles only know the model id).
     """
     # 1. Check in-memory registry (Anthropic builtins)
     entry = MODEL_REGISTRY.get(model)
@@ -1528,7 +1719,7 @@ def get_model_provider(model: str) -> str:
     # 2. Check DB (dynamically discovered/added models have provider set)
     with contextlib.suppress(Exception):
         from storage import subscription_store
-        db_models = subscription_store.list_models(layer="direct-llm")
+        db_models = subscription_store.list_models(layer=layer or None)
         for m in db_models:
             if m.get("model_id") == model and m.get("provider"):
                 return m["provider"]
@@ -1692,6 +1883,20 @@ _MODEL_REGISTRY_ORDER: dict[str, int] = {
 }
 
 
+def _pool_providers(layer: str) -> set[str]:
+    """Providers with an active platform-pool subscription on ``layer`` (the
+    relay rows count; personal-only accounts do not — they serve one user's
+    chats, and the System Default is an agent-level choice)."""
+    try:
+        from storage import subscription_store
+        return {
+            (s.get("provider") or "")
+            for s in subscription_store.list_platform_pool(layer)
+        } - {""}
+    except Exception:
+        return set()
+
+
 def resolve_agent_model(agent_name: str, layer: str | None = None) -> str:
     """Resolve the effective model for an agent session.
 
@@ -1757,6 +1962,16 @@ def resolve_agent_model(agent_name: str, layer: str | None = None) -> str:
             f"Execution Layers."
         )
 
+    # Prefer a provider the platform pool can actually serve: registry order
+    # alone lands a local-only install on the first builtin (Haiku 4.5 on
+    # direct-llm) and fails with "no credentials". A pool with no providers
+    # (personal accounts only) keeps the plain registry order.
+    configured = _pool_providers(path)
+    if configured:
+        served = [m for m in enabled if (m.get("provider") or "") in configured]
+        if served:
+            enabled = served
+
     def _sort_key(m: dict) -> tuple:
         # Builtins first (is_builtin=True sorts before False via `not`),
         # then within builtins by MODEL_REGISTRY order,
@@ -1795,14 +2010,29 @@ def get_cli_effort(agent_name: str) -> str:
 
 # Execution-path-level builtin tools (server-side Anthropic API tools).
 # Each execution path defines its own available builtin tools.
+#
+# The BASIC tool versions on purpose (decided 2026-09-07): the 2026 versions
+# add "dynamic filtering" — the model writes code that filters the results
+# inside a code-execution sandbox before reading them — which on a chat
+# assistant showed as a pile of code_execution rows (a weather question ran 3
+# searches + 2 fetches through 6 code executions, 41 s, and still answered
+# without live data because fetched weather pages carry no readable forecast).
+# Direct search hands the result snippets straight to the model, the way
+# OpenAI's built-in search does, and needs one step for the same question.
 EXECUTION_PATH_BUILTIN_TOOLS: dict[str, list[dict]] = {
     "direct-llm": [
-        {"type": "web_search_20260209", "name": "web_search"},
-        {"type": "web_fetch_20260209", "name": "web_fetch"},
+        {"type": "web_search_20250305", "name": "web_search"},
+        {"type": "web_fetch_20250910", "name": "web_fetch"},
     ],
     # "claude-code-cli": []  — CLI has its own builtin tools
     # "ollama": []           — future: custom search tools
 }
+
+# What one provider-run web search costs on top of the tokens (USD per search):
+# Anthropic's web_search tool and OpenAI's built-in web_search both list $10 per
+# 1k calls. Added to the per-turn cost by ProviderAdapter.calculate_cost from
+# ProviderUsage.web_search_requests; the hosted relay bills the same fee ×1.25.
+WEB_SEARCH_USD_PER_REQUEST = 0.01
 
 # Direct session idle timeout (seconds) before reaping
 DIRECT_SESSION_TIMEOUT = int(_cfg("DIRECT_SESSION_TIMEOUT", "900"))
@@ -2215,6 +2445,7 @@ OTODOCK_QUOTA_HELPER = _cfg("OTODOCK_QUOTA_HELPER", str(BASE_DIR / "scripts" / "
 # (accounting continues, no enforcement). Inode caps ship but default OFF.
 QUOTA_SHARED_FOLDER_MB_DEFAULT = 15360   # 15 GB — workspace + knowledge + config
 QUOTA_USER_FOLDER_MB_DEFAULT = 2048      # 2 GB  — each users/{username}/
+QUOTA_EXTERNAL_FOLDER_MB_DEFAULT = 1024  # 1 GB  — externals/ (every caller's tree of one agent)
 QUOTA_SHARED_FOLDER_INODES_DEFAULT = 0   # 0 = unlimited (file-count cap default off)
 QUOTA_USER_FOLDER_INODES_DEFAULT = 0
 
@@ -2432,11 +2663,3 @@ _google_redirect_default = (
 GOOGLE_OAUTH_REDIRECT_URI = _cfg(
     "GOOGLE_OAUTH_REDIRECT_URI", _google_redirect_default
 )
-
-# Default role for phone/API-key sessions on non-admin agents.
-# Admin agents always get "admin". Override specific agents here.
-# Agents not listed get the default ("viewer").
-PHONE_AGENT_ROLES: dict[str, str] = {
-    # "personal-assistant": "manager",  # uncomment if phone PA needs workspace writes
-}
-PHONE_DEFAULT_ROLE: str = "viewer"

@@ -114,6 +114,18 @@ _STREAM_GRACE_S = 30
 # tunnel's own client_max_size (128 MB).
 _MAX_STREAM_TIMEOUT_S = 15 * 60
 _MAX_REQUEST_BODY_BYTES = 128 * 1024 * 1024
+# Sweep semantics (2026-09-04): a stream is reaped when it has been IDLE (no
+# frame in either direction) past timeout_s + grace — a long-lived MCP
+# streamable-HTTP GET that keeps delivering is never cut (the old rule cut
+# every such stream at the 15-min clamp: "swept leaked stream" every ~15 min
+# on any machine with tunneled HTTP MCPs) — or when it is older than the
+# absolute cap regardless of activity. Reaping now CLOSES the upstream
+# response (cancels the dispatch task) instead of only forgetting the entry,
+# so a reaped stream can no longer hold one of the shared httpx client's
+# connections. A per-machine open-stream cap protects that pool (hook
+# callbacks share it) from a satellite that never sends EOF.
+_STREAM_MAX_AGE_S = 24 * 3600
+_MAX_OPEN_STREAMS_PER_MACHINE = 64
 
 
 class _BodyTooLarge(Exception):
@@ -262,6 +274,14 @@ class _HttpStream:
     timeout_s: int = 30
     created_at: float = field(default_factory=time.monotonic)
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # Last frame in EITHER direction (request chunk in, response chunk out)
+    # — the sweeper's idle clock.
+    last_activity: float = field(default_factory=time.monotonic)
+    # Set while the upstream httpx response is open (diagnostics / tests).
+    upstream_open: bool = False
+    # The dispatch task — cancelled by reap/abort so the upstream response is
+    # actually closed, not merely forgotten.
+    task: asyncio.Task | None = None
 
 
 class SatelliteHttpTunnelDispatcher:
@@ -358,10 +378,22 @@ class SatelliteHttpTunnelDispatcher:
                     error="stream-id-collision", body_eof=True,
                 )
                 return
+            open_here = sum(1 for k in self._streams if k[0] == machine_id)
+            if open_here >= _MAX_OPEN_STREAMS_PER_MACHINE:
+                logger.warning(
+                    "tunnel: machine %s has %d open streams — refusing %s",
+                    machine_id[:8], open_here, stream_id[:8],
+                )
+                await self._send_response(
+                    manager, machine_id, stream_id,
+                    status=503, headers={}, body=b"",
+                    error="too-many-streams", body_eof=True,
+                )
+                return
             self._streams[key] = stream
 
         # Run the dispatch in the background so the main message loop returns.
-        asyncio.create_task(
+        stream.task = asyncio.create_task(
             self._dispatch(manager, machine_id, stream_id, stream, msg),
             name=f"tunnel-dispatch-{stream_id[:8]}",
         )
@@ -376,6 +408,7 @@ class SatelliteHttpTunnelDispatcher:
                 stream_id[:8],
             )
             return
+        stream.last_activity = time.monotonic()
         try:
             stream.request_chunks.put_nowait(msg)
         except asyncio.QueueFull:
@@ -384,23 +417,46 @@ class SatelliteHttpTunnelDispatcher:
                 stream_id[:8],
             )
 
+    def _reap(self, key: tuple[str, str]) -> "_HttpStream | None":
+        """Forget a stream AND close it: set the cancel flag (the chunk loop
+        checks it) and cancel the dispatch task so its finally closes the
+        upstream httpx response now, not whenever upstream next speaks."""
+        stream = self._streams.pop(key, None)
+        if stream is None:
+            return None
+        stream.cancel_event.set()
+        task = stream.task
+        if task is not None and not task.done():
+            task.cancel()
+        return stream
+
+    def abort_stream(self, machine_id: str, stream_id: str) -> bool:
+        """Satellite ``http_abort``: its local client went away (hook script
+        or MCP client disconnected). Close our side at once instead of
+        holding the upstream until the sweep. Returns True if a stream was
+        open."""
+        stream = self._reap((machine_id, stream_id))
+        if stream is None:
+            return False
+        logger.debug(
+            "tunnel: stream %s aborted by machine %s", stream_id[:8], machine_id[:8],
+        )
+        return True
+
     async def cancel_machine_streams(
         self, manager, machine_id: str,
     ) -> None:
-        """Fail every pending stream for a machine with synthetic 502.
+        """Close every pending stream for a machine.
 
-        Called from SatelliteConnectionManager.deregister so subprocesses
-        get a clean failure instead of hanging until timeout.
+        Called from SatelliteConnectionManager.deregister. No response frame
+        is sent — the WS is going away; the satellite side fails its handlers
+        locally via LocalTunnelServer.fail_all_streams(). The dispatch tasks
+        ARE cancelled so their upstream responses close instead of lingering
+        until upstream next speaks.
         """
         keys = [k for k in list(self._streams.keys()) if k[0] == machine_id]
         for key in keys:
-            stream = self._streams.pop(key, None)
-            if stream is None:
-                continue
-            stream.cancel_event.set()
-            # No response is sent here — the WS is going away. The satellite
-            # side will see the WS close and fail its handlers locally via
-            # the LocalTunnelServer.fail_all_streams() path.
+            self._reap(key)
 
     # --- Dispatch implementation ---
 
@@ -503,6 +559,9 @@ class SatelliteHttpTunnelDispatcher:
                 )
                 return
 
+            stream.upstream_open = True
+            stream.last_activity = time.monotonic()
+
             # Forward response status + headers (strip hop-by-hop).
             resp_headers = {
                 k: v for (k, v) in resp.headers.items()
@@ -554,6 +613,7 @@ class SatelliteHttpTunnelDispatcher:
                         break
                     if not chunk:
                         continue
+                    stream.last_activity = time.monotonic()
                     for i in range(0, len(chunk), _MAX_FRAME_BODY):
                         await self._send_chunk(
                             manager, machine_id, stream_id,
@@ -577,7 +637,10 @@ class SatelliteHttpTunnelDispatcher:
             finally:
                 # Final EOF marker — flushes claude-code's HTTP reader on both a
                 # clean end and an early upstream drop. Guarded so a send failure
-                # (conn already gone) can't mask the close.
+                # (conn already gone) can't mask the close. Runs on
+                # cancellation too (reap / abort / machine disconnect), which
+                # is what actually releases the upstream connection.
+                stream.upstream_open = False
                 try:
                     await self._send_chunk(
                         manager, machine_id, stream_id,
@@ -661,8 +724,28 @@ class SatelliteHttpTunnelDispatcher:
             "body_eof": body_eof,
         })
 
+    def _sweep_once(self, now: float | None = None) -> list[tuple[str, str]]:
+        """One sweep pass (also the unit under test): reap streams IDLE past
+        their declared timeout + grace, or older than the absolute cap.
+        Returns the reaped keys."""
+        now = time.monotonic() if now is None else now
+        expired = []
+        for key, stream in list(self._streams.items()):
+            idle = now - max(stream.created_at, stream.last_activity)
+            age = now - stream.created_at
+            if age > _STREAM_MAX_AGE_S or idle > stream.timeout_s + _STREAM_GRACE_S:
+                expired.append(key)
+        for key in expired:
+            machine_id, stream_id = key
+            self._reap(key)
+            logger.warning(
+                "tunnel: swept leaked stream %s on machine %s",
+                stream_id[:8], machine_id[:8],
+            )
+        return expired
+
     async def _sweep_leaked_streams(self) -> None:
-        """Force-fail streams that haven't seen EOF past their declared timeout.
+        """Force-fail streams that go idle past their declared timeout.
 
         Defense against bad satellite implementations that send a request
         and never send EOF. Without this, _streams would grow unbounded.
@@ -670,20 +753,7 @@ class SatelliteHttpTunnelDispatcher:
         try:
             while True:
                 await asyncio.sleep(_STREAM_SWEEP_INTERVAL)
-                now = time.monotonic()
-                expired = []
-                for key, stream in list(self._streams.items()):
-                    if now - stream.created_at > stream.timeout_s + _STREAM_GRACE_S:
-                        expired.append(key)
-                for key in expired:
-                    machine_id, stream_id = key
-                    stream = self._streams.pop(key, None)
-                    if stream is not None:
-                        stream.cancel_event.set()
-                    logger.warning(
-                        "tunnel: swept leaked stream %s on machine %s",
-                        stream_id[:8], machine_id[:8],
-                    )
+                self._sweep_once()
         except asyncio.CancelledError:
             return
 

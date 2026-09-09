@@ -24,6 +24,12 @@ from storage import database as task_store
 
 from api.agents._common import _get_agent_dir
 from api.agents._router import router
+# The write / delete bookkeeping every platform writer shares (tombstones,
+# authorship, library projection, satellite fan-out, recover-bin capture)
+# lives in services/infra/file_bookkeeping — the Direct-LLM builtin file
+# tools run the same sequence through the same module.
+from services.infra import file_bookkeeping
+from services.infra.path_confinement import PathOutsideRoot, resolve_under
 
 logger = logging.getLogger("claude-proxy.agents")
 
@@ -324,9 +330,10 @@ def safe_agent_path(
     if "\x00" in raw_path:
         raise HTTPException(status_code=400, detail="Invalid path")
     norm = _normalize_path(raw_path)  # rejects empty / '.' / '..' segments
-    agent_root = agent_dir.resolve()
-    resolved = (agent_root / norm).resolve()
-    if not resolved.is_relative_to(agent_root):
+    agent_root = Path(os.path.realpath(agent_dir))
+    try:
+        resolved = resolve_under(agent_root / norm, agent_root)
+    except PathOutsideRoot:
         raise HTTPException(status_code=403, detail="Path traversal not allowed")
     rel = resolved.relative_to(agent_root).as_posix()
     _check_oauth_protected(rel)  # OAuth token dirs are off-limits to EVERY principal
@@ -367,77 +374,6 @@ def _check_library_mirror_write(rel: str, agent: str) -> None:
         )
 
 
-async def _record_platform_write(agent_slug: str, rel_path: str, writer: str | None) -> None:
-    """Versioned-sync bookkeeping for a platform-side write: retire any tombstone
-    (the path is live again) and record the author (username slug) for cross-user
-    conflict attribution. Best-effort; runs regardless of remote targets."""
-    from storage import file_tombstones_store, file_author_store
-    await asyncio.to_thread(file_tombstones_store.drop, agent_slug, rel_path)
-    if writer:
-        await asyncio.to_thread(file_author_store.record, agent_slug, rel_path, writer)
-    _schedule_library_projection(agent_slug, rel_path, deleted=False)
-
-
-async def _tombstone_path(agent_slug: str, rel_path: str) -> None:
-    """Record a delete tombstone + forget the author for one platform file path,
-    so an idle satellite APPLIES the delete (never resurrects it) at next sync."""
-    import time as _t
-    from storage import file_tombstones_store, file_author_store
-    await asyncio.to_thread(
-        file_tombstones_store.record, agent_slug, rel_path, _t.time(), origin="dashboard",
-    )
-    await asyncio.to_thread(file_author_store.clear, agent_slug, rel_path)
-    _schedule_library_projection(agent_slug, rel_path, deleted=True)
-
-
-def _schedule_library_projection(agent_slug: str, rel_path: str, *, deleted: bool) -> None:
-    """Fire-and-forget knowledge-library projection for a dashboard write /
-    delete (rename and move decompose into exactly these two): a promoted
-    source's knowledge change reaches every consumer mirror; an RW mirror
-    change flows back to its source. Dashboard deletes of RW mirror files
-    are the one EXPLICIT mirror→source delete channel — satellite/absence
-    deletes never propagate (they heal). Cheap no-op off knowledge/."""
-    if not rel_path.startswith("knowledge/"):
-        return
-    from services.knowledge import library_projector
-    parsed = library_projector.parse_library_rel(rel_path)
-    if parsed is not None:
-        src, sub_rel = parsed
-        if not sub_rel:
-            return
-        if deleted:
-            asyncio.create_task(
-                library_projector.propagate_mirror_delete(agent_slug, src, sub_rel))
-        else:
-            asyncio.create_task(
-                library_projector.propagate_mirror_write(agent_slug, src, sub_rel))
-        return
-    knowledge_rel = rel_path[len("knowledge/"):]
-    if knowledge_rel:
-        asyncio.create_task(
-            library_projector.propagate_source_write(
-                agent_slug, knowledge_rel, deleted=deleted))
-
-
-async def _tombstone_subtree(agent_slug: str, agent_dir: "Path", src: "Path") -> None:
-    """Tombstone every file under ``src`` (a file or dir) BEFORE it is deleted /
-    moved / renamed on disk — so an idle satellite removes the old path(s) instead
-    of resurrecting them. Per-file (a directory has no file hash to key on)."""
-    base = agent_dir.resolve()
-    if src.is_file():
-        files = [src]
-    elif src.is_dir():
-        files = [f for f in src.rglob("*") if f.is_file() and not f.is_symlink()]
-    else:
-        return
-    for f in files:
-        try:
-            rel = f.resolve().relative_to(base).as_posix()
-        except (OSError, ValueError):
-            continue
-        await _tombstone_path(agent_slug, rel)
-
-
 def _dashboard_writer(u) -> str | None:
     """The username slug to record as ``file_author`` for a dashboard write, or
     None for an API-key / agent-scope write (no human identity)."""
@@ -445,71 +381,6 @@ def _dashboard_writer(u) -> str | None:
         return None
     from storage import database as task_store
     return task_store.get_username_by_sub(u.sub) or None
-
-
-async def _push_file_write_to_remote(
-    agent_slug: str, rel_path: str, host_path: "Path", *, writer: str | None = None,
-) -> None:
-    """Publish a written/created FILE: record platform authorship + retire any
-    tombstone, then push to active remote sessions so a dashboard edit reaches the
-    satellite immediately — not only at the next end-of-turn manifest sync.
-
-    Routes the push through ``services/remote/workspace_fanout`` so the SAME per-user /
-    per-role isolation that gates session-start sync applies here too: a write
-    under ``users/{alice}/`` or ``config/`` only reaches machines whose active
-    session is allowed to see it. The author/tombstone bookkeeping runs even when
-    no remote session is active (it's platform state, not a push)."""
-    await _record_platform_write(agent_slug, rel_path, writer)
-    from services.remote import workspace_fanout
-    if not workspace_fanout.has_fanout_candidates(agent_slug, rel_path, include_idle=True):
-        return
-    try:
-        content = host_path.read_bytes()
-    except OSError as e:
-        logger.warning("Cannot read %s for satellite push: %s", host_path, e)
-        return
-    await workspace_fanout.fan_out_write(agent_slug, rel_path, content, include_idle=True)
-
-
-async def _push_file_delete_to_remote(agent_slug: str, rel_path: str) -> None:
-    """Push a delete (file or dir) to active remote sessions of this agent, via
-    the isolation-aware fan-out (reaches only allowed machines). The delete
-    tombstone is written separately at the delete source (per file)."""
-    from services.remote import workspace_fanout
-    await workspace_fanout.fan_out_delete(agent_slug, rel_path, include_idle=True)
-
-
-async def _push_tree_write_to_remote(
-    agent_slug: str, root: "Path", agent_dir: "Path", *, writer: str | None = None,
-) -> None:
-    """Publish a written FILE — or every file under a moved/copied DIRECTORY: record
-    platform authorship + retire any tombstone per file, then fan out to active
-    remote sessions so a dashboard move/copy reaches the satellite immediately
-    instead of only at the next manifest sync. Each file is fanned out with
-    per-file isolation; the disk read happens only when a file has an allowed
-    target. Best-effort."""
-    if root.is_file():
-        files = [root]
-    elif root.is_dir():
-        files = [f for f in root.rglob("*") if f.is_file()]
-    else:
-        return
-    from services.remote import workspace_fanout
-    base = agent_dir.resolve()
-    for f in files:
-        try:
-            rel = f.relative_to(base).as_posix()
-        except ValueError:
-            continue
-        await _record_platform_write(agent_slug, rel, writer)
-        if not workspace_fanout.has_fanout_candidates(agent_slug, rel, include_idle=True):
-            continue
-        try:
-            content = f.read_bytes()
-        except OSError as e:
-            logger.warning("Cannot read %s for satellite push: %s", f, e)
-            continue
-        await workspace_fanout.fan_out_write(agent_slug, rel, content, include_idle=True)
 
 
 def _scope_root(path: str) -> str:
@@ -957,7 +828,7 @@ async def restore_recover_bin(
     from storage import recover_bin_store
 
     agent_dir = _get_agent_dir(name)
-    agent_root = agent_dir.resolve()
+    agent_root = Path(os.path.realpath(agent_dir))
     is_edit = u.can_edit_agent(name)
     is_mgr = u.can_manage_agent(name)
     restored: list[dict] = []
@@ -986,10 +857,9 @@ async def restore_recover_bin(
         # would sit ignored next to the live persona).
         if rel_path == "config/prompt.md":
             rel_path = "config/agent.md"
-        dest = (agent_dir / rel_path).resolve()
         try:
-            dest.relative_to(agent_root)
-        except ValueError:
+            dest = resolve_under(agent_root / rel_path, agent_root)
+        except PathOutsideRoot:
             denied.append(entry_id)  # traversal guard (defensive)
             continue
 
@@ -1035,13 +905,13 @@ async def restore_recover_bin(
 
         # Publish it the way EVERY other platform write is published. Doing
         # its own fan-out call meant a restore skipped the rest of
-        # _record_platform_write: the delete tombstone stayed, so an idle
+        # record_platform_write: the delete tombstone stayed, so an idle
         # satellite would re-apply the delete and undo the restore; the
         # author was never recorded; and a restore into an RW library mirror
         # never reached the source, so the next reconcile healed it away.
         # This also picks up include_idle, which the bare call lacked.
         try:
-            await _push_file_write_to_remote(
+            await file_bookkeeping.push_file_write(
                 name, final_rel, dest, writer=_dashboard_writer(u))
         except Exception:
             logger.exception("recover-bin restore publish failed for %s", final_rel)
@@ -1116,7 +986,7 @@ async def write_agent_file(
     logger.info(f"Wrote file: {file_path}")
 
     rel = file_path.relative_to(agent_dir).as_posix()
-    await _push_file_write_to_remote(name, rel, file_path, writer=uname or None)
+    await file_bookkeeping.push_file_write(name, rel, file_path, writer=uname or None)
     return {"status": "saved", "path": rel}
 
 
@@ -1155,7 +1025,7 @@ async def create_agent_file(
 
     logger.info(f"Created file: {file_path}")
     rel = file_path.relative_to(agent_dir).as_posix()
-    await _push_file_write_to_remote(name, rel, file_path, writer=_dashboard_writer(u))
+    await file_bookkeeping.push_file_write(name, rel, file_path, writer=_dashboard_writer(u))
     return {"status": "created", "path": rel}
 
 
@@ -1203,32 +1073,11 @@ async def delete_agent_path(
         raise HTTPException(status_code=404, detail="Path not found")
 
     if target.is_file():
-        rel = target.relative_to(agent_dir.resolve()).as_posix()
-        # Recover-bin: keep a copy of the deleted bytes (best-effort; a manual
-        # dashboard delete is voluntary → no notification). Files above the bin
-        # cap are NOT captured (Windows-Recycle-Bin-style) — don't even read
-        # them, and tell the dashboard so it can warn "cannot be undone".
-        bin_skipped = False
-        try:
-            _size = target.stat().st_size
-        except OSError:
-            _size = 0
-        if _size > config.RECOVER_BIN_MAX_BYTES:
-            bin_skipped = True
-        else:
-            try:
-                _content = target.read_bytes()
-            except OSError:
-                _content = b""
-            if _content:
-                from storage import recover_bin_store
-                await asyncio.to_thread(
-                    recover_bin_store.capture, name, rel, _content, "deleted",
-                )
-        target.unlink()
-        logger.info(f"Deleted file: {target}")
-        await _tombstone_path(name, rel)  # idle satellites apply the delete
-        await _push_file_delete_to_remote(name, rel)
+        # Recover-bin capture + unlink + tombstone + fan-out: the ONE platform
+        # delete sequence (shared with the Direct-LLM Delete tool). Files above
+        # the bin cap are not captured (Windows-Recycle-Bin-style); the
+        # dashboard warns "cannot be undone" from the flag.
+        bin_skipped = await file_bookkeeping.delete_platform_file(name, agent_dir, target)
         return {
             "status": "deleted", "path": req.path, "type": "file",
             "recover_bin_skipped": bin_skipped,
@@ -1239,7 +1088,7 @@ async def delete_agent_path(
             rel = target.relative_to(agent_dir.resolve()).as_posix()
             target.rmdir()
             logger.info(f"Deleted empty directory: {target}")
-            await _push_file_delete_to_remote(name, rel)
+            await file_bookkeeping.push_file_delete(name, rel)
             return {"status": "deleted", "path": req.path, "type": "dir"}
 
         if not req.recursive:
@@ -1306,10 +1155,10 @@ async def delete_agent_path(
                     )
             # Per-file tombstone so an idle satellite removes each path (a dir has
             # no file hash, so the merge can't key a delete on the folder itself).
-            await _tombstone_path(name, _crel)
+            await file_bookkeeping.tombstone_path(name, _crel)
         shutil.rmtree(target)
         logger.info(f"Recursively deleted directory: {target}")
-        await _push_file_delete_to_remote(name, rel)
+        await file_bookkeeping.push_file_delete(name, rel)
         return {
             "status": "deleted", "path": req.path, "type": "dir",
             "recursive": True, "recover_bin_skipped": _bin_skipped,
@@ -1362,18 +1211,18 @@ async def rename_agent_path(
 
     # Tombstone the old path(s) BEFORE the move so an idle satellite removes the
     # source instead of resurrecting it (per-file for a dir rename).
-    await _tombstone_subtree(name, agent_dir, old_path)
+    await file_bookkeeping.tombstone_subtree(name, agent_dir, old_path)
     old_path.rename(new_path)
     logger.info(f"Renamed: {old_path} -> {new_path}")
     # Mirror to active remote sessions: drop the old path; publish the new file(s).
-    await _push_file_delete_to_remote(name, old_path.relative_to(agent_dir.resolve()).as_posix())
+    await file_bookkeeping.push_file_delete(name, old_path.relative_to(agent_dir.resolve()).as_posix())
     if new_path.is_file():
-        await _push_file_write_to_remote(
+        await file_bookkeeping.push_file_write(
             name, new_path.relative_to(agent_dir.resolve()).as_posix(), new_path,
             writer=_dashboard_writer(u),
         )
     else:
-        await _push_tree_write_to_remote(name, new_path, agent_dir, writer=_dashboard_writer(u))
+        await file_bookkeeping.push_tree_write(name, new_path, agent_dir, writer=_dashboard_writer(u))
     return {
         "status": "renamed",
         "old_path": str(old_path.relative_to(agent_dir)),
@@ -1434,16 +1283,16 @@ async def move_agent_paths(
             target = _resolve_conflict(dest_resolved / src_resolved.name)
             # Tombstone the source path(s) BEFORE the move so an idle satellite
             # removes the old location instead of resurrecting it.
-            await _tombstone_subtree(name, agent_dir, src_resolved)
+            await file_bookkeeping.tombstone_subtree(name, agent_dir, src_resolved)
             shutil.move(str(src_resolved), str(target))
             logger.info(f"Moved: {src_resolved} -> {target}")
             # Mirror to active remote sessions: drop the old subtree, push the
             # new one (recursively for directories) so the satellite updates
             # immediately rather than waiting for the next manifest sync.
-            await _push_file_delete_to_remote(
+            await file_bookkeeping.push_file_delete(
                 name, src_resolved.relative_to(agent_dir.resolve()).as_posix(),
             )
-            await _push_tree_write_to_remote(name, target, agent_dir, writer=_dashboard_writer(u))
+            await file_bookkeeping.push_tree_write(name, target, agent_dir, writer=_dashboard_writer(u))
             moved.append({
                 "src": src_norm,
                 "dest": str(target.relative_to(agent_dir)),
@@ -1508,7 +1357,7 @@ async def copy_agent_paths(
             # Mirror to active remote sessions: push the new file/subtree so the
             # satellite sees the copy immediately, not only at the next sync.
             # (Copy keeps the source — no tombstone.)
-            await _push_tree_write_to_remote(name, target, agent_dir, writer=_dashboard_writer(u))
+            await file_bookkeeping.push_tree_write(name, target, agent_dir, writer=_dashboard_writer(u))
             copied.append({
                 "src": src_norm,
                 "dest": str(target.relative_to(agent_dir)),

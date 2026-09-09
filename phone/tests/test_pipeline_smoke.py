@@ -111,6 +111,97 @@ def test_opening_not_complete_proceeds_to_listen(make_pipeline):
     assert p.stt.recovered == ["en"]  # recover_after_opening(language="en")
 
 
+# ── Outbound: adopting the pre-warmed backend ────────────────────────────
+
+def _cfg(**settings):
+    from config_manager import ConfigManager
+    cfg = ConfigManager()
+    cfg.load({"settings": {k: str(v) for k, v in settings.items()}, "routes": []})
+    return cfg
+
+
+def test_waits_for_a_running_pregen_and_adopts_its_connection(make_pipeline):
+    """The callee answers while the opening is still being generated (a slow
+    local model): the pipeline WAITS for it and adopts the connection that
+    generated it — it never sends the task prompt a second time on that
+    session (live-hit 2026-09-07: the old 15 s fallback did, and the model
+    hung up on its second answer)."""
+    call = FakeCall(opening_ready=False)
+    pw = FakeLLM(llm_mode="proxy", session_id="s1")
+    p = make_pipeline(
+        route=make_route(direction="outbound"),
+        call_manager=FakeCallManager(call),
+        outbound_call_id="c1",
+        cfg=_cfg(opening_pregen_timeout_s="5"),
+    )
+
+    async def _pregen():
+        await asyncio.sleep(0.3)
+        call.opening_text = "Γεια σου Δημήτρη!"
+        call.warmup_client = pw
+        call._opening_ready.set()
+
+    async def run():
+        call.pregen_task = asyncio.create_task(_pregen())
+        return await p._adopt_prewarmed_backend()
+
+    assert asyncio.run(run()) is pw
+    assert call.warmup_client is None            # ownership moved to the pipeline
+    assert call.opening_text == "Γεια σου Δημήτρη!"
+    assert pw.prompts == []                      # nothing was re-sent
+    # Silent wait: no filler / pre-recorded audio reaches the line before
+    # the agent's own opening.
+    assert p.conn.sent_audio == [] and p.tts.text_chunks == []
+
+
+def test_pregen_timeout_cancels_it_and_falls_back(make_pipeline):
+    """A pre-generation that outlives the bound is CANCELLED before the live
+    fallback runs, so the session never carries two opening prompts."""
+    call = FakeCall(opening_ready=False)
+    cancelled = []
+    p = make_pipeline(
+        route=make_route(direction="outbound"),
+        call_manager=FakeCallManager(call),
+        outbound_call_id="c1",
+        cfg=_cfg(opening_pregen_timeout_s="0.3"),
+    )
+
+    async def _pregen():
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            call._opening_ready.set()            # the real task's finally does this
+            raise
+
+    async def run():
+        call.pregen_task = asyncio.create_task(_pregen())
+        return await p._adopt_prewarmed_backend()
+
+    assert asyncio.run(run()) is None
+    assert cancelled == [True]
+    assert call.warmup_client is None and call.opening_text is None
+    assert call._opening_ready.is_set()          # the opening step falls back at once
+
+
+def test_ready_pregen_is_adopted_without_waiting(make_pipeline):
+    pw = FakeLLM(llm_mode="proxy", session_id="s2")
+    call = FakeCall(opening_text="Hi", warmup_client=pw)
+    p = make_pipeline(
+        route=make_route(direction="outbound"),
+        call_manager=FakeCallManager(call), outbound_call_id="c1",
+    )
+    assert asyncio.run(p._adopt_prewarmed_backend()) is pw
+    # A pre-warmed client in the wrong mode is closed and not adopted.
+    wrong = FakeLLM(llm_mode="direct", session_id="s3")
+    call2 = FakeCall(opening_text="Hi", warmup_client=wrong)
+    p2 = make_pipeline(
+        route=make_route(direction="outbound"),
+        call_manager=FakeCallManager(call2), outbound_call_id="c1",
+    )
+    assert asyncio.run(p2._adopt_prewarmed_backend()) is None
+
+
 # ── Per-route provider resolution────────────────────────────────
 
 def _cfg_with_providers():

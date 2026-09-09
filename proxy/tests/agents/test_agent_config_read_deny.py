@@ -44,6 +44,15 @@ PROTECTED = [
     "/home/x/docker/oto-dock/agents/pa/users/alice/.claude/pa-abc.json",
     # satellite-absolute form
     "/home/frank/.oto-dock/agents/pa/users/alice/.codex/config.toml",
+    # an external caller's tree (a phone caller who is not a platform user):
+    # sandbox-virtual, host, and the ephemeral (withheld-number) host form
+    "/caller/.codex/config.toml",
+    "/caller/.codex/auth.json",
+    "/caller/.claude/settings.json",
+    "/caller/.claude/.credentials.json",
+    "/home/x/agents/pa/externals/phone/302101234567/.codex/config.toml",
+    "/home/x/agents/pa/externals/phone/302101234567/.claude/pa-abc.json",
+    "/home/x/agents/pa/externals/phone/_ephemeral/11111111-2222/.codex/config.toml",
 ]
 
 NOT_PROTECTED = [
@@ -51,6 +60,10 @@ NOT_PROTECTED = [
     "/users/alice/workspace/myrepo/.claude/settings.json",
     "/workspace/myrepo/.codex/config.toml",
     "/home/x/agents/pa/users/alice/workspace/proj/.claude/foo.json",
+    # a caller's own files, and a repo nested in a caller tree
+    "/caller/workspace/notes.md",
+    "/caller/workspace/proj/.claude/settings.json",
+    "/home/x/agents/pa/externals/phone/302101234567/context/memory/topic.md",
     # not a config file
     "/users/alice/.codex/history.jsonl",
     "/users/alice/.claude/projects/transcript.jsonl",

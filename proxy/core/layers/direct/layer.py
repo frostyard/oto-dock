@@ -5,6 +5,7 @@ the DirectSession machinery (core/layers/direct/session.py) — wraps it.
 """
 
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -14,10 +15,14 @@ import config as app_config
 
 from core.events.common_events import (
     CommonEvent,
-    TEXT, TOOL_USE, TOOL_RESULT, DONE, ERROR, SYSTEM, METADATA, CONTEXT_COMPACT,
+    TEXT, THINKING, TOOL_USE, TOOL_RESULT, DONE, ERROR, SYSTEM, METADATA,
+    CONTEXT_COMPACT,
 )
 from core.execution_layer import ExecutionLayer, AgentConfig, LayerCapabilities
-from core.session.session_state import set_session_mode, set_session_security, _record_session_use
+from core.session.session_state import (
+    _record_session_use, cleanup_session_permission_state, register_session_state,
+    set_session_mode,
+)
 from core.layers.direct.session import (
     DirectSession,
     create_direct_session, get_direct_session,
@@ -47,6 +52,10 @@ def direct_event_to_common(event: dict) -> CommonEvent | None:
         if content:
             return CommonEvent(type=TEXT, data={"content": content})
         return None
+
+    if etype == "thinking":
+        # Same phase contract as the Codex translator: start / delta / end.
+        return CommonEvent(type=THINKING, data=data)
 
     if etype == "tool_start":
         return CommonEvent(type=TOOL_USE, data={
@@ -123,6 +132,50 @@ _DIRECT_CAPABILITIES = LayerCapabilities(
 # DirectLLMExecutionLayer
 # ---------------------------------------------------------------------------
 
+def _plain_text(message: dict) -> str:
+    """The visible text of a stored message, whatever provider shape it has:
+    a string content; the ``text`` blocks of a content list (Anthropic blocks
+    and the chat-shape blocks share that shape — images, tool_use /
+    tool_result / thinking / server-tool blocks are dropped); an OpenAI
+    assistant dict's ``content`` string. "" when nothing visible remains."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            b.get("text") for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+            and isinstance(b.get("text"), str)
+        ]
+        return "\n\n".join(p for p in parts if p)
+    return ""
+
+
+def _text_only_history(messages: list[dict]) -> list[dict]:
+    """The history as plain text turns — what a chat keeps when it switches to
+    another provider (the same shape the DB resume builds). Tool calls, tool
+    results, reasoning items and images are provider-shaped and dropped; the
+    user's and the assistant's visible text stays. Consecutive same-role
+    turns (an assistant's text before and after a tool loop) merge, and
+    leading assistant turns go (every provider wants the user to speak
+    first)."""
+    out: list[dict] = []
+    for m in messages:
+        role = m.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        text = _plain_text(m)
+        if not text:
+            continue
+        if not out and role != "user":
+            continue
+        if out and out[-1]["role"] == role:
+            out[-1]["content"] += "\n\n" + text
+        else:
+            out.append({"role": role, "content": text})
+    return out
+
+
 def _rebuild_history_from_db(session, session_id: str, chat_id: str = "") -> None:
     """Reconstruct conversation history from DB chat_messages.
 
@@ -150,6 +203,35 @@ def _rebuild_history_from_db(session, session_id: str, chat_id: str = "") -> Non
         content = m.get("content", "")
         if role in ("user", "assistant") and content:
             rebuilt.append({"role": role, "content": content})
+
+    # Deferred tools the model already discovered in this chat: re-load them
+    # so it can keep calling them without another tool_search. A tool call
+    # persists as its OWN row (role "event", event_type "tool", the block in
+    # event_data — stream_pump._serialize_turn_rows), never inside the
+    # assistant text row.
+    catalog = getattr(session, "catalog", None)
+    if catalog is not None:
+        used: list[str] = []
+        for m in messages_db:
+            if m.get("role") != "event" or m.get("event_type") != "tool":
+                continue
+            try:
+                block = json.loads(m.get("event_data") or "{}")
+            except ValueError:
+                continue
+            name = block.get("name") if isinstance(block, dict) else None
+            if isinstance(name, str) and name.startswith("mcp__") and name not in used:
+                used.append(name)
+        if used:
+            new_defs = catalog.load(used)
+            session.tools.extend(new_defs)
+            resident = {t.get("name") for t in session.tools}
+            gone = [n for n in used if n not in catalog.deferred and n not in resident]
+            logger.info(
+                f"Direct session resume: re-loaded {len(new_defs)} deferred tool(s) "
+                f"from chat {chat['id'][:8]}"
+                + (f"; {len(gone)} no longer available: {gone}" if gone else "")
+            )
 
     # If the previous turn was aborted, drop trailing aborted messages
     # (the aborted user message + any partial assistant responses saved
@@ -192,6 +274,18 @@ def _rebuild_history_from_db(session, session_id: str, chat_id: str = "") -> Non
         )
 
 
+def direct_mcp_policy(client_type: str) -> tuple[bool, int]:
+    """``(enable_http_transport, tool_timeout)`` for a direct session by
+    client type. Chats, tasks and meetings get the sidecar HTTP MCPs
+    (file-tools, video-tools, browser…) and the chat call cap; a phone call
+    stays stdio-only with the short cap — a document render behind a 300 s
+    timeout must never hang a caller."""
+    from core.layers.direct.mcp import TOOL_CALL_TIMEOUT, TOOL_CALL_TIMEOUT_CHAT
+    if client_type == "phone":
+        return False, TOOL_CALL_TIMEOUT
+    return True, TOOL_CALL_TIMEOUT_CHAT
+
+
 class DirectLLMExecutionLayer(ExecutionLayer):
     """Execution layer wrapping the Direct Anthropic API path.
 
@@ -205,7 +299,23 @@ class DirectLLMExecutionLayer(ExecutionLayer):
     async def start_session(
         self, session_id: str, config: AgentConfig,
     ) -> None:
-        """Create a direct LLM session with MCP servers."""
+        """Create a direct LLM session with MCP servers.
+
+        The permission mode + security context are registered BEFORE the MCP
+        processes spawn: the session JWT minted into their env derives its
+        external claim from the live context. A failed start drops the
+        registration again (see the CLI layer).
+        """
+        register_session_state(session_id, config.permission_mode, config.security_context)
+        try:
+            await self._start_session_impl(session_id, config)
+        except BaseException:
+            cleanup_session_permission_state(session_id)
+            raise
+
+    async def _start_session_impl(
+        self, session_id: str, config: AgentConfig,
+    ) -> None:
         # Fail CLOSED: a local agent's stdio MCPs MUST run sandboxed +
         # network-isolated. The config builders always set this; empty means an
         # omission — refuse rather than run MCPs un-sandboxed. (The LLM call
@@ -217,6 +327,12 @@ class DirectLLMExecutionLayer(ExecutionLayer):
                 f"must run sandboxed + network-isolated."
             )
         phone_mode = config.client_type == "phone"
+        # An EXTERNAL session (a phone caller who is not a platform user):
+        # the MCP set is filtered by the same rule the builder applied
+        # (mcp_registry.session_exclusion_reason), here for the per-MCP dir
+        # binds and again inside the manager's own config rebuild.
+        from core.session.external_identity import external_home_of, is_external_ctx
+        external = is_external_ctx(config.security_context)
         extra = config.extra_env or {}
         # Provider-aware: subscription_pool sets _API_KEY/_PROVIDER/_ENDPOINT_URL
         # on direct-llm sessions (see services/engines/subscription_pool.py — the
@@ -251,7 +367,12 @@ class DirectLLMExecutionLayer(ExecutionLayer):
             # assigned set directly. ``.uv-python`` rides along for venvs
             # whose interpreter is uv-fetched.
             stdio_dirs = [
-                str(manifest.mcp_dir) for manifest in assigned_mcps
+                str(manifest.mcp_dir)
+                for manifest in mcp_reg.filter_manifests_for_session(
+                    assigned_mcps,
+                    contexts={"phone"} if phone_mode else set(),
+                    external=external,
+                )
                 if manifest.server.transport == "stdio"
             ]
             if stdio_dirs:
@@ -271,9 +392,12 @@ class DirectLLMExecutionLayer(ExecutionLayer):
                 mount_shared=ctx.mount_shared if ctx else True,
                 knowledge_rw=bool(getattr(ctx, "knowledge_rw", False)) if ctx else False,
                 mcp_dir_binds=stdio_dirs,
+                external=external,
+                external_home=external_home_of(ctx),
             )
             sandbox_builder = SandboxBuilder(sandbox_cfg)
 
+        enable_http, tool_timeout = direct_mcp_policy(config.client_type)
         session = await create_direct_session(
             session_id=session_id,
             agent_name=config.agent_name,
@@ -284,7 +408,13 @@ class DirectLLMExecutionLayer(ExecutionLayer):
             credential_env=config.credential_env or None,
             system_prompt=config.system_prompt,
             sandbox_builder=sandbox_builder,
+            enable_http_transport=enable_http,
+            tool_timeout=tool_timeout,
+            external=external,
         )
+        # The builtin file tools resolve against this session's mount table
+        # (the same decisions the MCP subprocesses get from bwrap).
+        session.sandbox_cfg = sandbox_builder.cfg if sandbox_builder else None
         # The scope signal for credential acquisition (here + on provider switch
         # in change_model): a real user_sub ⇒ user-scope (own subs, then borrowable
         # admin APIs only); empty ⇒ agent-scope (full platform pool). Set ONCE here
@@ -296,10 +426,7 @@ class DirectLLMExecutionLayer(ExecutionLayer):
             session.model = config.model
         if config.effort:
             session.effort = config.effort
-        # Store permission mode + security context for tool permission checking
-        set_session_mode(session_id, config.permission_mode)
-        if config.security_context:
-            set_session_security(session_id, config.security_context)
+        # (permission mode + security context were registered before the start)
         # Register session metadata (agent name, client type) — needed by
         # location bridge and other hooks that look up sessions by agent name
         _record_session_use(session_id, client_type=config.client_type, agent=config.agent_name)
@@ -387,6 +514,9 @@ class DirectLLMExecutionLayer(ExecutionLayer):
         from core.credentials.credential_writeback import writeback_credential_dirs
         await writeback_credential_dirs(session_id)
         await close_direct_session(session_id)
+        # A closed session must not keep a live permission context (see the
+        # CLI layer).
+        cleanup_session_permission_state(session_id)
         # Release subscription + concurrency slot
         from services.engines.subscription_pool import release_subscription
         release_subscription(session_id)
@@ -411,9 +541,11 @@ class DirectLLMExecutionLayer(ExecutionLayer):
         new_provider = app_config.get_model_provider(model)
         if new_provider != session.provider:
             # Provider changed — acquire new subscription, release old
+            from core.layers.providers.registry import get_adapter
             from services.engines import subscription_pool
             import asyncio as _asyncio
 
+            old_provider = session.provider
             subscription_pool.release_subscription(session_id)
             sub_handle = await _asyncio.to_thread(
                 subscription_pool.acquire_subscription,
@@ -437,9 +569,20 @@ class DirectLLMExecutionLayer(ExecutionLayer):
                     session_id, sub_handle.subscription_id,
                     layer="direct-llm", user_sub=session.user_sub or "",
                 )
+                # The history is provider-shaped (OpenAI tool_calls / reasoning
+                # items / tool messages, Anthropic content blocks / tool_result
+                # messages, provider image blocks) and the new provider would
+                # 400 on it. Keep the conversation as plain text turns — what
+                # the DB resume builds — and swap the provider's own server
+                # tools (the client tools all carry an input_schema).
+                before = len(session.messages)
+                session.messages = _text_only_history(session.messages)
+                session.tools = [t for t in session.tools if "input_schema" in t]
+                session.tools.extend(get_adapter(session.provider).get_builtin_tools())
                 logger.info(
                     f"Direct session {session_id[:8]} switched provider: "
-                    f"{session.provider} → {new_provider} for model {model}"
+                    f"{old_provider} → {session.provider} for model {model}; "
+                    f"history kept as text ({before} → {len(session.messages)} messages)"
                 )
             else:
                 logger.warning(

@@ -961,6 +961,64 @@ class TestRootfulCapDropAndEnv:
         assert "IS_SANDBOX" not in env
 
 
+class TestTmpfsCap:
+    """Per-sandbox /tmp cap (bwrap --size): feature-gated on the bubblewrap,
+    bounded by half the host's RAM, off with SANDBOX_TMP_SIZE_MB=0."""
+
+    def _args(self, tmp_agents):
+        agents_dir, mcps_dir = tmp_agents
+        return SandboxBuilder(_make_config(agents_dir, mcps_dir))._system_mounts()
+
+    def test_size_directly_precedes_tmpfs_when_supported(self, tmp_agents, monkeypatch):
+        monkeypatch.setattr(_sandbox_mod, "_bwrap_has_size", True)
+        monkeypatch.setattr(_sandbox_mod.app_config, "SANDBOX_TMP_SIZE_MB", 4096)
+        monkeypatch.setattr(_sandbox_mod, "_mem_total_mb", lambda: 16000)
+        args = self._args(tmp_agents)
+        i = args.index("--tmpfs")
+        assert args[i + 1] == "/tmp"
+        assert args[i - 2:i] == ["--size", str(4096 * 1024 * 1024)]
+
+    def test_cap_never_looser_than_half_ram(self, monkeypatch):
+        monkeypatch.setattr(_sandbox_mod, "_bwrap_has_size", True)
+        monkeypatch.setattr(_sandbox_mod.app_config, "SANDBOX_TMP_SIZE_MB", 4096)
+        monkeypatch.setattr(_sandbox_mod, "_mem_total_mb", lambda: 4000)
+        assert _sandbox_mod.tmpfs_cap_mb() == 2000
+        monkeypatch.setattr(_sandbox_mod, "_mem_total_mb", lambda: 0)  # unreadable
+        assert _sandbox_mod.tmpfs_cap_mb() == 4096
+
+    def test_no_size_when_bwrap_lacks_it(self, tmp_agents, monkeypatch):
+        monkeypatch.setattr(_sandbox_mod, "_bwrap_has_size", False)
+        monkeypatch.setattr(_sandbox_mod.app_config, "SANDBOX_TMP_SIZE_MB", 4096)
+        args = self._args(tmp_agents)
+        assert "--size" not in args and "/tmp" in args
+
+    def test_zero_disables(self, tmp_agents, monkeypatch):
+        monkeypatch.setattr(_sandbox_mod, "_bwrap_has_size", True)
+        monkeypatch.setattr(_sandbox_mod.app_config, "SANDBOX_TMP_SIZE_MB", 0)
+        assert "--size" not in self._args(tmp_agents)
+
+    def test_lazy_probe_when_preflight_never_ran(self, monkeypatch):
+        monkeypatch.setattr(_sandbox_mod, "_bwrap_has_size", None)
+        monkeypatch.setattr(_sandbox_mod.app_config, "SANDBOX_TMP_SIZE_MB", 4096)
+        monkeypatch.setattr(_sandbox_mod, "_probe_bwrap_size", lambda: True)
+        monkeypatch.setattr(_sandbox_mod, "_mem_total_mb", lambda: 16000)
+        assert _sandbox_mod.tmpfs_cap_mb() == 4096
+        assert _sandbox_mod._bwrap_has_size is True
+
+    def test_preflight_logs_and_caches(self, monkeypatch, caplog):
+        monkeypatch.setattr(_sandbox_mod, "_bwrap_has_size", None)
+        monkeypatch.setattr(_sandbox_mod.app_config, "SANDBOX_TMP_SIZE_MB", 4096)
+        monkeypatch.setattr(_sandbox_mod, "_probe_bwrap_size", lambda: False)
+        with caplog.at_level("INFO", logger=_sandbox_mod.logger.name):
+            _sandbox_mod.tmpfs_cap_preflight()
+        assert _sandbox_mod._bwrap_has_size is False
+        assert "uncapped" in caplog.text
+
+    def test_claude_runtime_root_follows_uid(self, monkeypatch):
+        monkeypatch.setattr(_sandbox_mod.os, "getuid", lambda: 1234)
+        assert _sandbox_mod.claude_runtime_root() == "/tmp/claude-1234"
+
+
 class TestNetnsPreflight:
     def test_hard_fails_when_pasta_missing(self, monkeypatch):
         # Isolation is mandatory — a missing tool hard-fails boot.

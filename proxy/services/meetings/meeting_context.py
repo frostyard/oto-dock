@@ -42,12 +42,13 @@ You are participating in a multi-agent meeting (no interactive user prompts).
 
 - **Be concise** — each response should be 1-3 paragraphs max. Provide data, not filler.
 - **ALWAYS call `direct_to(agents=[...])` exactly ONCE, as the LAST action of your response, then END your turn immediately** — no further text and no repeat calls (repeats only waste slow round-trips; the last call wins). Text written after the call is discarded.
+- **A turn is: gather what you need with tools, write your message, route, stop.** The agents you address speak only AFTER your turn ends, and their replies reach you as transcript in your NEXT turn. Never wait for a reply inside your turn — no polling, no `sleep`, no peeking at their sessions or tasks. The platform denies every tool call that follows a routing call in the same turn.
 - **Write your full message as normal response text BEFORE calling `direct_to`.** The tool only routes — its arguments are NOT shown to the other agents; anything you put in them is lost.
   If you don't call direct_to, your response broadcasts to ALL participants and they ALL respond — avoid this unless the moderator explicitly wants input from everyone.
 - **The other participants receive ONLY the response text you write.** They can NOT see your tool results or your thinking. After gathering data with tools you MUST write the findings out as plain response text before routing — otherwise the others receive nothing and the meeting stalls on a restatement round.
 - **As participant**: After delivering your report or answering a question, **always direct back to the moderator** — not to other participants. Only direct to another participant if the moderator explicitly asked you to coordinate with them.
 - **As participant**: When you have nothing more to add, call `propose_conclude` or `leave_meeting` immediately — do NOT say "nothing further" without using one of these tools.
-- **As moderator**: Direct to specific agents with clear questions. Use `end_meeting` to conclude — your final response is the meeting summary.
+- **As moderator**: Direct to specific agents with clear questions. Use `end_meeting` to conclude — write the summary as response text, then call it, then stop (memory writes are the one tool still allowed after a routing call).
 - **Do NOT** repeat or summarize information already shared by other participants.
 - **Do NOT** respond just to acknowledge — only speak when you have new information or a question.
 - **Do NOT** use the Agent tool, background subagents, or delegate_task during meetings.
@@ -123,6 +124,9 @@ async def build_meeting_agent_config(
     target_device_grants = await asyncio.to_thread(
         _remote_store.get_target_device_grants, _meeting_target_kind, resolved_target,
     )
+    target_browser = await asyncio.to_thread(
+        _remote_store.get_target_browser_settings, _meeting_target_kind, resolved_target,
+    )
 
     # Codex needs the MCP config in TOML (config.toml [mcp_servers.*]), not the
     # Claude JSON format — a JSON blob written into config.toml makes Codex's
@@ -149,6 +153,7 @@ async def build_meeting_agent_config(
             is_remote=is_remote,
             target_has_display=target_has_display,
             target_device_grants=target_device_grants,
+            target_browser=target_browser,
         )
     )
 
@@ -222,6 +227,7 @@ async def build_meeting_agent_config(
         target_has_display=target_has_display,
         target_device_grants=target_device_grants,
         mount_shared=vis.mount_shared,
+        execution_path=execution_path or "",
     )
     agent_prompt = (agent_prompt or "") + build_permission_context(
         task_security,
@@ -401,7 +407,12 @@ def build_turn_prompt(meeting: dict, agent_slug: str, transcript: list[dict],
             "`direct_to(agents=[...])` again to deliver it."
         )
     elif prompt_type == "start":
-        footer = "Please open the discussion. Use `direct_to(agents=[...])` to address specific agents."
+        footer = (
+            "Please open the discussion: write the agenda and your questions "
+            "as response text, then call `direct_to(agents=[...])` once and "
+            "stop. The addressed agents answer after your turn ends; their "
+            "answers reach you in your next turn."
+        )
     else:
         footer = "Please respond."
 

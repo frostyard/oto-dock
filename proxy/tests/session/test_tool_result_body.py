@@ -87,8 +87,9 @@ async def test_result_body_attaches_forwards_and_persists(temp_db):
         assert blk["result_summary"] == "3 lines"
         assert blk["is_error"] is False
 
-        # …and _save_turn_blocks persists it (the history-reload source).
-        pump._save_turn_blocks()
+        # …and _save_turn_blocks persists it (the history-reload source) —
+        # an off-loop writer job; await it.
+        await pump._save_turn_blocks()
         rows = [m for m in task_store.get_chat_messages("tr1")
                 if m.get("event_type") == "tool"]
         assert len(rows) == 1

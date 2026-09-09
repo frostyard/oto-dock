@@ -28,6 +28,10 @@ interface Props {
   model: string
   modelValue?: string  // compound value for dropdown matching (layer::model_id)
   costUsd: number
+  /** false = the chat's newest turn ran on a subscription or a local model —
+   * the total is an activity estimate, not money, so the badge is hidden.
+   * Undefined keeps it shown (back-compat / unknown credential). */
+  costBilled?: boolean
   contextUsed: number
   contextMax: number
   cacheStats?: CacheStats
@@ -272,6 +276,7 @@ export default function ChatStatusBar({
   mode,
   model,
   costUsd,
+  costBilled,
   contextUsed,
   contextMax,
   cacheStats,
@@ -493,8 +498,10 @@ export default function ChatStatusBar({
           : <div className="flex-1" />}
 
         {/* Cost badge — hidden in interactive mode (cost accrues inside the TUI,
-            not via the -p pump; a leftover value would be stale). */}
-        {costUsd > 0 && !interactiveActive && (
+            not via the -p pump; a leftover value would be stale) and when the
+            newest turn ran on a subscription / local model (costBilled false:
+            the number is activity, not money — still counted in Usage). */}
+        {costUsd > 0 && costBilled !== false && !interactiveActive && (
           <span className="flex items-center gap-1 px-2 py-0.5 rounded-lg bg-p-surface border border-p-border-light/60 dark:border-gray-700 text-p-text-secondary tabular-nums font-mono">
             <svg className="w-3 h-3 text-p-text-light" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />

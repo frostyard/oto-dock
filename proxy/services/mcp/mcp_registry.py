@@ -721,6 +721,97 @@ def get_agent_mcps_all_placements(agent_name: str) -> list[McpManifest]:
     return _agent_base_manifests(agent_name)
 
 
+# ---------------------------------------------------------------------------
+# External routes (phone callers who are not platform users)
+# ---------------------------------------------------------------------------
+
+#: Exclusion context matched against a manifest's ``exclude_from`` for every
+#: EXTERNAL session (a phone call in the per-caller or shared identity mode —
+#: anyone who is not a platform user). Community manifests may opt out of
+#: external sessions with ``"exclude_from": ["external"]``.
+EXTERNAL_CONTEXT = "external"
+
+#: MCPs that never attach to an external session regardless of what any
+#: manifest declares: they manage the platform, schedule deferred execution
+#: that would later run with the agent's full rights, or expose infrastructure
+#: inventory. A manifest can add itself to the exclusion (above) but nothing
+#: can remove a name listed here.
+EXTERNAL_DENIED_MCPS = frozenset({
+    "delegation-mcp", "schedules-mcp", "triggers-mcp", "notifications-mcp",
+    "meetings-mcp", "agent-config-mcp", "agent-creator-mcp", "mcps-mcp",
+    "ssh-hosts", "phone-mcp",
+})
+
+#: Exclusion reasons that describe the EXTERNAL rules themselves. The
+#: prompt's "Unavailable Tools" list omits them on external sessions — a
+#: caller-facing prompt must not enumerate the platform's management surface.
+EXTERNAL_DENIED_REASON = "Not available on external routes"
+EXTERNAL_CONTEXT_REASON = f"Excluded in {EXTERNAL_CONTEXT} mode"
+
+
+def session_exclusion_reason(
+    manifest, *, contexts: set[str] | frozenset[str], external: bool,
+) -> str | None:
+    """Why ``manifest`` is NOT part of a session with these ``contexts``
+    (``{"phone"}``, ``{"task", "meeting"}``, …) — or None when it is.
+
+    THE one rule every consumer applies: the session MCP config
+    (``build_session_mcp_config``), the prompt catalog, the inline skills
+    and the Direct-LLM skill catalog, the route preview, and the layers'
+    per-MCP dir binds. ``external`` adds the ``"external"`` context AND the
+    :data:`EXTERNAL_DENIED_MCPS` hard set, so prompt, config, key material
+    and processes can never disagree about what a caller gets.
+    """
+    if external and manifest.name in EXTERNAL_DENIED_MCPS:
+        return EXTERNAL_DENIED_REASON
+    effective = set(contexts) | ({EXTERNAL_CONTEXT} if external else set())
+    exclude_from = manifest.exclude_from or []
+    # "meeting" outranks the base context (a manifest may opt out of
+    # meetings alone); the external context is checked last so a manifest
+    # listing both "phone" and "external" reports the base reason.
+    ordered = (
+        [c for c in ("meeting",) if c in effective]
+        + sorted(effective - {"meeting", EXTERNAL_CONTEXT})
+        + ([EXTERNAL_CONTEXT] if EXTERNAL_CONTEXT in effective else [])
+    )
+    for c in ordered:
+        if c and c in exclude_from:
+            return f"Excluded in {c} mode"
+    return None
+
+
+def filter_manifests_for_session(
+    manifests, *, contexts: set[str] | frozenset[str], external: bool,
+) -> list:
+    """``manifests`` minus those :func:`session_exclusion_reason` drops."""
+    return [
+        m for m in manifests
+        if session_exclusion_reason(m, contexts=contexts, external=external) is None
+    ]
+
+
+def preview_session_mcps(
+    agent_name: str, *, contexts: set[str], external: bool,
+) -> tuple[list[McpManifest], dict[str, str]]:
+    """Manifest-only view of what a session with ``contexts`` would attach:
+    the agent's configured MCPs minus what :func:`session_exclusion_reason`
+    drops. Returns ``(attached, excluded_reasons)``.
+
+    No processes, no credential resolution — the admin route form uses it to
+    show "available to callers on this line" before saving; the session
+    builder applies the same rule (plus credential availability).
+    """
+    attached: list[McpManifest] = []
+    excluded: dict[str, str] = {}
+    for manifest in get_agent_mcps_all_placements(agent_name):
+        reason = session_exclusion_reason(manifest, contexts=contexts, external=external)
+        if reason:
+            excluded[manifest.name] = reason
+            continue
+        attached.append(manifest)
+    return attached, excluded
+
+
 def device_capability_for_server(server_name: str) -> str | None:
     """Return the ``device_capability`` of the loaded MCP whose mcpServers key
     (its ``server_name``, defaulting to the manifest name) equals ``server_name``,
@@ -1173,6 +1264,12 @@ def _first_sentence(text: str) -> str:
     return text[:idx]
 
 
+def _is_http_transport(manifest) -> bool:
+    """A sidecar (streamable-HTTP) MCP — the transport the phone Direct-LLM
+    manager does not connect. ``sse`` / ``stdio`` / ``none`` are not."""
+    return getattr(getattr(manifest, "server", None), "transport", "") == "http"
+
+
 def build_available_mcps_section(
     agent_name: str,
     *,
@@ -1180,6 +1277,8 @@ def build_available_mcps_section(
     is_remote: bool = False,
     target_has_display: bool | None = None,
     target_device_grants: set[str] | None = None,
+    skip_http_mcps: bool = False,
+    external: bool = False,
 ) -> str:
     """Build the ``# Available Tools (MCPs)`` prompt section.
 
@@ -1201,11 +1300,17 @@ def build_available_mcps_section(
         is_remote / target_has_display / target_device_grants: forwarded to
             ``get_agent_mcps`` so the prompt catalog only lists device-local
             MCPs the session can actually use. Fail-closed defaults.
+        skip_http_mcps: drop manifests with ``server.transport == "http"`` —
+            the sidecar MCPs a phone Direct-LLM session never connects
+            (``core/layers/direct/mcp.py`` skips them), so the prompt does
+            not advertise tools the session cannot reach.
     """
     manifests = get_agent_mcps(
         agent_name, is_remote=is_remote, target_has_display=target_has_display,
         target_device_grants=target_device_grants,
     ) or []
+    if skip_http_mcps:
+        manifests = [m for m in manifests if not _is_http_transport(m)]
     # Sort alphabetically by label for deterministic output — registry scan
     # order is otherwise filesystem-dependent and can drift across reinstalls.
     manifests_sorted = sorted(
@@ -1221,7 +1326,9 @@ def build_available_mcps_section(
         # the skills pipeline (inline or the CLI's own index) instead.
         if m.category == "skill":
             continue
-        if context and context in (m.exclude_from or []):
+        if session_exclusion_reason(
+            m, contexts={context} if context else set(), external=external,
+        ):
             continue
         label = (m.label or m.name).strip()
         desc = _first_sentence(m.description)
@@ -1250,6 +1357,8 @@ def get_skills_for_agent(
     is_remote: bool = False,
     target_has_display: bool | None = None,
     target_device_grants: set[str] | None = None,
+    skip_http_mcps: bool = False,
+    external: bool = False,
 ) -> list[tuple[str, str, str]]:
     """Return (skill_id, prompt_content, loading) for an agent, context-filtered.
 
@@ -1266,23 +1375,64 @@ def get_skills_for_agent(
 
     ``is_remote`` / ``target_has_display`` / ``target_device_grants`` forward to
     ``get_agent_mcps`` so a device-local MCP's skill text is dropped on sessions
-    that can't run it. Fail-closed defaults.
+    that can't run it. Fail-closed defaults. ``skip_http_mcps`` drops the
+    skills of sidecar (HTTP) MCPs — see ``build_available_mcps_section``.
     """
     from services.mcp.skill_format import strip_frontmatter
 
+    result: list[tuple[str, str, str]] = []
+    for manifest, skill_def in _iter_agent_skills(
+        agent_name, context, is_remote=is_remote,
+        target_has_display=target_has_display,
+        target_device_grants=target_device_grants,
+        skip_http_mcps=skip_http_mcps,
+        external=external,
+    ):
+        # Load skill file content
+        skill_path = manifest.mcp_dir / skill_def.file
+        if skill_path.is_file():
+            try:
+                content = strip_frontmatter(skill_path.read_text())
+                result.append((skill_def.id, content, skill_def.loading))
+            except Exception as e:
+                logger.warning("Failed to read skill %s: %s", skill_path, e)
+
+    return result
+
+
+def _iter_agent_skills(
+    agent_name: str,
+    context: str,
+    *,
+    is_remote: bool = False,
+    target_has_display: bool | None = None,
+    target_device_grants: set[str] | None = None,
+    skip_http_mcps: bool = False,
+    external: bool = False,
+):
+    """``(manifest, skill_def)`` for every ENABLED skill of the agent's
+    assigned MCPs that is not excluded from ``context`` — the one filter
+    behind the inline skills and the Direct-LLM skill catalog. DB rows
+    override the manifest defaults (enabled gate + exclude_from copy);
+    ``""`` as context excludes nothing; ``skip_http_mcps`` drops sidecar
+    MCPs (phone Direct-LLM sessions never connect them); ``external`` drops
+    the MCPs an external session never attaches (their skills with them) and
+    honours a skill-level ``"external"`` exclusion."""
     db_skills = mcp_store.get_agent_skills(agent_name)
     skill_map: dict[str, dict] = {s["skill_id"]: s for s in db_skills}
 
-    # Collect all skills from assigned MCPs
     assigned_mcps = get_agent_mcps(
         agent_name, is_remote=is_remote, target_has_display=target_has_display,
         target_device_grants=target_device_grants,
     )
-    result: list[tuple[str, str, str]] = []
-
     for manifest in assigned_mcps:
+        if skip_http_mcps and _is_http_transport(manifest):
+            continue
+        if session_exclusion_reason(
+            manifest, contexts={context} if context else set(), external=external,
+        ):
+            continue
         for skill_def in manifest.skills:
-            # Check DB override
             db_entry = skill_map.get(skill_def.id)
             if db_entry:
                 if not db_entry["enabled"]:
@@ -1290,21 +1440,41 @@ def get_skills_for_agent(
                 exclude_from = db_entry["exclude_from"]
             else:
                 exclude_from = skill_def.default_exclude_from
-
-            # Check context exclusion
             if context in exclude_from:
                 continue
+            if external and EXTERNAL_CONTEXT in exclude_from:
+                continue
+            yield manifest, skill_def
 
-            # Load skill file content
-            skill_path = manifest.mcp_dir / skill_def.file
-            if skill_path.is_file():
-                try:
-                    content = strip_frontmatter(skill_path.read_text())
-                    result.append((skill_def.id, content, skill_def.loading))
-                except Exception as e:
-                    logger.warning("Failed to read skill %s: %s", skill_path, e)
 
-    return result
+def get_skill_catalog_for_agent(
+    agent_name: str,
+    context: str = "dashboard",
+    *,
+    is_remote: bool = False,
+    target_has_display: bool | None = None,
+    target_device_grants: set[str] | None = None,
+    skip_http_mcps: bool = False,
+    external: bool = False,
+) -> list[tuple[str, str]]:
+    """``(skill_id, description)`` of the agent's enabled ON-DEMAND skills in
+    this context, sorted by id — the ``# Skills`` catalog of a Direct-LLM
+    prompt. The CLI engines index their materialized skills dir themselves;
+    the direct layer has a client-side ``Skill`` builtin instead and needs
+    the names in the prompt to know what it can load. Same filters as the
+    inline path (``_iter_agent_skills``)."""
+    rows = [
+        (skill_def.id, skill_def.description or "")
+        for _m, skill_def in _iter_agent_skills(
+            agent_name, context, is_remote=is_remote,
+            target_has_display=target_has_display,
+            target_device_grants=target_device_grants,
+            skip_http_mcps=skip_http_mcps,
+            external=external,
+        )
+        if skill_def.loading == "on_demand"
+    ]
+    return sorted(rows)
 
 
 def find_skill_provider(skill_id: str) -> McpManifest | None:
@@ -1737,6 +1907,57 @@ def _apply_browser_allowed_origins(entry: dict[str, Any], allowed_origins: list[
         env["PLAYWRIGHT_MCP_BLOCKED_ORIGINS"] = ";".join(kept)
 
 
+# Browser-control env keys only the framework may set. Admin MCP config values
+# merge into the entry env unvalidated (resolve_server_config), so any of
+# these arriving from the manifest / DB is dropped before the target
+# machine's own setting is applied — otherwise an admin config value could
+# flip every machine (a user-paired laptop included) into the owner's real
+# browser, or point the dedicated mode at the real profile dir.
+_BROWSER_MODE_ENV_KEYS = (
+    "OTO_BROWSER_MODE",
+    "OTO_BROWSER_UNATTENDED",
+    "OTO_BROWSER_TOKEN_EXPECTED",
+    "PLAYWRIGHT_MCP_EXTENSION",
+    "PLAYWRIGHT_MCP_EXTENSION_TOKEN",
+    "PLAYWRIGHT_MCP_USER_DATA_DIR",
+    "PLAYWRIGHT_MCP_EXECUTABLE_PATH",
+    "PLAYWRIGHT_MCP_BROWSER",
+    "PLAYWRIGHT_MCP_CDP_ENDPOINT",
+)
+
+
+def _apply_browser_mode(
+    entry: dict[str, Any], secret_bundles: dict, target_browser, *, unattended: bool,
+) -> None:
+    """Apply the target machine's browser-control mode to the ``local`` entry.
+
+    ``own`` → ``OTO_BROWSER_MODE=own`` in the (non-secret) config env; the
+    extension token rides the MCP's secret bundle (broker-fetched at spawn,
+    never in the config file) with ``OTO_BROWSER_TOKEN_EXPECTED=1`` beside it
+    so the wrapper can tell "no token saved" from "the fetch failed". Without
+    a token, an unattended session (task / phone / meeting) gets
+    ``OTO_BROWSER_UNATTENDED=1`` so the wrapper fails the first browser call
+    at once instead of waiting for a click nobody will give.
+    """
+    env = entry.get("env") or {}
+    for key in _BROWSER_MODE_ENV_KEYS:
+        env.pop(key, None)
+    if target_browser is not None and target_browser.mode == "own":
+        env["OTO_BROWSER_MODE"] = "own"
+        if target_browser.extension_token:
+            from core.credentials.mcp_broker import SecretBundle
+            env["OTO_BROWSER_TOKEN_EXPECTED"] = "1"
+            bundle = secret_bundles.get("local") or SecretBundle()
+            bundle.env["PLAYWRIGHT_MCP_EXTENSION_TOKEN"] = target_browser.extension_token
+            secret_bundles["local"] = bundle
+        elif unattended:
+            env["OTO_BROWSER_UNATTENDED"] = "1"
+    if env:
+        entry["env"] = env
+    else:
+        entry.pop("env", None)
+
+
 def build_session_mcp_config(
     agent_name: str,
     user_sub: str | None,
@@ -1758,10 +1979,17 @@ def build_session_mcp_config(
     target_has_display: bool | None = None,
     target_device_grants: set[str] | None = None,
     target_admin_paired: bool = False,
+    target_browser=None,
+    external: bool = False,
 ) -> tuple[Path | None, dict[str, str], dict[str, str], dict, set]:
     """Main entry point: build a complete MCP config for a session.
 
     Args:
+        target_browser: the target machine's ``remote_store.BrowserTargetSettings``
+            (browser-control mode + extension token) — None / dedicated
+            leaves the browser entry untouched; ``own`` is applied by
+            ``_apply_browser_mode``. Local sessions never carry it (the MCP
+            is satellite-only).
         meeting_mode: meeting-participant session. Meetings RIDE the task lane
             (callers also pass ``task_mode=True``), so their base exclusion
             context stays ``"task"`` — this flag ADDITIONALLY matches
@@ -1819,6 +2047,11 @@ def build_session_mcp_config(
     # exclude only "task" have always been absent from meetings, and swapping
     # the context would silently re-admit them all.
     exclusion_contexts = {context, "meeting"} if meeting_mode else {context}
+    # External sessions (a phone caller who is not a platform user) add the
+    # "external" context AND the hard-denied management set — see
+    # ``session_exclusion_reason``; the prompt builders apply the same rule.
+    if external:
+        exclusion_contexts.add(EXTERNAL_CONTEXT)
 
     # Get assigned + enabled MCPs for this agent. Device-local placement /
     # consent / display filtering happens here; the dropped device MCPs
@@ -1883,14 +2116,13 @@ def build_session_mcp_config(
     for manifest in assigned:
         mcp_name = manifest.name
 
-        # Check context exclusion (from manifest)
-        matched_context = next(
-            (c for c in ("meeting", context) if c in exclusion_contexts
-             and c in (manifest.exclude_from or [])),
-            None,
+        # Context exclusion (manifest exclude_from + the external hard set) —
+        # the ONE rule shared with the prompt builders and the route preview.
+        context_reason = session_exclusion_reason(
+            manifest, contexts=exclusion_contexts, external=external,
         )
-        if matched_context:
-            exclusion_reasons[mcp_name] = f"Excluded in {matched_context} mode"
+        if context_reason:
+            exclusion_reasons[mcp_name] = context_reason
             continue
 
         # Check credential exclusion
@@ -2147,6 +2379,16 @@ def build_session_mcp_config(
         _apply_browser_allowed_origins(
             servers["local"], _agent_store.get_browser_allowed_origins(agent_name)
         )
+        _apply_browser_mode(
+            servers["local"], secret_bundles, target_browser,
+            unattended=bool(task_mode or phone_mode or meeting_mode),
+        )
+        # A bundle created here (token) gets the same bash-cred stripping the
+        # loop applies to credentialed stdio MCPs.
+        if "local" in secret_bundles and cred_result.bash_env_keys:
+            servers["local"].setdefault("env", {})["OTO_STRIP_KEYS"] = ",".join(
+                sorted(cred_result.bash_env_keys)
+            )
 
     # Write config file
     sub_hash = hashlib.sha256((user_sub or "agent").encode()).hexdigest()[:12]

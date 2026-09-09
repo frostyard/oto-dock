@@ -298,3 +298,171 @@ def test_drain_system_notes_routes_nudges_to_moderator():
     assert transcript[0]["role"] == "system"
     assert pending["mod"] == [transcript[0]]
     assert pending["other"] == []
+
+
+# ───────────────── the turn-end backstop in decide_tool_permission ───────────
+#
+# Once a meeting participant's hook has allowed a routing tool, every later
+# tool call in the same turn is denied (the orchestrator routes only at the
+# turn boundary — a participant that keeps working stalls the whole meeting;
+# observed live 2026-09-09, 304 s and 27 API turns after the first direct_to).
+
+from api.hooks.hooks import decide_tool_permission  # noqa: E402
+from auth.path_policy import SecurityContext  # noqa: E402
+from core.session.session_state import (  # noqa: E402
+    clear_meeting_turn_routed,
+    get_meeting_session_info,
+    set_session_mode,
+)
+
+
+def _register_meeting_session(sid: str, *, is_moderator: bool) -> None:
+    session_state.register_session_state(sid, "auto", SecurityContext(
+        role="manager", username="", agent="agent-a", is_admin_agent=False,
+        session_scope="agent",
+    ))
+    set_session_mode("parent-sess-b", "dontAsk")
+    set_meeting_session_info(
+        sid, "parent-sess-b", "meeting-m2", "agent-a", "parent-chat-2",
+        is_moderator=is_moderator,
+    )
+
+
+@pytest.fixture
+def moderator_session():
+    sid = "mod-sess-1"
+    _register_meeting_session(sid, is_moderator=True)
+    yield sid
+    cleanup_meeting_session_info(sid)
+    session_state.cleanup_session_permission_state(sid)
+    session_state._session_modes.pop("parent-sess-b", None)
+
+
+@pytest.fixture
+def participant_session():
+    sid = "part-sess-2"
+    _register_meeting_session(sid, is_moderator=False)
+    yield sid
+    cleanup_meeting_session_info(sid)
+    session_state.cleanup_session_permission_state(sid)
+    session_state._session_modes.pop("parent-sess-b", None)
+
+
+async def _decide(sid, tool, tool_input=None):
+    return await decide_tool_permission(sid, tool, tool_input or {"command": "ls"})
+
+
+@pytest.mark.asyncio
+async def test_tools_run_freely_before_routing(moderator_session):
+    assert (await _decide(moderator_session, "Bash"))["decision"] == "allow"
+    assert resolve_hook_route(moderator_session).routed_tool == ""
+
+
+@pytest.mark.asyncio
+async def test_direct_to_marks_the_turn_and_later_tools_are_denied(moderator_session):
+    allowed = await _decide(moderator_session, "mcp__meetings-mcp__direct_to",
+                            {"agents": ["agent-b"]})
+    assert allowed["decision"] == "allow"
+    assert resolve_hook_route(moderator_session).routed_tool == "direct_to"
+
+    denied = await _decide(moderator_session, "Bash")
+    assert denied["decision"] == "deny"
+    assert "direct_to" in denied["reason"] and "next turn" in denied["reason"]
+    # Read-only tools are denied too — the point is ending the turn.
+    assert (await _decide(moderator_session, "Read", {"file_path": "/x"}))["decision"] == "deny"
+    # Memory writes are the one exception, after any routing call.
+    assert (await _decide(moderator_session, "mcp__memory-mcp__memory",
+                          {"command": "view", "path": "/memories/agent/x.md"}))["decision"] == "allow"
+
+
+@pytest.mark.asyncio
+async def test_meeting_tools_and_their_schema_load_stay_allowed(moderator_session):
+    await _decide(moderator_session, "mcp__meetings-mcp__direct_to", {"agents": ["agent-b"]})
+    ok = await _decide(moderator_session, "ToolSearch",
+                       {"query": "select:mcp__meetings-mcp__end_meeting"})
+    assert ok["decision"] == "allow"
+    other = await _decide(moderator_session, "ToolSearch", {"query": "select:Bash"})
+    assert other["decision"] == "deny"
+    again = await _decide(moderator_session, "mcp__meetings-mcp__end_meeting",
+                          {"meeting_id": "m2"})
+    assert again["decision"] == "allow"
+    # The closing call supersedes the earlier direct_to…
+    assert resolve_hook_route(moderator_session).routed_tool == "end_meeting"
+    # …and everything but the meeting tools and memory stays denied.
+    memory = await _decide(moderator_session, "mcp__memory-mcp__memory",
+                           {"command": "str_replace", "path": "/memories/agent/x.md"})
+    assert memory["decision"] == "allow"
+    assert (await _decide(moderator_session, "Bash"))["decision"] == "deny"
+
+
+@pytest.mark.asyncio
+async def test_end_meeting_reason_depends_on_the_summary_written(moderator_session):
+    await _decide(moderator_session, "mcp__meetings-mcp__end_meeting", {"meeting_id": "m2"})
+    thin = await _decide(moderator_session, "Bash")
+    assert "Write the meeting summary now" in thin["reason"]
+    get_meeting_session_info(moderator_session)["turn_text_chars"] = 900
+    full = await _decide(moderator_session, "Bash")
+    assert "summary you wrote above" in full["reason"]
+
+
+@pytest.mark.asyncio
+async def test_participant_end_meeting_is_not_a_routing(participant_session):
+    # The API refuses it (moderator only) and the model recovers with
+    # propose_conclude — the turn must not be closed on it.
+    await _decide(participant_session, "mcp__meetings-mcp__end_meeting", {"meeting_id": "m2"})
+    assert resolve_hook_route(participant_session).routed_tool == ""
+    assert (await _decide(participant_session, "Bash"))["decision"] == "allow"
+    await _decide(participant_session, "mcp__meetings-mcp__propose_conclude", {"meeting_id": "m2"})
+    denied = await _decide(participant_session, "Bash")
+    assert denied["decision"] == "deny" and "propose_conclude" in denied["reason"]
+    assert (await _decide(participant_session, "mcp__memory-mcp__memory",
+                          {"command": "view", "path": "/memories/agent/x.md"}))["decision"] == "allow"
+
+
+@pytest.mark.asyncio
+async def test_clearing_the_turn_state_reopens_tools(moderator_session):
+    await _decide(moderator_session, "mcp__meetings-mcp__direct_to", {"agents": ["agent-b"]})
+    assert (await _decide(moderator_session, "Bash"))["decision"] == "deny"
+    clear_meeting_turn_routed(moderator_session)
+    assert (await _decide(moderator_session, "Bash"))["decision"] == "allow"
+    assert get_meeting_session_info(moderator_session)["routed_tool"] == ""
+
+
+@pytest.mark.asyncio
+async def test_non_meeting_sessions_are_untouched():
+    sid = "plain-sess-9"
+    session_state.register_session_state(sid, "dontAsk", SecurityContext(
+        role="manager", username="", agent="agent-a", is_admin_agent=False,
+        session_scope="agent",
+    ))
+    try:
+        await _decide(sid, "mcp__meetings-mcp__direct_to", {"agents": ["agent-b"]})
+        assert (await _decide(sid, "Bash"))["decision"] == "allow"
+    finally:
+        session_state.cleanup_session_permission_state(sid)
+
+
+@pytest.mark.asyncio
+async def test_codex_named_meeting_tool_marks_the_turn(moderator_session, monkeypatch):
+    # Codex's hook sanitizes the server key: mcp__meetings_mcp__direct_to.
+    # The decision path canonicalizes it, so the backstop (and the
+    # manifest's open tier) see the same name Claude sends.
+    from pathlib import Path
+    import config as app_config
+    from services.mcp import mcp_registry as reg
+    from services.mcp.mcp_manifest_types import (
+        CredentialConfig, McpManifest, ServerConfig,
+    )
+    manifest = McpManifest(
+        name="meetings-mcp", label="Meetings", description="d", version="1.0.0",
+        category="core", server=ServerConfig(runtime="python", transport="stdio"),
+        credentials=CredentialConfig(), config=[], env={}, agent_env={},
+        exclude_from=[], skills=[], server_name="", permissions=None,
+        mcp_dir=Path(app_config.MCPS_DIR) / "custom" / "meetings-mcp",
+    )
+    monkeypatch.setattr(reg, "_manifests", {"meetings-mcp": manifest})
+    allowed = await _decide(moderator_session, "mcp__meetings_mcp__direct_to",
+                            {"agents": ["agent-b"]})
+    assert allowed["decision"] == "allow"
+    assert resolve_hook_route(moderator_session).routed_tool == "direct_to"
+    assert (await _decide(moderator_session, "Bash"))["decision"] == "deny"

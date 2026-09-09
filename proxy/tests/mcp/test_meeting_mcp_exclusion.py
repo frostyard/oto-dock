@@ -94,10 +94,11 @@ def test_shipped_manifests_opt_out_of_tasks_and_meetings():
     from services.mcp.mcp_manifest_parse import _parse_manifest
 
     root = PROXY_DIR.parent / "mcps" / "custom"
-    assert _parse_manifest(root / "agent-config-mcp" / "manifest.json").exclude_from == ["task", "meeting"]
-    assert _parse_manifest(root / "mcps-mcp" / "manifest.json").exclude_from == ["task", "meeting"]
+    # ("external" = never on a phone caller's session — tests/mcp/test_external_exclusions.py)
+    assert _parse_manifest(root / "agent-config-mcp" / "manifest.json").exclude_from == ["task", "meeting", "external"]
+    assert _parse_manifest(root / "mcps-mcp" / "manifest.json").exclude_from == ["task", "meeting", "external"]
     creator = _parse_manifest(root / "agent-creator-mcp" / "manifest.json")
-    assert set(creator.exclude_from) == {"phone", "task", "meeting"}
+    assert set(creator.exclude_from) == {"phone", "task", "meeting", "external"}
 
 
 # ---------------------------------------------------------------------------

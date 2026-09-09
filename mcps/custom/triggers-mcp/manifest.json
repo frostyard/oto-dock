@@ -2,7 +2,7 @@
   "name": "triggers-mcp",
   "label": "Triggers",
   "description": "Webhook trigger creation and management. Lets agents configure event-driven webhooks (per-user or per-agent) that fire tasks and/or notifications when external systems (GitHub, Stripe, Linear, IoT, etc.) call the platform.",
-  "version": "1.1.2",
+  "version": "1.1.4",
   "category": "core",
 
   "server": {
@@ -24,7 +24,7 @@
     "PROXY_TASK_OWNER": "${session.task_owner}"
   },
 
-  "exclude_from": [],
+  "exclude_from": ["external"],
 
   "skills": [
     {
@@ -32,6 +32,13 @@
       "loading": "always",
       "file": "docs/trigger-instructions.md",
       "description": "When and how to use triggers, scope rules, the trigger ↔ task and trigger ↔ notification pairing patterns, webhook setup workflow",
+      "default_exclude_from": []
+    },
+    {
+      "id": "triggers-guide",
+      "loading": "on_demand",
+      "file": "docs/triggers-guide/SKILL.md",
+      "description": "Reference for the triggers tools — trigger↔task and trigger↔notification call shapes, vendor-subscribed (OAuth) triggers and event_filter rules, payload placeholders, external-system setup and API keys, debounce, worked examples. Use before creating or editing a webhook trigger.",
       "default_exclude_from": []
     }
   ],

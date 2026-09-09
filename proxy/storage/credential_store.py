@@ -68,6 +68,18 @@ def _decrypt(enc: str) -> str:
     return _get_fernet().decrypt(enc.encode()).decode()
 
 
+def encrypt_secret(value: str) -> str:
+    """Encrypt a secret another table stores (e.g. a machine's browser
+    extension token) with the credential-store key, so it shares the same
+    at-rest guarantees. The boot key canary does not sample such columns:
+    a key mismatch surfaces where the value is read (the reader degrades)."""
+    return _encrypt(value)
+
+
+def decrypt_secret(enc: str) -> str:
+    return _decrypt(enc)
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 

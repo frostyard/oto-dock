@@ -1,0 +1,4 @@
+# Byte-exact data files: never normalize line endings on checkout.
+# codex_base_instructions.md is a verbatim copy of Codex's prompt.md whose
+# length and hash are pinned by tests (a CRLF checkout would change both).
+proxy/core/layers/codex/codex_base_instructions.md -text

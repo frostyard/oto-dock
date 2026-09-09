@@ -7,9 +7,11 @@ one. Single-use is structural: accepting — or an admin password reset — give
 the account a password, which permanently invalidates every outstanding token.
 """
 
+import threading
 import time
 from urllib.parse import parse_qs, urlparse
 
+import anyio
 import jwt as pyjwt
 import pytest
 from fastapi.testclient import TestClient
@@ -230,9 +232,15 @@ def test_forgot_password_never_sends_broken_relative_links(monkeypatch):
     clear_rate_limit("forgot", "email:invitee@t.com")
 
     sent: list = []
+    sent_evt = threading.Event()
+
+    def _capture(to, url):
+        sent.append((to, url))
+        sent_evt.set()
+        return True
+
     monkeypatch.setattr(smtp_mod, "is_smtp_configured", lambda: True)
-    monkeypatch.setattr(smtp_mod, "send_password_reset_email",
-                        lambda to, url: sent.append((to, url)) or True)
+    monkeypatch.setattr(smtp_mod, "send_password_reset_email", _capture)
 
     monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "")
     resp = client.post("/auth/forgot-password", json={"email": "invitee@t.com"})
@@ -242,15 +250,21 @@ def test_forgot_password_never_sends_broken_relative_links(monkeypatch):
     clear_rate_limit("forgot", "testclient")
     clear_rate_limit("forgot", "email:invitee@t.com")
     monkeypatch.setattr(config, "DASHBOARD_PUBLIC_URL", "https://dash.example.com")
-    resp = client.post("/auth/forgot-password", json={"email": "invitee@t.com"})
-    assert resp.status_code == 200
-    # The send is fire-and-forget (a background task, so the hit and miss
-    # paths answer equally fast); under a loaded xdist run it can land after
-    # the response — wait for it instead of asserting immediately.
-    for _ in range(100):
-        if sent:
-            break
-        time.sleep(0.02)
+    # The send is fire-and-forget (a background task, so registered and
+    # unregistered addresses answer equally fast — no timing oracle). It can
+    # complete after the response returns, so wait on the send itself rather
+    # than a fixed delay (a 2s fixed wait flaked on a loaded CI runner,
+    # 2026-09-03) — and keep the request's event loop ALIVE meanwhile: outside
+    # a `with` block the TestClient spins a portal per request and closes its
+    # loop the moment the response returns, which drops the still-unstarted
+    # send on a loaded runner (xdist, 2026-09-09). Pinning one portal on the
+    # client is what the with-block form does, minus the app lifespan.
+    with anyio.from_thread.start_blocking_portal(backend="asyncio") as portal:
+        live = TestClient(app)
+        live.portal = portal
+        resp = live.post("/auth/forgot-password", json={"email": "invitee@t.com"})
+        assert resp.status_code == 200
+        assert sent_evt.wait(timeout=15), "reset email was not sent within 15s"
     assert len(sent) == 1
     assert sent[0][1].startswith("https://dash.example.com/reset-password?token=")
 

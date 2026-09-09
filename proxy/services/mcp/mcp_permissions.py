@@ -59,6 +59,39 @@ def _is_bundled(manifest: McpManifest) -> bool:
         return False
 
 
+def canonical_tool_name(tool_name: str) -> str:
+    """Map an engine-mangled ``mcp__<server>__<tool>`` name onto the
+    manifest's server name.
+
+    Codex exposes MCP tools to its PreToolUse hook with the server key
+    sanitized — ``meetings-mcp`` arrives as ``meetings_mcp`` — while every
+    permission rule, tier lookup and meeting check keys on the manifest's
+    ``server_name``. Observed live 2026-09-09: a Codex meeting participant's
+    ``mcp__meetings_mcp__direct_to`` missed the manifest's ``open`` rule,
+    fell to the default tier and parked the meeting on a permission card.
+    Unchanged when the server part already names a manifest, or none match.
+    """
+    if not tool_name.startswith("mcp__"):
+        return tool_name
+    parts = tool_name.split("__", 2)
+    if len(parts) < 3 or not parts[1] or not parts[2]:
+        return tool_name
+    server, tool = parts[1], parts[2]
+    from services.mcp import mcp_registry
+    names = [(m.server_name or m.name) for m in mcp_registry.get_all_manifests().values()]
+    if server in names:
+        return tool_name
+    for name in names:
+        if _sanitized_server_name(name) == server:
+            return f"mcp__{name}__{tool}"
+    return tool_name
+
+
+def _sanitized_server_name(name: str) -> str:
+    """The form Codex gives a server key in its hook tool names."""
+    return "".join(c if c.isalnum() or c == "_" else "_" for c in name)
+
+
 def resolve_tool_tier(server_name: str, tool_name: str) -> str:
     """Resolve the permission tier for ``mcp__<server_name>__<tool_name>``.
 

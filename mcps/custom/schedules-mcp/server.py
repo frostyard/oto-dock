@@ -162,7 +162,9 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="create_scheduled_task",
             description=(
-                "Create a recurring task — fire-and-forget only. "
+                "Create a recurring task — fire-and-forget only. Read the skill "
+                "`task-scheduling-guide` (Skill tool) before creating a recurring task: "
+                "notification modes, cron vs interval, model pinning, timezone rules. "
                 "Returns immediately; the task runs on its own schedule in the background. "
                 "No result is returned to this session — use get_task_history to check past runs. "
                 "Use this only for genuinely recurring automation (daily reports, weekly checks, etc.). "

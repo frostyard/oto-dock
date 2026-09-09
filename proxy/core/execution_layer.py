@@ -14,6 +14,12 @@ from typing import AsyncIterator
 
 from core.events.common_events import CommonEvent
 
+#: Client types with no human on the line: nobody answers a question or an
+#: approval, so the permission authority never waits for one (it allows,
+#: or denies-and-informs — api/hooks/hooks.py). The Codex layer runs its
+#: PreToolUse hook floor for exactly these sessions.
+UNATTENDED_CLIENT_TYPES: tuple[str, ...] = ("task", "phone", "meeting", "trigger", "internal")
+
 
 # ---------------------------------------------------------------------------
 # AgentConfig — bundles what each execution layer needs to start a session
@@ -43,7 +49,7 @@ class AgentConfig:
     # (it provisions from its own build_session_mcp_config call).
     mcp_secret_bundles: dict = field(default_factory=dict)
     permission_mode: str = "default"   # auto | default | plan | acceptEdits
-    client_type: str = ""              # dashboard | phone | task | sse
+    client_type: str = ""              # dashboard | phone | task | sse (UNATTENDED_CLIENT_TYPES below)
     model: str = ""                    # override model (empty = agent default)
     effort: str = ""                   # low | medium | high | max
     resume: bool = False               # CLI: --resume existing session

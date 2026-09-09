@@ -29,7 +29,13 @@ export function getToolDetail(name: string, summary: string | undefined, toolInp
     case 'Read':
     case 'Write':
     case 'Edit':
+    case 'Delete':
       return toolInput.file_path || ''
+    // Direct-LLM client-side builtins: the skill loaded / the search query.
+    case 'Skill':
+      return toolInput.name || ''
+    case 'tool_search':
+      return toolInput.query || ''
     case 'Grep':
       return [toolInput.pattern, toolInput.path].filter(Boolean).join(' in ')
     case 'Glob':
@@ -137,6 +143,20 @@ function ToolDetail({ name, toolInput }: { name: string; toolInput: any }) {
         {toolInput.path && <div className="font-mono">path: {toolInput.path}</div>}
         {toolInput.type && <div className="text-p-text-light">type: {toolInput.type}</div>}
         {toolInput.output_mode && <div className="text-p-text-light">mode: {toolInput.output_mode}</div>}
+      </div>
+    )
+  }
+
+  if (name === 'Delete' || name === 'Skill') {
+    // Direct-LLM builtins: one identifying line (the path / the skill name).
+    return <div className="font-mono">{toolInput.file_path || toolInput.name || ''}</div>
+  }
+
+  if (name === 'tool_search') {
+    return (
+      <div className="space-y-0.5">
+        {toolInput.query && <div className="font-mono">query: {toolInput.query}</div>}
+        {toolInput.max_results && <div className="text-p-text-light">max results: {toolInput.max_results}</div>}
       </div>
     )
   }

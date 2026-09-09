@@ -113,20 +113,23 @@ def _is_due(now_utc: datetime) -> tuple[bool, bool]:
 async def maybe_run_weekly() -> None:
     """Polled every 60s from app.py's registry sweep loop. Launches the weekly
     run as a background task when enabled, due, and inside the window (or
-    overdue). Never blocks the caller."""
-    if not mcp_updater.auto_update_enabled():
-        return
+    overdue). Never blocks the caller — the two gate reads and the slot claim
+    are store calls, so they run off the loop (run_db): this is a periodic
+    drumbeat, exactly the class that froze the proxy on 2026-09-03."""
+    from storage.pg import run_db
     if _run_lock.locked():
         return
+    if not await run_db(mcp_updater.auto_update_enabled):
+        return
     now = _now_utc()
-    due, overdue = _is_due(now)
+    due, overdue = await run_db(_is_due, now)
     if not due:
         return
     if not (overdue or _in_window(now)):
         return
     # Claim the slot up front so the next 60s tick sees "not due" even while the
     # run (incl. the multi-hour defer loop) is still in flight.
-    _set_last_run(now)
+    await run_db(_set_last_run, now)
     asyncio.create_task(_run_guarded(trigger="auto"))
 
 

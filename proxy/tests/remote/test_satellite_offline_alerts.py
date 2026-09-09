@@ -55,9 +55,11 @@ def harness(monkeypatch):
     monkeypatch.setattr(remote_store, "set_offline_alerted", _set_alerted)
 
     from services.remote import remote_status
+    # The evaluator passes the row it already holds (``machine=``) so it
+    # never re-reads the DB on the loop — accept and ignore it here.
     monkeypatch.setattr(
         remote_status, "get_live_machine_status",
-        lambda mid: state["status"][mid],
+        lambda mid, **_kw: state["status"][mid],
     )
 
     async def _fake_notify(machine_id, *, online):

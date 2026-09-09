@@ -90,3 +90,9 @@ Server sandbox by default (locked-down filesystem + network, per-service allowli
 An admin can set an agent's **Execution Target** to an admin-paired remote machine;
 users can run agents on their own paired machines. Device-control tools (browser,
 computer) exist only on remote machines with the matching grant.
+
+In the server sandbox, packages installed into HOME vanish when the session ends. An
+agent keeps Python packages across sessions in a virtualenv inside its workspace
+(`uv venv .venv`, then `uv pip install --python .venv/bin/python <pkg>`): it persists,
+never syncs to remote machines, and counts toward the agent's storage quota —
+`node_modules` in the workspace behaves the same way.

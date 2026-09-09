@@ -155,7 +155,9 @@ async def create_subscription(
             vendor_target=body.vendor_target,
             selected_events=body.selected_events,
             selected_subevents=body.selected_subevents or {},
-            caller_is_admin=bool(u.is_admin or u.is_api_key),
+            # The trusted master key counts as admin; a session token (an
+            # agent subprocess, incl. a phone caller's) never does.
+            caller_is_admin=bool(u.is_admin or u.is_service),
         )
     except subscription_manager.SubscriptionScopeError as e:
         raise HTTPException(

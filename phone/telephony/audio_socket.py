@@ -14,6 +14,7 @@ Frame types:
 import asyncio
 import collections
 import logging
+import os
 import struct
 import uuid as uuid_mod
 
@@ -49,6 +50,27 @@ class AudioSocketConnection(MediaTransport):
         self.writer = writer
         self.call_uuid: str | None = None
         self._closed = False
+        # A TLV header consumed by a read_frame() that was cancelled before
+        # its payload arrived (every caller polls through asyncio.wait_for):
+        # kept here so the next call resumes IN SYNC instead of reading three
+        # payload bytes as the next header and desyncing the stream for the
+        # rest of the call.
+        self._pending_header: bytes | None = None
+        # Diagnostic dump of the OUTGOING audio (everything send_audio ships:
+        # bed, fillers, breath, voice) for the first N seconds of the call,
+        # as a WAV under <BASE_DIR>/debug — OTODOCK_PHONE_DUMP_OUTGOING_S=N
+        # (default 0 = off). What Asterisk was given, byte for byte, so a
+        # "what did the caller hear at the start" question has an answer
+        # without guessing at the PBX (2026-09-07).
+        self._dump_remaining = 0
+        self._dump_file = None
+        self._dump_path = None
+        try:
+            dump_s = float(os.environ.get("OTODOCK_PHONE_DUMP_OUTGOING_S", "0") or 0)
+        except ValueError:
+            dump_s = 0.0
+        if dump_s > 0:
+            self._dump_remaining = int(dump_s * config.SAMPLE_RATE * 2)
         # Side-channel digits from the AMI event listener (signalled DTMF —
         # never present in the TLV stream). Bounded drop-oldest: nothing
         # drains it outside the PIN gate, a PIN entry is ≤ 7 chars, and
@@ -84,10 +106,16 @@ class AudioSocketConnection(MediaTransport):
     async def read_frame(self) -> tuple[int, bytes]:
         """Read one TLV frame. Returns (frame_type, payload).
 
-        Raises AudioSocketError on connection issues.
+        Cancellation-safe: ``readexactly`` consumes nothing while it waits,
+        so a caller's ``wait_for`` timeout can only cost the already-returned
+        header — which is parked in ``_pending_header`` and reused by the
+        next call. Raises AudioSocketError on connection issues.
         """
         try:
-            header = await self.reader.readexactly(HEADER_SIZE)
+            header = self._pending_header
+            if header is None:
+                header = await self.reader.readexactly(HEADER_SIZE)
+                self._pending_header = header
         except asyncio.IncompleteReadError:
             raise AudioSocketError("Connection closed during header read")
         except ConnectionError as e:
@@ -97,13 +125,16 @@ class AudioSocketConnection(MediaTransport):
         payload_len = struct.unpack(">H", header[1:3])[0]
 
         if payload_len == 0:
+            self._pending_header = None
             return frame_type, b""
 
         try:
             payload = await self.reader.readexactly(payload_len)
         except asyncio.IncompleteReadError:
+            self._pending_header = None
             raise AudioSocketError("Connection closed during payload read")
 
+        self._pending_header = None
         return frame_type, payload
 
     async def read_uuid(self) -> str:
@@ -145,6 +176,41 @@ class AudioSocketConnection(MediaTransport):
             self.writer.write(frame)
         except ConnectionError:
             self._closed = True
+        if self._dump_remaining > 0:
+            self._dump_frame(pcm_data)
+
+    def _dump_frame(self, pcm_data: bytes) -> None:
+        """Append one outgoing frame to the diagnostic WAV (see __init__)."""
+        try:
+            if self._dump_file is None:
+                import wave
+                debug_dir = config.BASE_DIR / "debug"
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                name = (self.call_uuid or self.peer_addr.replace(":", "-")) + "-out.wav"
+                self._dump_path = debug_dir / name
+                self._dump_file = wave.open(str(self._dump_path), "wb")
+                self._dump_file.setnchannels(1)
+                self._dump_file.setsampwidth(2)
+                self._dump_file.setframerate(config.SAMPLE_RATE)
+                logger.info(f"[{self.peer_addr}] Dumping outgoing audio to {self._dump_path}")
+            take = pcm_data[:self._dump_remaining]
+            self._dump_file.writeframes(take)
+            self._dump_remaining -= len(take)
+            if self._dump_remaining <= 0:
+                self._close_dump()
+        except Exception as e:
+            logger.warning(f"[{self.peer_addr}] Outgoing audio dump failed: {e}")
+            self._dump_remaining = 0
+            self._close_dump()
+
+    def _close_dump(self) -> None:
+        f, self._dump_file = self._dump_file, None
+        if f is not None:
+            try:
+                f.close()
+                logger.info(f"[{self.peer_addr}] Outgoing audio dump closed: {self._dump_path}")
+            except Exception:
+                pass
 
     async def drain(self) -> None:
         """Flush the write buffer."""
@@ -170,6 +236,7 @@ class AudioSocketConnection(MediaTransport):
         if self._closed:
             return
         self._closed = True
+        self._close_dump()
         try:
             self.writer.close()
             await self.writer.wait_closed()

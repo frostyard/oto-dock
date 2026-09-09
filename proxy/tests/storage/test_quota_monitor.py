@@ -145,6 +145,13 @@ def test_message_user_scope_names_the_user():
     assert "bob" in body
 
 
+def test_message_external_scope_names_the_callers():
+    sc = _scope("external:acme", "external", "acme")
+    title, body = qm._message(sc, "bytes", 100, 1024 ** 3, 1024 ** 3)
+    assert "callers' folders" in body
+    assert "None" not in body
+
+
 def test_message_inode_metric():
     sc = _scope()
     title, body = qm._message(sc, "inodes", 100, 10000, 10000)

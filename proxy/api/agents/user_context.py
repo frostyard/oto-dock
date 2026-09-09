@@ -13,6 +13,7 @@ from auth.providers import UserContext, get_current_user, require_agent_access, 
 
 from api.agents._common import _get_agent_dir
 from api.agents._router import router
+from services.infra.path_confinement import PathOutsideRoot, resolve_under
 
 
 CONTEXT_ALLOWED_EXTENSIONS = {".md", ".txt"}
@@ -30,9 +31,21 @@ def _get_user_context_dir(agent_name: str, user: UserContext) -> Path:
     if not username:
         raise HTTPException(400, "User has no username slug")
     agent_dir = _get_agent_dir(agent_name)
-    ctx_dir = agent_dir / "users" / username / "context"
+    try:
+        ctx_dir = resolve_under(agent_dir / "users" / username / "context", agent_dir)
+    except PathOutsideRoot:
+        raise HTTPException(403, "Path traversal not allowed")
     ctx_dir.mkdir(parents=True, exist_ok=True)
     return ctx_dir
+
+
+def _context_file(ctx_dir: Path, filename: str) -> Path:
+    """``ctx_dir/filename`` confined to the context dir — a route segment
+    can still spell ``..`` or name a symlink that points out."""
+    try:
+        return resolve_under(ctx_dir / filename, ctx_dir)
+    except PathOutsideRoot:
+        raise HTTPException(403, "Path traversal not allowed")
 
 
 class UserContextFileRequest(BaseModel):
@@ -74,11 +87,7 @@ async def get_user_context_file(
     require_agent_access(u, name)
     ctx_dir = _get_user_context_dir(name, u)
 
-    # Validate filename
-    file_path = (ctx_dir / filename).resolve()
-    ctx_root = ctx_dir.resolve()
-    if file_path != ctx_root and not file_path.is_relative_to(ctx_root):
-        raise HTTPException(403, "Path traversal not allowed")
+    file_path = _context_file(ctx_dir, filename)
     if file_path.suffix not in CONTEXT_ALLOWED_EXTENSIONS:
         raise HTTPException(400, f"Only {', '.join(CONTEXT_ALLOWED_EXTENSIONS)} files allowed")
     if not file_path.exists():
@@ -106,10 +115,7 @@ async def set_user_context_file(
     path = Path(filename)
     if path.suffix not in CONTEXT_ALLOWED_EXTENSIONS:
         filename = filename + ".md"
-    file_path = (ctx_dir / filename).resolve()
-    ctx_root = ctx_dir.resolve()
-    if file_path != ctx_root and not file_path.is_relative_to(ctx_root):
-        raise HTTPException(403, "Path traversal not allowed")
+    file_path = _context_file(ctx_dir, filename)
 
     file_path.write_text(body.content)
     return {"status": "ok", "name": filename}
@@ -126,10 +132,7 @@ async def delete_user_context_file(
     require_agent_access(u, name)
     ctx_dir = _get_user_context_dir(name, u)
 
-    file_path = (ctx_dir / filename).resolve()
-    ctx_root = ctx_dir.resolve()
-    if file_path != ctx_root and not file_path.is_relative_to(ctx_root):
-        raise HTTPException(403, "Path traversal not allowed")
+    file_path = _context_file(ctx_dir, filename)
     if not file_path.exists():
         raise HTTPException(404, "File not found")
 

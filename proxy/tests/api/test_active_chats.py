@@ -7,6 +7,7 @@ literal path isn't shadowed by the /v1/chats/{chat_id} param route, and the
 two deterministic-title broadcast sites the widget's title path rides on.
 """
 
+import asyncio
 import uuid
 
 import pytest
@@ -404,15 +405,19 @@ def test_persist_first_prompt_broadcasts_inside_not_title_guard(temp_db, monkeyp
     ctrl.notify_connection_id = "conn-test"
 
     cid = _mk_chat("user-alice")
-    ctrl._persist_first_prompt(cid, "deploy the fix")
-    assert task_store.get_chat(cid)["title"] == "deploy the fix"
-    assert calls == [(("user-alice", cid, "deploy the fix"), {"agent": AGENT})]
 
-    # Cold re-send of an already-titled chat re-runs the persist — the
-    # broadcast must stay INSIDE the not-title guard (no rename churn).
-    ctrl._persist_first_prompt(cid, "a different prompt")
-    assert task_store.get_chat(cid)["title"] == "deploy the fix"
-    assert len(calls) == 1
+    async def scenario():
+        # Awaited: the row + conditional title land as one chat-lane job.
+        await ctrl._persist_first_prompt(cid, "deploy the fix")
+        assert task_store.get_chat(cid)["title"] == "deploy the fix"
+        assert calls == [(("user-alice", cid, "deploy the fix"), {"agent": AGENT})]
+
+        # Cold re-send of an already-titled chat re-runs the persist — the
+        # broadcast must stay INSIDE the not-title guard (no rename churn).
+        await ctrl._persist_first_prompt(cid, "a different prompt")
+        assert task_store.get_chat(cid)["title"] == "deploy the fix"
+        assert len(calls) == 1
+    asyncio.run(scenario())
 
 
 def test_first_turn_title_branch_broadcasts_and_keeps_socket_send(temp_db, monkeypatch):

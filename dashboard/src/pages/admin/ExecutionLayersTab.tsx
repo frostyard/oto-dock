@@ -2,7 +2,9 @@
  * Admin Execution Layers tab — manages subscriptions and models per layer.
  *
  * One expandable card per execution layer. Each card shows:
- * - Subscriptions (API keys, OAuth, local endpoints) with add/remove
+ * - Subscriptions (API keys, OAuth) with add/remove
+ * - Local models (self-hosted endpoints, listed once, enabled per engine) —
+ *   the same section inside the Direct LLM API and Codex CLI cards
  * - Models (builtin + custom) with enable/disable toggles
  */
 
@@ -15,7 +17,8 @@ import {
   type DiscoveredModel,
 } from '../../api/executionLayers'
 import { Badge } from './ExecutionLayersTab.widgets'
-import { AddApiKeyForm, AddLocalEndpointForm, ConnectOAuth, DiscoverModelsPanel } from './ExecutionLayersTab.forms'
+import { AddApiKeyForm, ConnectOAuth, DiscoverModelsPanel } from './ExecutionLayersTab.forms'
+import { LocalModelsSection } from './ExecutionLayersTab.local'
 import { SubscriptionRow, ModelsByProvider } from './ExecutionLayersTab.rows'
 import { SetupBanner } from './ExecutionLayersTab.sections'
 
@@ -26,13 +29,15 @@ import { SetupBanner } from './ExecutionLayersTab.sections'
 function LayerCard({ layer }: { layer: ExecutionLayerInfo }) {
   const [expanded, setExpanded] = useState(false)
   const [showAddApiKey, setShowAddApiKey] = useState(false)
-  const [showAddEndpoint, setShowAddEndpoint] = useState<string | null>(null) // provider name
   const [showAddModel, setShowAddModel] = useState<string | false>(false)
   const [showOAuth, setShowOAuth] = useState(false)
   const [discoverState, setDiscoverState] = useState<{
     sub: Subscription
     models: DiscoveredModel[] | null
     provider: string
+    // Engines the discovered models are added to — a shared local endpoint
+    // adds to every engine it is enabled for; undefined = this card's engine.
+    layers?: string[]
   } | null>(null)
 
   const discoverMut = useDiscoverModels()
@@ -47,17 +52,12 @@ function LayerCard({ layer }: { layer: ExecutionLayerInfo }) {
   const activeSubs = subs.filter((s) => s.status === 'active').length
   const oauthCount = subs.filter((s) => s.auth_type === 'oauth').length
   const apiKeyCount = subs.filter((s) => s.auth_type === 'api_key').length
-  const endpointCount = subs.filter((s) => s.auth_type === 'local_endpoint').length
   const hostedCount = subs.filter((s) => s.auth_type === 'relay' && s.status === 'active').length
   // Hosted (relay) subs render in their own toggle box; the row list shows only
-  // bring-your-own credentials (keys / local endpoints / OAuth).
+  // bring-your-own credentials (keys / OAuth). Local endpoints live in the
+  // shared Local models section (the server lists them once, not per layer).
   const rowSubs = isDirectLlm ? subs.filter((s) => s.auth_type !== 'relay') : subs
-
-  // Determine available providers for local endpoints (Codex layer)
-  const providers = (layer.capabilities as Record<string, unknown>).providers as
-    | { id: string; label: string; requires_key?: boolean }[]
-    | null
-  const localProviders = providers?.filter((p) => !p.requires_key) ?? []
+  const hasLocalModels = isDirectLlm || layer.name === 'codex-cli'
 
   // Determine the main provider for API keys
   const mainProvider = layer.name === 'codex-cli' ? 'openai'
@@ -67,13 +67,13 @@ function LayerCard({ layer }: { layer: ExecutionLayerInfo }) {
   // Existing model IDs for the discover panel
   const existingModelIds = new Set(layer.models.map((m) => m.model_id))
 
-  const handleDiscover = (sub: Subscription) => {
-    setDiscoverState({ sub, models: null, provider: sub.provider })
+  const handleDiscover = (sub: Subscription, layers?: string[]) => {
+    setDiscoverState({ sub, models: null, provider: sub.provider, layers })
     discoverMut.mutate(
       { layer: layer.name, subscriptionId: sub.id },
       {
         onSuccess: (data) => {
-          setDiscoverState({ sub, models: data.models, provider: data.provider })
+          setDiscoverState({ sub, models: data.models, provider: data.provider, layers })
         },
         onError: () => {
           // Keep panel open so error is visible
@@ -81,6 +81,55 @@ function LayerCard({ layer }: { layer: ExecutionLayerInfo }) {
       },
     )
   }
+
+  // The discover panel (loading / error / results) renders under the list it
+  // was launched from: below the key rows for a key subscription, below the
+  // shared Local models section for a local endpoint — a panel ABOVE the
+  // section read as belonging to the key list (operator feedback 2026-09-06).
+  const isLocalDiscover = discoverState != null
+    && (discoverState.provider === 'ollama' || discoverState.provider === 'openai_compatible')
+  const discoverPanel = discoverState ? (
+    <>
+      {/* Discover models: loading state */}
+      {!discoverState.models && (
+        <div className="mt-3 p-4 bg-p-bg rounded-xl border border-p-border-light">
+          {discoverMut.isPending ? (
+            <div className="flex items-center gap-3">
+              <svg className="animate-spin h-4 w-4 text-brand" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+              </svg>
+              <span className="text-sm text-p-text-secondary">
+                Fetching models from {discoverState.provider}...
+              </span>
+            </div>
+          ) : discoverMut.isError ? (
+            <div className="space-y-2">
+              <p className="text-sm text-red-500">{(discoverMut.error as Error).message}</p>
+              <button
+                onClick={() => setDiscoverState(null)}
+                className="text-xs text-p-text-secondary hover:text-p-text transition-colors"
+              >
+                Dismiss
+              </button>
+            </div>
+          ) : null}
+        </div>
+      )}
+
+      {/* Discover models: results panel */}
+      {discoverState.models && (
+        <DiscoverModelsPanel
+          layer={layer.name}
+          provider={discoverState.provider}
+          discoveredModels={discoverState.models}
+          existingModelIds={existingModelIds}
+          onDone={() => setDiscoverState(null)}
+          layers={discoverState.layers}
+        />
+      )}
+    </>
+  ) : null
 
   return (
     <div className="bg-white dark:bg-p-surface rounded-xl border border-p-border-light overflow-hidden">
@@ -103,7 +152,6 @@ function LayerCard({ layer }: { layer: ExecutionLayerInfo }) {
               hostedCount > 0 && `${hostedCount} hosted`,
               oauthCount > 0 && `${oauthCount} sub${oauthCount !== 1 ? 's' : ''}`,
               apiKeyCount > 0 && `${apiKeyCount} key${apiKeyCount !== 1 ? 's' : ''}`,
-              endpointCount > 0 && `${endpointCount} endpoint${endpointCount !== 1 ? 's' : ''}`,
             ].filter(Boolean).join(', ') || 'No connections'}
           </Badge>
           {layer.subscriptions.user_count > 0 && (
@@ -129,31 +177,22 @@ function LayerCard({ layer }: { layer: ExecutionLayerInfo }) {
               <div className="flex flex-wrap gap-2">
                 {(layer.name === 'claude-code-cli' || layer.name === 'codex-cli') && (
                   <button
-                    onClick={() => { setShowOAuth(!showOAuth); setShowAddApiKey(false); setShowAddEndpoint(null) }}
+                    onClick={() => { setShowOAuth(!showOAuth); setShowAddApiKey(false) }}
                     className="text-xs text-brand hover:text-brand-hover transition-colors"
                   >
                     + Connect Account
                   </button>
                 )}
                 <button
-                  onClick={() => { setShowAddApiKey(!showAddApiKey); setShowAddEndpoint(null); setShowOAuth(false) }}
+                  onClick={() => { setShowAddApiKey(!showAddApiKey); setShowOAuth(false) }}
                   className="text-xs text-brand hover:text-brand-hover transition-colors"
                 >
                   + API Key
                 </button>
-                {localProviders.map((p) => (
-                  <button
-                    key={p.id}
-                    onClick={() => { setShowAddEndpoint(showAddEndpoint === p.id ? null : p.id); setShowAddApiKey(false); setShowOAuth(false) }}
-                    className="text-xs text-brand hover:text-brand-hover transition-colors"
-                  >
-                    + {p.label}
-                  </button>
-                ))}
               </div>
             </div>
 
-            {rowSubs.length === 0 && !showAddApiKey && !showAddEndpoint && !showOAuth && (
+            {rowSubs.length === 0 && !showAddApiKey && !showOAuth && (
               <p className="text-sm text-p-text-light py-2">
                 {isDirectLlm
                   ? 'No API keys configured.'
@@ -178,48 +217,24 @@ function LayerCard({ layer }: { layer: ExecutionLayerInfo }) {
             {showAddApiKey && (
               <AddApiKeyForm layer={layer.name} provider={mainProvider} onDone={() => setShowAddApiKey(false)} />
             )}
-            {showAddEndpoint && (
-              <AddLocalEndpointForm layer={layer.name} provider={showAddEndpoint} onDone={() => setShowAddEndpoint(null)} />
-            )}
 
-            {/* Discover models: loading state */}
-            {discoverState && !discoverState.models && (
-              <div className="mt-3 p-4 bg-p-bg rounded-xl border border-p-border-light">
-                {discoverMut.isPending ? (
-                  <div className="flex items-center gap-3">
-                    <svg className="animate-spin h-4 w-4 text-brand" fill="none" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                    </svg>
-                    <span className="text-sm text-p-text-secondary">
-                      Fetching models from {discoverState.provider}...
-                    </span>
-                  </div>
-                ) : discoverMut.isError ? (
-                  <div className="space-y-2">
-                    <p className="text-sm text-red-500">{(discoverMut.error as Error).message}</p>
-                    <button
-                      onClick={() => setDiscoverState(null)}
-                      className="text-xs text-p-text-secondary hover:text-p-text transition-colors"
-                    >
-                      Dismiss
-                    </button>
-                  </div>
-                ) : null}
-              </div>
-            )}
-
-            {/* Discover models: results panel */}
-            {discoverState?.models && (
-              <DiscoverModelsPanel
-                layer={layer.name}
-                provider={discoverState.provider}
-                discoveredModels={discoverState.models}
-                existingModelIds={existingModelIds}
-                onDone={() => setDiscoverState(null)}
-              />
-            )}
+            {/* Discover panel for a key subscription — under the key rows */}
+            {!isLocalDiscover && discoverPanel}
           </div>
+
+          {/* Local models — shared across the engines that dial OpenAI-compatible servers */}
+          {hasLocalModels && (
+            <div>
+              <LocalModelsSection
+                layer={layer.name}
+                onDiscover={(t) => handleDiscover(
+                  { id: t.id, provider: t.provider, layer: layer.name } as Subscription, t.layers,
+                )}
+              />
+              {/* Discover panel for a local endpoint — under the section it came from */}
+              {isLocalDiscover && discoverPanel}
+            </div>
+          )}
 
           {/* Models Section */}
           <div>

@@ -161,9 +161,11 @@ _CODEX_RUNTIME_GLOBS = ("*.sqlite*",)
 # worker), both paths regenerate auth.json at session start (local
 # ``_write_auth_json``; remote via the ``start_session`` ``auth_json``
 # payload), and nothing ever reads the file back — syncing it was redundant
-# and could clobber a daemon-refreshed token mid-session.
+# and could clobber a daemon-refreshed token mid-session. ``models.json`` is
+# the per-session model catalog of a local-model session (a host-absolute
+# path in config.toml points at it; each host writes its own).
 _CODEX_HOST_LOCAL_FILES = frozenset({
-    "config.toml", "AGENTS.md", "hooks.json", "auth.json",
+    "config.toml", "AGENTS.md", "hooks.json", "auth.json", "models.json",
 })
 
 
@@ -574,6 +576,10 @@ def compute_manifest(
         ]
         if exclude_user_dirs and root == str(agent_dir) and "users" in dirs:
             dirs.remove("users")
+        # External callers' trees (phone callers who are not platform users)
+        # live on the proxy host only — never synced to any satellite.
+        if root == str(agent_dir) and "externals" in dirs:
+            dirs.remove("externals")
         if matcher is not None:
             for d in dirs:
                 if matcher.named_match(d, files):
@@ -672,6 +678,8 @@ def _is_other_user_or_sensitive(rel_path: str, target_username: str) -> bool:
     if parts and parts[0] == "users" and len(parts) >= 2:
         if parts[1] != target_username:
             return True
+    if parts and parts[0] == "externals":
+        return True  # callers' trees never leave the proxy host
     for prefix in _SENSITIVE_PATH_PREFIXES:
         if rel_path.startswith(prefix):
             return True
@@ -914,6 +922,8 @@ def should_sync_to_target(rel_path: str, username: str | None, role: str) -> boo
     NOTE: this governs the PUSH direction (platform → satellite). The satellite →
     platform WRITE direction is the separate ``can_write_back`` predicate above.
     """
+    if rel_path.startswith("externals/"):
+        return False  # callers' trees never leave the proxy host (any target)
     if username is not None and _is_other_user_or_sensitive(rel_path, username):
         return False
     owner_tier = role in ("manager", "admin")

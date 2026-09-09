@@ -305,3 +305,149 @@ def test_build_turn_prompt_restate_footer():
     prompt = build_turn_prompt(meeting, "p1", transcript, prompt_type="restate")
     assert "did not include your findings" in prompt
     assert "direct_to" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Turn-end backstop state + end_meeting summary salvage (2026-09-09)
+# ---------------------------------------------------------------------------
+#
+# Live incident mtg-55a9c2cf4c90: the moderator called direct_to, kept
+# running tools for 304 s inside the same turn (the orchestrator routes only
+# at the turn boundary, so the participant never spoke), and wrote its summary
+# AFTER end_meeting — discarded by the echo guard. The hook now denies tools
+# after a routing call (api/hooks); the runner clears that state around the
+# turn and keeps a summary written after the MODERATOR's end_meeting.
+
+from core.session.session_state import (  # noqa: E402
+    cleanup_meeting_session_info,
+    get_meeting_session_info,
+    mark_meeting_turn_routed,
+    set_meeting_session_info,
+)
+
+END_MEETING = "mcp__meetings-mcp__end_meeting"
+
+
+class _RecordingLayer(_ScriptedLayer):
+    """Scripted layer whose event list may carry callables (run in-stream,
+    between events)."""
+
+    async def send_message(self, sid, prompt):
+        for ev in self._events:
+            if callable(ev):
+                ev()
+                continue
+            yield ev
+
+
+async def _run_turn_as(agent, events, *, layer=None):
+    meeting = {
+        "id": "m1", "topic": "t", "moderator": "mod",
+        "parent_chat_id": "chat-relay-4",
+        "participants": json.dumps(["mod", "p1"]),
+    }
+    layer = layer or _RecordingLayer(events)
+    MO._meeting_session_layers["sid-1"] = layer
+    queue: asyncio.Queue = asyncio.Queue()
+    try:
+        result = await MO._run_live_turn(
+            agent, {agent: "sid-1"}, meeting, [], {}, queue, "m1",
+        )
+    finally:
+        MO._meeting_session_layers.pop("sid-1", None)
+    forwarded_text = []
+    while not queue.empty():
+        ev = queue.get_nowait()
+        if ev.type == TEXT:
+            forwarded_text.append(ev.data["content"])
+    return result, forwarded_text, layer
+
+
+def _end_meeting_shape(pre_text, post_text):
+    return [
+        _text(pre_text),
+        _tool_use(END_MEETING),
+        _tool_input(END_MEETING, meeting_id="m1"),
+        _tool_result(END_MEETING),
+        _text(post_text),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_moderator_summary_after_end_meeting_is_kept():
+    result, forwarded, _ = await _run_turn_as(
+        "mod", _end_meeting_shape("Wrapping up.", "SUMMARY: ship 1.6 Friday."),
+    )
+    assert result.content == "Wrapping up.SUMMARY: ship 1.6 Friday."
+    assert "end_meeting" in result.tools_called
+    # The salvaged summary is displayed too, not only collected.
+    assert "SUMMARY: ship 1.6 Friday." in forwarded
+
+
+@pytest.mark.asyncio
+async def test_moderator_echo_after_a_written_summary_is_dropped():
+    summary = "SUMMARY: " + "the release is on track. " * 15  # > 300 chars
+    result, forwarded, _ = await _run_turn_as(
+        "mod", _end_meeting_shape(summary, "TRANSCRIPT ECHO JUNK"),
+    )
+    assert result.content == summary
+    assert "TRANSCRIPT ECHO JUNK" not in forwarded
+
+
+@pytest.mark.asyncio
+async def test_participant_text_after_end_meeting_is_dropped():
+    # A participant's end_meeting is refused by the API and routes nothing;
+    # its trailing text stays under the echo guard like any other tool.
+    result, forwarded, _ = await _run_turn_as(
+        "p1", _end_meeting_shape("Trying to close.", "AFTER"),
+    )
+    assert result.content == "Trying to close."
+    assert "AFTER" not in forwarded
+
+
+@pytest.mark.asyncio
+async def test_backstop_state_is_cleared_around_the_turn():
+    set_meeting_session_info("sid-1", "parent-1", "meeting-m1", "mod", "chat-relay-4",
+                             is_moderator=True)
+    seen: list[str] = []
+    try:
+        # Left over from the previous turn (a direct_to that closed it).
+        mark_meeting_turn_routed("sid-1", "direct_to")
+        events = [
+            lambda: seen.append(get_meeting_session_info("sid-1")["routed_tool"]),
+            _text("Report."),
+            lambda: seen.append(str(get_meeting_session_info("sid-1")["turn_text_chars"])),
+            _tool_use(DIRECT_TO),
+            _tool_input(DIRECT_TO, agents=["p1"]),
+            _tool_result(DIRECT_TO),
+        ]
+        result, _, _ = await _run_turn_as("mod", events)
+        info = get_meeting_session_info("sid-1")
+        assert seen == ["", str(len("Report."))]  # cleared at start; text counted live
+        assert result.directed_to == ["p1"]
+        assert info["routed_tool"] == ""
+        assert info["turn_text_chars"] == 0
+    finally:
+        cleanup_meeting_session_info("sid-1")
+
+
+@pytest.mark.asyncio
+async def test_participant_end_meeting_does_not_end_the_meeting():
+    # tools_called is recorded at TOOL_INPUT, before the API's 403 — the
+    # producer must only honour the moderator's end_meeting.
+    calls, saved = await _drive_meeting([
+        _result("mod", "Report please.", directed=["p1"]),
+        _result("p1", "Done, closing.", directed=["mod"], called=("end_meeting",)),
+        _result("mod", "Summary.", called=("end_meeting",)),
+    ])
+    assert [c[0] for c in calls] == ["mod", "p1", "mod"]
+    assert len(saved) == 3
+
+
+def test_turn_prompts_say_replies_arrive_next_turn():
+    meeting = _meeting_row()
+    start = build_turn_prompt(meeting, "mod", [], prompt_type="start")
+    assert "next turn" in start and "stop" in start
+    from services.meetings.meeting_context import _MEETING_AGENT_SUFFIX
+    assert "NEXT turn" in _MEETING_AGENT_SUFFIX
+    assert "denies every tool call" in _MEETING_AGENT_SUFFIX

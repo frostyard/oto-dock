@@ -2,7 +2,7 @@
   "name": "agent-creator-mcp",
   "label": "Agent Creator",
   "description": "Create new agents from a template folder. Author the template (persona, MCPs, skills, schedules, onboarding), validate it, then install it as a new agent on the platform.",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "category": "core",
 
   "server": {
@@ -21,7 +21,7 @@
   "env": {},
   "agent_env": {},
 
-  "exclude_from": ["phone", "task", "meeting"],
+  "exclude_from": ["phone", "task", "meeting", "external"],
 
   "skills": [
     {

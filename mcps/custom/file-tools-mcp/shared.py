@@ -216,13 +216,16 @@ async def _resolve_path(path: str, writing: bool = False) -> str:
     the parent dir if the exact path doesn't exist on disk (see
     ``_unicode_match_on_disk``).
     """
-    # Already container-absolute? Just validate it sits under the mount.
-    if path.startswith(MOUNT_AGENTS_DIR + "/") or path == MOUNT_AGENTS_DIR:
-        resolved = str(Path(path).resolve())
-        if resolved.startswith(MOUNT_AGENTS_DIR):
-            return _unicode_match_on_disk(resolved)
+    # A container-absolute path goes through the proxy like every other
+    # form: the mount holds EVERY agent's tree, so the prefix alone says
+    # nothing about this session's rights on the file (another agent, another
+    # user's folder, a caller's config). Hand the proxy the agents-relative
+    # form and let the session's path policy decide.
+    if path == MOUNT_AGENTS_DIR:
+        path = ""
+    elif path.startswith(MOUNT_AGENTS_DIR + "/"):
+        path = path[len(MOUNT_AGENTS_DIR) + 1:]
 
-    # Otherwise ask the proxy to translate.
     agents_rel, reason = await _resolve_via_proxy(path, writing=writing)
     if agents_rel:
         cp = MOUNT_AGENTS_DIR + ("/" + agents_rel.lstrip("/"))
@@ -240,8 +243,10 @@ async def _resolve_path(path: str, writing: bool = False) -> str:
 
 
 def _op_type(op: dict) -> str:
-    """Extract operation type — LLMs may use 'type', 'op', 'operation', or 'action'."""
-    return op.get("type") or op.get("op") or op.get("operation") or op.get("action") or ""
+    """Extract operation type — LLMs may use 'op', 'operation', 'action' or
+    'type'. An explicit op key wins: next to one, 'type' is a parameter of
+    that operation (add_chart's chart type), not the dispatch key."""
+    return op.get("op") or op.get("operation") or op.get("action") or op.get("type") or ""
 
 
 def _normalize_operations(ops) -> tuple[list[dict], int]:

@@ -271,6 +271,11 @@ def assemble_phone_config() -> dict:
             pin = phone_route_store.get_route_pin(r["id"])
             if pin:
                 r["pin"] = pin
+        # Route identity / role / remember-callers are proxy-side session
+        # policy (the warmup resolves them from the route id); the daemon has
+        # no use for them and the tied user's sub must not travel.
+        for proxy_only in ("identity_mode", "identity_user_sub", "role", "remember_callers"):
+            r.pop(proxy_only, None)
 
     # Default-for-calls providers set the per-call default STT/TTS ids (below) +
     # the global endpointing fallback. Per-provider voices, advanced and API keys

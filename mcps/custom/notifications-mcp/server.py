@@ -90,7 +90,9 @@ async def list_tools() -> list[Tool]:
                 "notifications (phone/browser) and appear in the notification inbox. "
                 "Keep them SHORT — a notification is a headline plus one nudge; details "
                 "belong in the digest file, dashboard, or chat, never in the body. "
-                "Use severity carefully: 'danger' triggers an alarm that loops until dismissed."
+                "Use severity carefully: 'danger' triggers an alarm that loops until dismissed. "
+                "Scheduling a notification (run_at / cron schedule)? Read the skill "
+                "`notifications-guide` (Skill tool) first for the timezone rules and examples."
             ),
             inputSchema={
                 "type": "object",

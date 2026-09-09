@@ -625,6 +625,12 @@ class McpManifest:
     permissions: PermissionsBlock | None = None  # per-tool permission tiers (see mcp_permissions)
     agent_context: list[AgentContextBlock] = field(default_factory=list)  # per-session prompt blocks
     tool_filter: ToolFilterConfig | None = None  # Runtime tool restriction support
+    # Direct-LLM deferred tool loading (core/layers/direct/tool_catalog.py):
+    # True keeps this MCP's tool schemas RESIDENT in every request instead of
+    # behind `tool_search`. Bundled manifests set it on memory-mcp only (the
+    # memory tool is called on most turns); community manifests may opt out
+    # of deferral the same way.
+    always_load: bool = False
     # Device-local MCP class (computer / browser / app-connector control)
     placement: str = "any"  # "any" | "satellite_only"
     remote_policy: str = "any"  # "any" | "admin_paired_only"

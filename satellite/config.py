@@ -544,10 +544,10 @@ _DEFAULT_CONFIG_PATH = otodock_dir() / "satellite.conf"
 # this on any change to the satellite<->proxy contract; a purely additive frame
 # an older proxy can safely ignore needs a bump only when the proxy must gate
 # behaviour on it (e.g. satellite_supports_pty). Per-change history is in git.
-SATELLITE_VERSION = "0.5.114"
+SATELLITE_VERSION = "0.5.118"
 SHARED_STDIO_INTERCEPTOR_HASH = "7afe65d06ada641e89c9901c261417dbf3d0786f043ff415b7a580248b831449"
 SHARED_CODEX_APPROVALS_HASH = "118ad311166465a2ab4990177cefc056af3ca236af38a112556dfc0a3e362391"
-SHARED_APP_SERVER_CLIENT_HASH = "8afc272b0568ff5da018ed5be03fcf3b91c830c58f6d074ca3f13e56537bbb8b"
+SHARED_APP_SERVER_CLIENT_HASH = "dca6faa22c0275c59712a7887f3eed7eec0ebe302a44b2cba17728aed48bbd39"
 SHARED_MCP_INSTALLER_HASH = "61b99c692d36c17760d6de93abd2a269d4a3ed9a8da861fa9c829fb351221419"
 
 

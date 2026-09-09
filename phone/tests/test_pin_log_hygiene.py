@@ -1,4 +1,4 @@
-"""Grep guard: DTMF digits and PINs must never be interpolated into logs.
+"""Log hygiene: DTMF digits, PINs and dialed numbers never reach the log.
 
 Source-level check (the test_grep_no_voice_strings convention): the files
 that touch keypad digits or PIN values must not format them into any string
@@ -44,3 +44,15 @@ def test_twilio_dtmf_log_carries_no_value():
             # The literal word "digit" is fine; interpolating the variable
             # (any brace right of "DTMF") is not.
             assert "{" not in line.split("DTMF", 1)[1], line
+
+
+def test_call_registration_log_carries_no_number(caplog):
+    """The dialed number is personal data — it lives on the call record,
+    never in the log line."""
+    import logging
+    from calls.call_manager import CallManager
+    with caplog.at_level(logging.INFO, logger="call_manager"):
+        call = CallManager().register_call("+15559998888", "say hi")
+    assert call.phone_number == "+15559998888"
+    assert call.call_id in caplog.text
+    assert "9998888" not in caplog.text

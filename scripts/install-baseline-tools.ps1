@@ -322,8 +322,8 @@ if (Get-Command npm -ErrorAction SilentlyContinue) {
     # CODEX_VERSION). Mirrors install-baseline-tools.sh: the platform runs a
     # VERIFIED CLI (in-app auto-update disabled), so a mismatched install is
     # UPGRADED to the pin, not skipped.
-    $ClaudeCodeVersion = if ($env:CLAUDE_CODE_VERSION) { $env:CLAUDE_CODE_VERSION } else { '2.1.258' }
-    $CodexVersion      = if ($env:CODEX_VERSION) { $env:CODEX_VERSION } else { '0.149.1' }
+    $ClaudeCodeVersion = if ($env:CLAUDE_CODE_VERSION) { $env:CLAUDE_CODE_VERSION } else { '2.1.263' }
+    $CodexVersion      = if ($env:CODEX_VERSION) { $env:CODEX_VERSION } else { '0.153.4' }
 
     function Test-ResolvedCli {
         # After an install/upgrade, verify what the shell NOW resolves for the

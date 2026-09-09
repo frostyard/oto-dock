@@ -9,6 +9,7 @@ import hmac
 import json
 import logging
 import secrets
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 
 from storage.pg import get_conn
@@ -33,6 +34,9 @@ _SECRET_COLUMNS = (
     "pairing_token_hash",
     "pairing_token_created_at",
     "machine_secret_hash",
+    # Own-browser mode's Playwright Extension token; read only by
+    # get_target_browser_settings' targeted SELECT.
+    "browser_extension_token_enc",
 )
 
 
@@ -115,7 +119,8 @@ def get_remote_machine(machine_id: str) -> dict | None:
     """
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT rm.*, COALESCE(u.role, '') AS owner_role "
+            "SELECT rm.*, COALESCE(u.role, '') AS owner_role, "
+            "       (rm.browser_extension_token_enc IS NOT NULL) AS browser_extension_token_set "
             "FROM remote_machines rm "
             "LEFT JOIN users u ON u.sub = rm.registered_by "
             "WHERE rm.id = %s",
@@ -227,7 +232,8 @@ def get_all_remote_machines() -> list[dict]:
             "SELECT rm.*, "
             "       COALESCE(u.display_name, '') AS owner_display_name, "
             "       COALESCE(u.email, '')        AS owner_email, "
-            "       COALESCE(u.role, '')         AS owner_role "
+            "       COALESCE(u.role, '')         AS owner_role, "
+            "       (rm.browser_extension_token_enc IS NOT NULL) AS browser_extension_token_set "
             "FROM remote_machines rm "
             "LEFT JOIN users u ON u.sub = rm.registered_by "
             "ORDER BY rm.name"
@@ -372,10 +378,21 @@ def set_device_grants(machine_id: str, grants: list[str]) -> None:
     """
     cleaned = sorted({str(g) for g in (grants or [])})
     with get_conn() as conn:
-        conn.execute(
-            "UPDATE remote_machines SET device_grants = %s WHERE id = %s",
-            (json.dumps(cleaned), machine_id),
-        )
+        if "browser" in cleaned:
+            conn.execute(
+                "UPDATE remote_machines SET device_grants = %s WHERE id = %s",
+                (json.dumps(cleaned), machine_id),
+            )
+        else:
+            # Revoking browser control revokes the whole own-browser consent
+            # unit (mode + token): a later re-grant starts from the dedicated
+            # default instead of silently reviving the user's-browser choice.
+            conn.execute(
+                "UPDATE remote_machines SET device_grants = %s, "
+                "browser_mode = 'dedicated', browser_extension_token_enc = NULL "
+                "WHERE id = %s",
+                (json.dumps(cleaned), machine_id),
+            )
         conn.commit()
 
 
@@ -395,6 +412,89 @@ def get_target_device_grants(target_kind: str, target_value: str) -> set[str]:
     if not machine:
         return set()
     return _parse_device_grants(machine.get("device_grants"))
+
+
+# --- Own-browser mode (browser-control) ---
+
+BROWSER_MODES = ("dedicated", "own")
+
+
+@dataclass(frozen=True)
+class BrowserTargetSettings:
+    """Which browser the browser-control MCP drives on a target machine —
+    ``dedicated`` (the per-agent profile) or ``own`` (the OS user's signed-in
+    browser through the Playwright Extension) — and, for ``own``, the
+    decrypted extension token. ``extension_token`` None = every session asks
+    the user to click Allow in the browser."""
+
+    mode: str = "dedicated"
+    extension_token: str | None = None
+
+
+def _parse_browser_mode(raw) -> str:
+    """Fail-closed: anything but the literal ``own`` is the dedicated profile."""
+    return "own" if raw == "own" else "dedicated"
+
+
+def set_browser_mode(machine_id: str, mode: str) -> None:
+    """Switch the machine's browser-control mode. The extension token stays
+    stored across switches (it belongs to the machine, and it is only ever
+    delivered while the mode is ``own``) — an explicit clear or revoking the
+    ``browser`` grant removes it, a round trip through ``dedicated`` does not."""
+    if mode not in BROWSER_MODES:
+        raise ValueError(f"unknown browser mode {mode!r}")
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE remote_machines SET browser_mode = %s WHERE id = %s",
+            (mode, machine_id),
+        )
+        conn.commit()
+
+
+def set_browser_extension_token(machine_id: str, token: str | None) -> None:
+    """Store (Fernet, credential-store key) or clear (None) the machine's
+    Playwright Extension token. The endpoint validates the token shape and
+    the mode; the store persists verbatim."""
+    from storage import credential_store
+    enc = credential_store.encrypt_secret(token) if token else None
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE remote_machines SET browser_extension_token_enc = %s WHERE id = %s",
+            (enc, machine_id),
+        )
+        conn.commit()
+
+
+def get_target_browser_settings(target_kind: str, target_value: str) -> BrowserTargetSettings:
+    """Browser-control mode + decrypted extension token for a remote target.
+    Dedicated (no token) for a local target, an unknown machine, or one on
+    the dedicated profile — the token is decrypted only when the mode is
+    ``own``, through this targeted SELECT (the column never rides a machine
+    row; see ``_SECRET_COLUMNS``). A decrypt failure (key mismatch) is logged
+    and degrades to "no token" — the session then asks in the browser."""
+    if target_kind not in ("admin_remote", "user_remote") or not target_value:
+        return BrowserTargetSettings()
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT browser_mode, browser_extension_token_enc "
+            "FROM remote_machines WHERE id = %s",
+            (target_value,),
+        ).fetchone()
+    if not row or _parse_browser_mode(row["browser_mode"]) != "own":
+        return BrowserTargetSettings()
+    token = None
+    enc = row["browser_extension_token_enc"]
+    if enc:
+        from storage import credential_store
+        try:
+            token = credential_store.decrypt_secret(enc)
+        except Exception:
+            logger.warning(
+                "Failed to decrypt the browser extension token of machine %s "
+                "(key mismatch? see the CREDENTIAL KEY MISMATCH boot check)",
+                target_value[:8],
+            )
+    return BrowserTargetSettings(mode="own", extension_token=token)
 
 
 _EMPTY_PATH_POLICY = {
@@ -878,7 +978,8 @@ def get_visible_machines_for_user(
     with get_conn() as conn:
         if include_admin_paired:
             rows = conn.execute(
-                "SELECT * FROM remote_machines "
+                "SELECT rm.*, (rm.browser_extension_token_enc IS NOT NULL) AS browser_extension_token_set "
+                "FROM remote_machines rm "
                 "WHERE (registered_by = %s AND pairing_scope = 'user') "
                 "   OR pairing_scope = 'admin' "
                 "ORDER BY pairing_scope DESC, name",  # user-paired first, then admin
@@ -886,7 +987,8 @@ def get_visible_machines_for_user(
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM remote_machines "
+                "SELECT rm.*, (rm.browser_extension_token_enc IS NOT NULL) AS browser_extension_token_set "
+                "FROM remote_machines rm "
                 "WHERE registered_by = %s AND pairing_scope = 'user' "
                 "ORDER BY name",
                 (user_sub,),
@@ -976,7 +1078,25 @@ def resolve_execution_target(
     user-level overrides (their own paired machine) are still honored.
     """
     from services.remote.remote_status import is_reachable
+    from storage import agent_store
     from storage import database as _db
+
+    # The Direct LLM engine runs in-process on the server, never on a
+    # satellite (session_manager.get_layer routes it local unconditionally
+    # and remote_execution refuses it), so a direct-llm agent's target is
+    # local whatever its pin or the user's override says. Deciding it HERE
+    # covers every builder (chat, task, meeting, phone), the dashboard's
+    # pin/mismatch logic and the scheduler in one place — before the fix each
+    # of them believed the pin and shaped a remote placement prompt + device
+    # MCP set for a session that then ran on the server (2026-09-07).
+    agent = agent_store.get_agent(agent_slug)
+    if (agent or {}).get("execution_path") == "direct-llm":
+        if (agent or {}).get("execution_target", "local") != "local":
+            logger.info(
+                "resolve_execution_target: %s runs on the Direct LLM engine — "
+                "its remote target is ignored (always local)", agent_slug,
+            )
+        return ("local", None)
 
     fallback_user = _db.get_platform_setting("remote_fallback_user_override")
     fallback_agent = _db.get_platform_setting("remote_fallback_agent_default")
@@ -1006,9 +1126,7 @@ def resolve_execution_target(
     else:
         _user_override_fallback = False
 
-    # 2. Agent-level default
-    from storage import agent_store
-    agent = agent_store.get_agent(agent_slug)
+    # 2. Agent-level default (the row was loaded above)
     agent_target = (agent or {}).get("execution_target", "local")
 
     if agent_target == "local":

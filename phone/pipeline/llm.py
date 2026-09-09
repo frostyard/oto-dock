@@ -157,9 +157,15 @@ class LlmStreamingMixin:
                 tts_text = pending_response
                 self.state._full_response = pending_response
                 _precoll_question = False
-                # Check for [CALL_COMPLETE] in pre-collected response
-                if _CALL_COMPLETE_RE.search(tts_text):
-                    tts_text = _CALL_COMPLETE_RE.sub("", tts_text).strip()
+                transcript_text = None   # what the call transcript records (markers stripped)
+                # Check for [CALL_COMPLETE] in pre-collected response: the
+                # caller hears what precedes the marker and NOTHING after it
+                # (a report the model appends behind the marker stays in the
+                # transcript — live-hit 2026-09-07).
+                _m = _CALL_COMPLETE_RE.search(tts_text)
+                if _m:
+                    transcript_text = _CALL_COMPLETE_RE.sub("", tts_text).strip()
+                    tts_text = tts_text[:_m.start()].strip()
                     self.state._call_complete = True
                     logger.info(f"[{self.conn.peer_addr}] [CALL_COMPLETE] detected in pre-collected response")
                 elif self._is_outbound and not self.state._call_complete:
@@ -173,10 +179,11 @@ class LlmStreamingMixin:
                             f"pre-collected response: {question_text[:80]}"
                         )
 
-                # Record assistant transcript (clean of markers)
-                if self._is_outbound and self._call_manager and tts_text:
+                # Record assistant transcript (clean of markers, incl. any
+                # text the model put after the end-of-call marker)
+                if self._is_outbound and self._call_manager and (transcript_text or tts_text):
                     self._call_manager.add_transcript_entry(
-                        self._outbound_call_id, "assistant", tts_text,
+                        self._outbound_call_id, "assistant", transcript_text or tts_text,
                     )
 
                 if tts_text:
@@ -220,6 +227,7 @@ class LlmStreamingMixin:
                 full_response = []  # accumulate ALL text for [CALL_COMPLETE] detection
                 sentence_end_re = re.compile(r"[.!?;]\s")
                 _question_marker_seen = False  # stop TTS flushing once [QUESTION detected
+                _complete_marker_seen = False  # stop TTS flushing once [CALL_COMPLETE] streamed
                 _stream_done = False   # stream ran to completion (no break)
                 _abort_requeue = False  # abort + re-dispatch batched with queued speech
 
@@ -322,13 +330,36 @@ class LlmStreamingMixin:
                             continue
 
                         # --- Normal text token ---
-                        text_buffer += token
                         full_response.append(token)
+
+                        # [CALL_COMPLETE] streamed: the caller hears what
+                        # precedes the marker and NOTHING after it — a report
+                        # the model appends behind the marker is for the
+                        # transcript, not the line (live-hit 2026-09-07: the
+                        # whole call report was read out before the hang-up).
+                        # The tokens still reach full_response (transcript +
+                        # post-stream detection) but never the TTS buffer.
+                        if _complete_marker_seen:
+                            continue
+                        text_buffer += token
 
                         # Once [QUESTION marker detected, stop all TTS flushing.
                         # Let tokens accumulate silently — post-stream detection
                         # will handle the complete marker.
                         if _question_marker_seen:
+                            continue
+
+                        _m = _CALL_COMPLETE_RE.search(text_buffer)
+                        if _m:
+                            pre_marker = text_buffer[:_m.start()].strip()
+                            if pre_marker:
+                                await self.tts.send_text_chunk(pre_marker)
+                            text_buffer = ""
+                            _complete_marker_seen = True
+                            logger.info(
+                                f"[{self.conn.peer_addr}] [CALL_COMPLETE] streamed — "
+                                f"TTS stops after the text before the marker"
+                            )
                             continue
 
                         # Check for [QUESTION marker arriving before flush threshold
@@ -438,7 +469,7 @@ class LlmStreamingMixin:
 
                     # Store full response and unflushed text for barge-in annotation
                     self.state._full_response = "".join(full_response)
-                    self.state._tts_unsent_text = text_buffer
+                    self.state._tts_unsent_text = "" if _complete_marker_seen else text_buffer
 
                     # --- Detect [CALL_COMPLETE] in full accumulated response ---
                     _has_question = False
@@ -504,8 +535,9 @@ class LlmStreamingMixin:
                         # Continuation: close TTS context without final text.
                         # Queued speech handler below will cancel TTS and resend.
                         await self.tts.send_text_chunk("", is_last=True)
-                    elif _question_marker_seen:
-                        # Question marker was seen — don't send any remaining text to TTS
+                    elif _question_marker_seen or _complete_marker_seen:
+                        # A marker was seen mid-stream — nothing after it goes
+                        # to TTS (the pre-marker text was already sent).
                         await self.tts.send_text_chunk("", is_last=True)
                     elif text_buffer and not self.state._utterance_cancelled:
                         tts_final = _CALL_COMPLETE_RE.sub("", text_buffer).strip()

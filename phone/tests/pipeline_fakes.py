@@ -287,7 +287,8 @@ class FakeCall:
 
     def __init__(self, *, opening_text="", opening_prompt="",
                  opening_completes_call=False, task_description="test task",
-                 instructions="", warmup_session_id=None):
+                 instructions="", warmup_session_id=None, opening_ready=True,
+                 warmup_client=None):
         import asyncio
         self.opening_text = opening_text
         self.opening_prompt = opening_prompt
@@ -295,8 +296,11 @@ class FakeCall:
         self.task_description = task_description
         self.instructions = instructions
         self.warmup_session_id = warmup_session_id
+        self.warmup_client = warmup_client
+        self.pregen_task = None
         self._opening_ready = asyncio.Event()
-        self._opening_ready.set()
+        if opening_ready:
+            self._opening_ready.set()
 
 
 class FakeCallManager:

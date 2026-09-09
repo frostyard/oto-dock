@@ -42,6 +42,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from services.infra.path_confinement import join_under
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -95,13 +97,15 @@ class OpResult:
 # ---------------------------------------------------------------------------
 
 def scope_root(agent_dir: Path, scope: str, username: str | None = None) -> Path:
-    """On-disk root of a memory scope. Does NOT create it."""
+    """On-disk root of a memory scope. Does NOT create it. A username that
+    would leave the agent tree is refused (ValueError, like the other
+    contract violations here)."""
     if scope == "agent":
-        return agent_dir / "knowledge" / "memory"
+        return join_under(agent_dir, "knowledge", "memory")
     if scope == "user":
         if not username:
             raise ValueError("username required for user-scope memory")
-        return agent_dir / "users" / username / "context" / "memory"
+        return join_under(agent_dir, "users", username, "context", "memory")
     raise ValueError(f"unknown scope: {scope!r}")
 
 
@@ -112,11 +116,11 @@ def git_repo_root(agent_dir: Path, scope: str, username: str | None = None) -> P
     user scope:  ``agents/{a}/users/{u}/context/`` (existing per-user repo).
     """
     if scope == "agent":
-        return agent_dir / "knowledge"
+        return join_under(agent_dir, "knowledge")
     if scope == "user":
         if not username:
             raise ValueError("username required for user-scope memory")
-        return agent_dir / "users" / username / "context"
+        return join_under(agent_dir, "users", username, "context")
     raise ValueError(f"unknown scope: {scope!r}")
 
 

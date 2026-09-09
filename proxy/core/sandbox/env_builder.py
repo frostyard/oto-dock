@@ -124,6 +124,15 @@ def build_session_env(
     memory_user, memory_agent, default_scope = resolve_memory_and_scope(
         agent_name, username=username, user_role=user_role,
     )
+    # External sessions (a phone caller who is not a platform user): the
+    # layers register the SecurityContext before the spawn, so the caller's
+    # facts are read from it here — one place instead of every spawn site.
+    ext_ctx = None
+    if session_id:
+        from core.session.session_state import get_session_security
+        ext_ctx = get_session_security(session_id)
+    from core.session.external_identity import external_home_of, is_external_ctx
+    is_external = is_external_ctx(ext_ctx)
     env.update(build_oto_env(
         agent_name=agent_name,
         username=username,
@@ -135,6 +144,11 @@ def build_session_env(
         memory_agent_enabled=memory_agent,
         default_scope=default_scope,
         task_type="",  # env_builder is for chat / non-task sessions
+        external=is_external,
+        external_home_mounted=bool(is_external and external_home_of(ext_ctx)),
+        external_channel=(getattr(ext_ctx, "external_channel", "") or "") if is_external else "",
+        external_id=(getattr(ext_ctx, "external_id", "") or "") if is_external else "",
+        external_verified=bool(getattr(ext_ctx, "external_verified", False)) if is_external else False,
     ))
 
     # Per-user/infra MCP credentials from credential_resolver +

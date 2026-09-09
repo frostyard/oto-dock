@@ -70,8 +70,21 @@ function fail(message) {
   postMessage({ type: 'error', message: String(message) })
 }
 
+// Engine assets are same-origin only: the page names the versioned
+// /kws-assets/<version>/ folder and nothing else may be imported into this
+// worker, so the base is rebuilt from the fixed prefix + the version
+// segment rather than used as sent.
+function assetBase(raw) {
+  const m = /^\/kws-assets\/([A-Za-z0-9._-]+)\/$/.exec(String(raw))
+  return m ? '/kws-assets/' + m[1] + '/' : null
+}
+
 function init(msg) {
-  const base = msg.base // e.g. '/kws-assets/1.13.5-gigaspeech-3.3M/'
+  const base = assetBase(msg.base) // e.g. '/kws-assets/1.13.5-gigaspeech-3.3M/'
+  if (!base) {
+    fail('invalid asset base')
+    return
+  }
   Module = {
     locateFile: (f) => base + f,
     print: () => {},

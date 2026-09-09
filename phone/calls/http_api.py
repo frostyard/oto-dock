@@ -249,6 +249,9 @@ class OutboundCallAPI:
         warmup_task = asyncio.create_task(
             self._warmup_caller_session(call.call_id, route)
         )
+        # The live pipeline waits for this (bounded) before it speaks — see
+        # OutboundMixin._adopt_prewarmed_backend.
+        call.pregen_task = warmup_task
 
         # Originate: Twilio REST when the route's server is a Twilio row,
         # else AMI. The Twilio ring timeout is 45 s (+ Twilio's ~5 s buffer,

@@ -9,6 +9,7 @@ item/completed carrying a ThreadItem, item/agentMessage/delta, turn/completed,
 identically to CLI or Direct LLM events.
 """
 
+import contextlib
 import json
 import logging
 import re
@@ -19,12 +20,15 @@ from typing import AsyncIterator
 
 import config as app_config
 from core.events.common_events import CommonEvent, ERROR, METADATA, DONE, PLAN_MODE
-from core.execution_layer import ExecutionLayer, AgentConfig, LayerCapabilities
+from core.execution_layer import (
+    ExecutionLayer, AgentConfig, LayerCapabilities, UNATTENDED_CLIENT_TYPES,
+)
 from core.layers.codex.session import (
     create_codex_session, get_codex_session, close_codex_session,
 )
 from core.session.session_state import (
     _record_session_use, set_session_security, set_session_mode,
+    cleanup_session_permission_state, register_session_state,
     set_session_codex_dir,
     resolve_permission,
     resolve_session_permissions,
@@ -61,11 +65,12 @@ _CODEX_CAPABILITIES = LayerCapabilities(
     permission_modes=["default", "acceptEdits", "plan", "dontAsk"],
     control_commands=["set_model", "set_permission_mode"],
     models=app_config.get_layer_models("codex-cli"),
-    # "max" is real wire vocabulary from the GPT-5.6 family on; older models
-    # clamp to xhigh in map_effort_to_codex. "ultra" (max reasoning + Codex-
-    # native proactive multi-agent orchestration) is per-model: gpt-5.6
-    # Sol/Terra only — the dashboard gates it on the model's supports_ultra
-    # flag and map_effort_to_codex clamps it everywhere else (see helpers).
+    # "max" is real wire vocabulary from the GPT-5.6 family on (GPT-6 too);
+    # older models clamp to xhigh in map_effort_to_codex. "ultra" (Codex-
+    # native proactive multi-agent orchestration on top of max/xhigh
+    # reasoning) is per-model: gpt-5.6 Sol/Terra and gpt-6-astra — the
+    # dashboard gates it on the model's supports_ultra flag and
+    # map_effort_to_codex clamps it everywhere else (see helpers).
     effort_levels=["minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
     effort_changeable_mid_session=True,   # effort is a per-turn override now
     compression_threshold_pct=None,
@@ -85,6 +90,27 @@ _CODEX_CAPABILITIES = LayerCapabilities(
 
 from core.credentials.credential_writeback import writeback_credential_dirs as _writeback_credential_dirs
 
+
+# Child-env variable named by the local provider's ``env_key`` when the
+# endpoint is key-protected (deliberately not CODEX_API_KEY, which would put
+# Codex into API-key auth against its built-in OpenAI provider).
+from core.layers.codex.app_server_client import mcp_server_names_from_toml
+from core.layers.codex.helpers import (
+    LOCAL_ENDPOINT_KEY_ENV as _LOCAL_ENDPOINT_KEY_ENV,
+    LOCAL_ENDPOINT_STREAM_IDLE_TIMEOUT_MS as _STREAM_IDLE_TIMEOUT_MS,
+    codex_hooks_floor,
+    with_local_provider_note,
+)
+from core.layers.codex.local_model_catalog import (
+    CATALOG_FILE_NAME as _CATALOG_FILE_NAME,
+    LOCAL_MODEL_ROWS_ENV as _LOCAL_MODEL_ROWS_ENV,
+    catalog_toml_line as _catalog_toml_line,
+    local_model_catalog_json,
+    parse_local_model_rows,
+)
+
+# config.toml [tools] table every session gets — see _write_config_toml.
+_CODEX_TOOLS_TABLE = "[tools]\nupdate_plan = { enabled = true }"
 
 _TOML_MCP_SECTION_RE = re.compile(r"^\[mcp_servers\.([a-zA-Z0-9_-]+)\]")
 _TOML_ENV_LINE_RE = re.compile(r'^(\s*env\s*=\s*\{)(.*)\}(\s*)$')
@@ -229,6 +255,21 @@ class CodexCLIExecutionLayer(ExecutionLayer):
     # ------------------------------------------------------------------
 
     async def start_session(self, session_id: str, config: AgentConfig) -> None:
+        """Create or resume a Codex session.
+
+        The permission mode + security context are registered BEFORE the
+        spawn: the session JWTs minted into the TOML env + the process env
+        derive their external claim from the live context. A failed spawn
+        drops the registration again (see the CLI layer).
+        """
+        register_session_state(session_id, config.permission_mode, config.security_context)
+        try:
+            await self._start_session_impl(session_id, config)
+        except BaseException:
+            cleanup_session_permission_state(session_id)
+            raise
+
+    async def _start_session_impl(self, session_id: str, config: AgentConfig) -> None:
         # Fail CLOSED: a local agent MUST run sandboxed + network-isolated. The
         # codex layer reads sandbox_host_claude_dir AS CODEX_HOME; empty means a
         # config-builder omission — refuse rather than launch un-sandboxed.
@@ -251,6 +292,15 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         # Empty for OpenAI / ChatGPT subscriptions → Codex uses its built-in
         # provider and no carve-out is needed.
         local_endpoint = extra_env.pop("_CODEX_ENDPOINT_URL", "")
+        # An API key protecting the local endpoint: handed to Codex through
+        # the custom provider's ``env_key`` (a named child-env variable), so
+        # it never masquerades as CODEX_API_KEY.
+        local_api_key = extra_env.pop("_CODEX_LOCAL_API_KEY", "")
+        # The subscription's provider (ollama / openai_compatible) picks the
+        # AGENTS.md note about MCP tools on a local server; its model rows
+        # (read off-loop by the pool) feed the per-session model catalog.
+        local_provider = extra_env.pop("_CODEX_ENDPOINT_PROVIDER", "")
+        local_model_rows = parse_local_model_rows(extra_env.pop(_LOCAL_MODEL_ROWS_ENV, ""))
         if local_endpoint:
             # A local endpoint on the proxy host itself (T1) is reached via the
             # loopback splice — rewrite its host to 127.0.0.1 so the Codex CLI
@@ -258,6 +308,8 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             # T2 / for remote endpoints.
             from services.mcp import mcp_registry as _mr
             local_endpoint = _mr.loopback_if_host_self(local_endpoint)
+            if local_api_key:
+                extra_env[_LOCAL_ENDPOINT_KEY_ENV] = local_api_key
         sandbox_cmd_prefix: list[str] = []
 
         # Map permission mode → Codex sandbox mode
@@ -269,7 +321,11 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         agent_dir = app_config.get_agent_dir(config.agent_name)
         _ctx = config.security_context
         username = _ctx.mount_username if _ctx else ""
-        if username:
+        from core.session.external_identity import external_home_of, is_external_ctx
+        _ext_home = external_home_of(_ctx)
+        if _ext_home:
+            work_dir = _ext_home   # an external caller's own tree (/caller)
+        elif username:
             work_dir = str(agent_dir / "users" / username)
         else:
             work_dir = str(agent_dir / "workspace")
@@ -312,6 +368,8 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             # TOML build file with host mcps/ paths — scanned (plain-text)
             # for the per-MCP dir binds.
             mcp_config_path=config.mcp_config_path,
+            external=is_external_ctx(_ctx),
+            external_home=_ext_home,
         )
         sandbox_builder = SandboxBuilder(sandbox_cfg)
 
@@ -333,14 +391,17 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             config_dir_name=".codex", config_env_var="CODEX_HOME",
         )
         extra_env.update(env_overrides)
+        # CODEX_HOME as Codex sees it INSIDE the sandbox (config.toml paths).
+        sandbox_codex_dir = env_overrides.get("CODEX_HOME", "/workspace/.codex")
 
         # ssh-hosts (context-only MCP): provision the agent's authorized SSH
         # keys into <.codex>/ssh so the prompt's `ssh -i "$OTO_SSH_KEY_DIR/…"`
         # lines work from the Codex shell (mirrors the CLI layer).
+        # Never for an EXTERNAL session (see the CLI layer).
         from core.sandbox.session_config_dir import (
             materialize_ssh_keys_for_sandbox,
         )
-        if materialize_ssh_keys_for_sandbox(
+        if not is_external_ctx(_ctx) and materialize_ssh_keys_for_sandbox(
             config.agent_name, config.sandbox_host_claude_dir,
         ):
             _codex_home = env_overrides.get("CODEX_HOME", "/workspace/.codex")
@@ -417,22 +478,40 @@ class CodexCLIExecutionLayer(ExecutionLayer):
                     mcp_toml_content, config.mcp_secret_bundles or {},
                 )
             from core.sandbox.interceptor_wrap import wrap_toml_text
-            sandbox_codex_dir = env_overrides.get("CODEX_HOME", "/workspace/.codex")
             mcp_toml_content = wrap_toml_text(
                 mcp_toml_content, interpreter="python3",
                 interceptor_path=f"{sandbox_codex_dir}/stdio_path_interceptor.py",
             )
 
-        # Write combined config.toml (instructions + MCP servers). interactive=
-        # the bare-TUI path → adds `[features] hooks = true` so our permission
-        # gate runs (the app-server path leaves it off; see _write_config_toml).
+        # The per-session model catalog (Ollama only): Codex defers its MCP
+        # tools and searches them on demand instead of sending every schema on
+        # every request — see local_model_catalog. Every row of the provider
+        # rides along (a same-provider model switch keeps its entry); the
+        # context window is the row's when the admin set one.
+        local_catalog_json = ""
+        if local_endpoint:
+            local_catalog_json = local_model_catalog_json(
+                config.model, local_provider, local_model_rows,
+            )
+
+        # Write combined config.toml (instructions + MCP servers). The hook
+        # floor (`[features] hooks = true`) is written for the bare TUI and
+        # for unattended sessions; an external caller also loses the shell
+        # tool (see _write_config_toml).
         config_dir = Path(config.sandbox_host_claude_dir)
+        # ONE rule with the remote start payload (helpers.codex_hooks_floor).
+        hooks_floor = codex_hooks_floor(config.client_type, config.interactive)
         self._write_config_toml(
             config_dir, config.system_prompt, mcp_toml_content,
             interactive=config.interactive,
             trusted_cwd=(sandbox_builder.get_cwd() if config.interactive else ""),
             local_endpoint=local_endpoint,
+            local_endpoint_keyed=bool(local_endpoint and local_api_key),
+            local_provider=local_provider,
             client_type=config.client_type,
+            local_catalog_json=local_catalog_json,
+            sandbox_codex_dir=sandbox_codex_dir,
+            no_shell=is_external_ctx(_ctx),
         )
 
         # Write OAuth auth.json if token provided
@@ -446,6 +525,8 @@ class CodexCLIExecutionLayer(ExecutionLayer):
                 extra_env.pop("_CODEX_OAUTH_TOKEN"),
                 auth_blob=auth_blob,
             )
+        else:
+            self._drop_stale_auth_json(Path(config.sandbox_host_claude_dir))
 
         # Create session (thread_id from DB enables resume after proxy restart)
         codex_effort = _map_effort_to_codex(config.effort, config.model)
@@ -586,12 +667,15 @@ class CodexCLIExecutionLayer(ExecutionLayer):
             effort=codex_effort,
             thread_id=config.codex_thread_id or None,
             user_role=_user_role,
+            # The warm gate waits for each declared server; a local model
+            # gets the longer cap (a changed tool list re-prefills for minutes).
+            mcp_server_names=mcp_server_names_from_toml(mcp_toml_content),
+            local_model=bool(local_endpoint),
+            hooks_floor=hooks_floor,
         )
 
-        # Store session metadata (same pattern as CLI layer)
-        set_session_mode(session_id, config.permission_mode)
-        if config.security_context:
-            set_session_security(session_id, config.security_context)
+        # Session metadata (permission mode + security context were
+        # registered before the spawn)
         _record_session_use(session_id, client_type=config.client_type, agent=config.agent_name)
 
         # Bind subscription for cleanup on close
@@ -710,6 +794,9 @@ class CodexCLIExecutionLayer(ExecutionLayer):
     async def close_session(self, session_id: str) -> None:
         await _writeback_credential_dirs(session_id)
         await close_codex_session(session_id)
+        # A closed session must not keep a live permission context (see the
+        # CLI layer).
+        cleanup_session_permission_state(session_id)
         # Credential broker: drop this session's secrets (a cap token replayed
         # after close then finds nothing).
         from core.credentials import mcp_broker
@@ -816,6 +903,7 @@ class CodexCLIExecutionLayer(ExecutionLayer):
 
     async def can_resume_session(
         self, session_id: str, *, agent_name: str = "", username: str = "",
+        external_home: str = "",
     ) -> bool:
         """Codex resumability is THREAD-backed, not pool-backed.
 
@@ -844,8 +932,12 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         codex_dir = (rec or {}).get("home", "")
         if not codex_dir and agent_name:
             agent_dir = app_config.get_agent_dir(agent_name)
-            candidate = (agent_dir / "users" / username / ".codex") if username \
-                else (agent_dir / "workspace" / ".codex")
+            if external_home:
+                candidate = Path(external_home) / ".codex"
+            elif username:
+                candidate = agent_dir / "users" / username / ".codex"
+            else:
+                candidate = agent_dir / "workspace" / ".codex"
             if candidate.is_dir():
                 codex_dir = str(candidate)
         return bool(codex_dir) and codex_rollout_tailer.rollout_exists(
@@ -859,7 +951,10 @@ class CodexCLIExecutionLayer(ExecutionLayer):
     def _write_config_toml(
         config_dir: Path, system_prompt: str, mcp_toml: str = "",
         interactive: bool = False, trusted_cwd: str = "",
-        local_endpoint: str = "", client_type: str = "",
+        local_endpoint: str = "", local_endpoint_keyed: bool = False,
+        local_provider: str = "", client_type: str = "",
+        local_catalog_json: str = "", sandbox_codex_dir: str = "",
+        no_shell: bool = False,
     ) -> None:
         """Write config.toml and AGENTS.md for a Codex session.
 
@@ -876,9 +971,23 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         URL, so both the bare TUI and the app-server daemon (which both read
         CODEX_HOME/config.toml) dial the operator's local model. Codex's
         built-in OpenAI provider is used when this is empty.
+
+        ``local_catalog_json`` (the per-session model catalog of
+        ``local_model_catalog``, Ollama only) is written next to config.toml
+        as ``models.json`` and referenced by the root ``model_catalog_json``
+        key with its SANDBOX path (``sandbox_codex_dir`` — Codex reads it from
+        inside bwrap, where CODEX_HOME is ``/workspace/.codex`` or
+        ``/users/<u>/.codex``, not the host path ``config_dir``). A session
+        without one removes a previous session's file: CODEX_HOME persists per
+        (agent, user).
         """
         config_dir.mkdir(parents=True, exist_ok=True)
         config_path = config_dir / "config.toml"
+        catalog_path = config_dir / _CATALOG_FILE_NAME
+        if not (local_endpoint and local_catalog_json and sandbox_codex_dir):
+            local_catalog_json = ""
+            with contextlib.suppress(OSError):
+                catalog_path.unlink()
 
         parts: list[str] = []
 
@@ -901,6 +1010,12 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         # a top-level key, so it MUST be emitted before any [table] header below.
         if local_endpoint:
             parts.append('model_provider = "oto_local"')
+        # The per-session model catalog that makes Codex defer its MCP tools
+        # (tool_search) on a local model — root key, absolute SANDBOX path.
+        if local_catalog_json:
+            catalog_path.write_text(local_catalog_json)
+            catalog_path.chmod(0o600)
+            parts.append(_catalog_toml_line(f"{sandbox_codex_dir.rstrip('/')}/{_CATALOG_FILE_NAME}"))
 
         # Disable Codex's optional memory subsystem (``/memories`` slash
         # command + memory generation/reuse). Defense-in-depth alongside
@@ -939,14 +1054,35 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         # when a Codex bump graduates it to default-on (see CODEX.md).
         if interactive or client_type == "dashboard":
             parts.append("default_mode_request_user_input = true")
-        if interactive:
+        if interactive or client_type in UNATTENDED_CLIENT_TYPES:
             # Enable Codex's hook system so our PreToolUse permission_gate.py runs
             # as the command-level FLOOR (baseline restricted-tools + dangerous +
             # RBAC + path) — the SAME decide_tool_permission authority every other
-            # surface uses. ONLY for interactive: the app-server gates via its
-            # JSON-RPC approval bridge, so enabling both would double-gate.
+            # surface uses. Interactive TUI: trusted via
+            # --dangerously-bypass-hook-trust. Unattended app-server sessions
+            # (task / phone / meeting / trigger): trusted via thread/start.config
+            # (session.py::_thread_overrides) — with `never` + full access the
+            # JSON-RPC bridge never fires, so the hook is the only gate there.
+            # Dashboard app-server chats keep the bridge alone (both would
+            # double-gate). The key is default-on upstream; explicit on purpose.
             # Canonical key is `hooks` (the older `codex_hooks` is deprecated).
             parts.append("hooks = true")
+        if no_shell:
+            # External callers (a phone caller who is not a platform user) get
+            # no exec_command / write_stdin at all: the shell is what could read
+            # this file's [mcp_servers.*.env], the MCP children's environment,
+            # token files or /proc. apply_patch (mount-enforced), view_image,
+            # the Responses web_search tool and the MCP tools stay; file reads
+            # go through the file-tools MCP. Claude's twin is
+            # auth/path_policy.EXTERNAL_DENIED_CLI_TOOLS.
+            parts.append("shell_tool = false")
+
+        # Codex 0.152.0 made the update_plan tool OPT-IN (tools.update_plan,
+        # default off): without it the daemon never emits turn/plan/updated
+        # and the dashboard's TODO checklist silently disappears. Every
+        # session keeps it (valid on older Codex too, where it was the
+        # default). Twins: both satellite writers.
+        parts.append(_CODEX_TOOLS_TABLE)
 
         if interactive and trusted_cwd:
             # Pre-trust the working directory so the interactive `codex` TUI skips
@@ -963,16 +1099,25 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         # codex-rs removed the "chat" wire format (deserializing it is a hard
         # serde error since ≤0.144.1 — model-provider-info/src/lib.rs), so the
         # local server must expose an OpenAI Responses-compatible endpoint.
-        # No env_key (these servers are keyless). The agent dials base_url;
-        # the sandbox carves egress to that host.
+        # ``env_key`` names the child-env variable carrying the endpoint's
+        # bearer token — emitted ONLY when a key is configured: codex-rs
+        # refuses to start a provider whose env_key is unset. The agent dials
+        # base_url; the sandbox carves egress to that host. A local model
+        # prefills at CPU speed, so the stream idle timeout (Codex's 5-minute
+        # default killed a first turn before its first token) is raised for
+        # every local endpoint (local_model_catalog.STREAM_IDLE_TIMEOUT_MS).
         if local_endpoint:
             _esc_ep = local_endpoint.replace("\\", "\\\\").replace('"', '\\"')
-            parts.append(
-                "[model_providers.oto_local]\n"
-                'name = "Local"\n'
-                f'base_url = "{_esc_ep}"\n'
-                'wire_api = "responses"'
-            )
+            provider_lines = [
+                "[model_providers.oto_local]",
+                'name = "Local"',
+                f'base_url = "{_esc_ep}"',
+                'wire_api = "responses"',
+                f"stream_idle_timeout_ms = {_STREAM_IDLE_TIMEOUT_MS}",
+            ]
+            if local_endpoint_keyed:
+                provider_lines.append(f'env_key = "{_LOCAL_ENDPOINT_KEY_ENV}"')
+            parts.append("\n".join(provider_lines))
 
         # MCP server sections (already formatted as TOML by mcp_registry)
         if mcp_toml:
@@ -987,7 +1132,12 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         try:
             tomllib.loads(config_text)
         except tomllib.TOMLDecodeError as e:
+            # tomllib carries the position only in the message ("(at line
+            # N, column M)"); older builds exposed a ``lineno`` attribute.
             lineno = getattr(e, "lineno", None)
+            if not isinstance(lineno, int):
+                m = re.search(r"at line (\d+)", str(e))
+                lineno = int(m.group(1)) if m else None
             bad = ""
             if isinstance(lineno, int) and lineno >= 1:
                 lines = config_text.splitlines()
@@ -1009,6 +1159,10 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         # for injecting project-level instructions. Placed in CODEX_HOME
         # so it's read as the global AGENTS.md. Rewritten every session
         # start to stay up to date (survives resume/restart).
+        if local_endpoint:
+            # Tell a local model the truth about its MCP tools for its server
+            # (helpers.local_provider_note: ollama vs openai_compatible).
+            system_prompt = with_local_provider_note(system_prompt, local_provider)
         if system_prompt:
             (config_dir / "AGENTS.md").write_text(system_prompt)
 
@@ -1024,6 +1178,18 @@ class CodexCLIExecutionLayer(ExecutionLayer):
         from core.layers.codex.helpers import build_auth_json
         from services.engines.token_fanout import write_codex_auth_file
         write_codex_auth_file(config_dir, build_auth_json(token, auth_blob=auth_blob))
+
+    @staticmethod
+    def _drop_stale_auth_json(config_dir: Path) -> None:
+        """A session WITHOUT ChatGPT OAuth (API key / local endpoint) must not
+        load a previous session's ``auth.json`` from this persistent CODEX_HOME:
+        Codex would take the stale, refresh-neutralized token and loop on
+        refreshing it every request ("Failed to refresh token: 400 …
+        refresh_token: empty string" — verified 2026-09-07 on a local-endpoint
+        session that followed a ChatGPT one). The satellite writers do the same
+        (``codex_session.write_or_drop_auth_json``)."""
+        with contextlib.suppress(OSError):
+            (config_dir / "auth.json").unlink(missing_ok=True)
 
 
 # Permission mode → Codex sandbox mode and effort mappings live in helpers.py

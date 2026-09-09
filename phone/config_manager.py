@@ -517,6 +517,16 @@ class ConfigManager:
         return int(self._s("question_answer_timeout_s", "40"))
 
     @property
+    def opening_pregen_timeout_s(self) -> float:
+        """How long the live pipeline waits for the opening that was
+        pre-generated during ringing before it cancels that generation and
+        falls back to a live turn. A slow local model needs 20–40 s for the
+        first turn; thinking fillers cover the wait. Sending the opening
+        prompt again while the pre-generation is still in flight would queue
+        a duplicate prompt on the same session (live-hit 2026-09-07)."""
+        return float(self._s("opening_pregen_timeout_s", "90"))
+
+    @property
     def stt_mute_reconnect_s(self) -> float:
         """Caller-speech seconds with ZERO provider results before the STT
         guard treats the session as mute and reconnects (failure mode #3 —

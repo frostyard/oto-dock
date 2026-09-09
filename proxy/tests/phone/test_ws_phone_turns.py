@@ -97,7 +97,7 @@ class FakeLayer:
         return self.process_dead
 
     async def can_resume_session(self, session_id: str, *, agent_name="",
-                                 username="") -> bool:
+                                 username="", external_home="") -> bool:
         self.resume_checked.append(session_id)
         return True
 
@@ -176,9 +176,23 @@ def phone_ws_env(monkeypatch):
 
     monkeypatch.setattr(ws_phone.config, "is_master_key", lambda k: k == "test-key")
     monkeypatch.setattr(ws_phone.config, "get_cli_model", lambda name: "model-x")
-    monkeypatch.setattr(ws_phone, "resolve_phone_execution_target", lambda name: None)
+    monkeypatch.setattr(ws_phone, "resolve_phone_execution_target",
+                        lambda name, **kw: None)
     monkeypatch.setattr(ws_phone, "get_execution_layer",
                         lambda name, execution_target=None: layer)
+    # Identity resolution is DB-backed (routes, agents, users) — stub it to
+    # the id-less external principal; a reuse request passes through as-is.
+    from core.session import external_identity
+    from services.phone.phone_identity import RouteIdentity
+    monkeypatch.setattr(ws_phone.phone_route_store, "get_route", lambda rid: None)
+    monkeypatch.setattr(
+        ws_phone, "resolve_route_identity",
+        lambda route, **kw: RouteIdentity(
+            mode="shared", role="viewer",
+            external=external_identity.resolve("phone", "", session_id=kw["session_id"], shared=True),
+        ),
+    )
+    monkeypatch.setattr(ws_phone, "_validated_reuse_sid", lambda sid, agent: sid or "")
 
     async def _fake_build(**kwargs):
         return _FakeAgentCfg()

@@ -18,7 +18,9 @@ import time
 import uuid
 
 import config
-from core.layers.direct.mcp import AgentMCPManager, mcp_pool
+from core.layers.direct import builtins as direct_builtins
+from core.layers.direct import tool_catalog
+from core.layers.direct.mcp import TOOL_CALL_TIMEOUT, AgentMCPManager, mcp_pool
 from core.layers.providers import get_adapter, ProviderError, ProviderUsage
 from core.session.session_state import (
     get_session_mode,
@@ -66,10 +68,23 @@ class DirectSession:
         self.api_key: str | None = None  # explicit key from subscription pool
         self.user_sub: str = ""  # for subscription acquisition on provider switch
         self.effort: str = ""  # reasoning effort level (low/medium/high/max)
+        # The session's sandbox description (set by the layer at start): the
+        # client-side file tools resolve their paths against its mount table
+        # — the same RO/RW decisions bwrap renders for the MCP subprocesses.
+        self.sandbox_cfg = None
+        self._mount_table: list | None = None
+        # Deferred-tools catalog (core/layers/direct/tool_catalog.py) — set by
+        # _apply_deferred_tools once the MCP tool list is known; None means
+        # every tool is resident (deferral off / below the threshold).
+        self.catalog = None
 
         # Populate tools from MCP manager
         if mcp_manager:
             self.tools = mcp_manager.get_tools()
+
+        # Client-side builtins (Read / Glob / Write / Edit / Delete / Skill —
+        # executed in-process, gated inline; core/layers/direct/builtins.py).
+        self.tools.extend(direct_builtins.client_tool_defs())
 
         # Add provider-specific built-in tools (e.g., Anthropic web_search/web_fetch)
         adapter = get_adapter(provider)
@@ -80,6 +95,16 @@ class DirectSession:
                 f"Added {len(builtin)} built-in tools for {provider}: "
                 f"{[t.get('name', t.get('type', '?')) for t in builtin]}"
             )
+
+    def mount_table(self) -> list:
+        """The session's ``Mount`` decisions (computed once; empty without a
+        sandbox config — the file tools then refuse)."""
+        if self._mount_table is None:
+            if self.sandbox_cfg is None:
+                return []
+            from core.layers.direct.files import mount_table
+            self._mount_table = mount_table(self.sandbox_cfg)
+        return self._mount_table
 
     def touch(self) -> None:
         self.last_activity = time.monotonic()
@@ -173,6 +198,9 @@ async def create_direct_session(
     credential_env: dict[str, str] | None = None,
     system_prompt: str = "",
     sandbox_builder=None,
+    enable_http_transport: bool = False,
+    tool_timeout: int = TOOL_CALL_TIMEOUT,
+    external: bool = False,
 ) -> DirectSession:
     """Create a new direct session with MCP servers started.
 
@@ -180,6 +208,10 @@ async def create_direct_session(
         system_prompt: Pre-built prompt from config_builder (includes user context,
             permissions, MCP skills, dynamic context, etc.). If empty, falls back
             to building a basic prompt from the agent's agent.md persona.
+        enable_http_transport / tool_timeout: the MCP policy for this session
+            (``layer.direct_mcp_policy``) — sidecar HTTP MCPs + the chat
+            call cap for chats, tasks and meetings; stdio-only + 60 s for
+            phone calls.
     """
     if not system_prompt:
         # Fallback: basic prompt without user/permission context (phone path, etc.)
@@ -198,6 +230,9 @@ async def create_direct_session(
         session_id, agent_name, phone_mode=phone_mode,
         credential_env=credential_env,
         sandbox_builder=sandbox_builder,
+        enable_http_transport=enable_http_transport,
+        tool_timeout=tool_timeout,
+        external=external,
     )
 
     session = DirectSession(
@@ -210,15 +245,71 @@ async def create_direct_session(
     )
     if api_key:
         session.api_key = api_key
+    # The MCP tool list is known only now (the prompt was built before the
+    # servers started), so the deferred-tools split + catalog addendum
+    # happen here, before the session is visible to anyone.
+    _apply_deferred_tools(session)
 
     async with _direct_sessions_lock:
         _direct_sessions[session_id] = session
 
+    deferred = len(session.catalog.deferred) if session.catalog else 0
     logger.info(
         f"Created direct session {session_id} for agent '{agent_name}' "
-        f"(provider={provider}, model={session.model}, {len(session.tools)} tools)"
+        f"(provider={provider}, model={session.model}, {len(session.tools)} tools"
+        f"{f', {deferred} deferred' if deferred else ''}; "
+        f"prompt≈{len(session.system_prompt) // 4} tokens, "
+        f"tools≈{tool_catalog.estimate_tokens(session.tools)} tokens)"
     )
     return session
+
+
+def _registry_facts() -> tuple[set[str], dict[str, list[str]]]:
+    """(always-load server keys, server key → on-demand skill ids) from the
+    manifest registry; empty when the registry is not initialized (tests,
+    startup race)."""
+    always: set[str] = set()
+    guides: dict[str, list[str]] = {}
+    try:
+        from services.mcp import mcp_registry
+        for m in mcp_registry.get_all_manifests().values():
+            key = getattr(m, "server_name", "") or m.name
+            if getattr(m, "always_load", False):
+                always.add(key)
+            ids = [s.id for s in m.skills if s.loading == "on_demand"]
+            if ids:
+                guides[key] = ids
+    except Exception:
+        logger.debug("deferred tools: registry facts unavailable", exc_info=True)
+    return always, guides
+
+
+def _apply_deferred_tools(session: DirectSession) -> None:
+    """Split ``session.tools`` into resident + deferred per
+    ``DIRECT_LLM_TOOL_SEARCH``; when deferral is active the session keeps the
+    resident tools plus ``tool_search`` and its prompt gains the
+    ``# Deferred tools`` catalog."""
+    mode = config.DIRECT_LLM_TOOL_SEARCH
+    threshold = config.DIRECT_LLM_TOOL_SEARCH_THRESHOLD_TOKENS
+    always, guides = _registry_facts()
+    resident, deferrable = tool_catalog.ToolCatalog.split(session.tools, always)
+    if not tool_catalog.ToolCatalog.should_defer(mode, deferrable, threshold):
+        session.catalog = None
+        return
+    catalog = tool_catalog.ToolCatalog(
+        deferred={t["name"]: t for t in deferrable},
+        guides={k: v for k, v in guides.items()},
+    )
+    session.tools = resident + [tool_catalog.tool_search_def()]
+    session.system_prompt = (
+        session.system_prompt.rstrip() + "\n\n---\n\n" + catalog.catalog_text()
+    )
+    session.catalog = catalog
+    logger.info(
+        f"Deferred tools for session {session.session_id[:8]}: "
+        f"{len(deferrable)} deferred (≈{tool_catalog.estimate_tokens(deferrable)} tokens), "
+        f"{len(resident)} resident (mode={mode})"
+    )
 
 
 async def get_direct_session(session_id: str) -> DirectSession | None:
@@ -364,6 +455,19 @@ async def run_direct_stream(
             tool_calls: list[dict] = []
             stop_reason = ""
             raw_content = None
+            # Thinking phase bracket (start/delta/end — the Codex layer's
+            # THINKING contract): opened lazily on the first reasoning
+            # fragment, closed by the first non-reasoning event so a
+            # reasoning-only call still ends its block.
+            thinking_open = False
+            # Per-call timing (one INFO line per model call): where a slow
+            # turn spends its time — time to the first token (prefill on a
+            # local server; a tools change re-prefills), reasoning volume,
+            # cached tokens — is otherwise invisible from the dashboard.
+            call_started = time.monotonic()
+            first_token_at: float | None = None
+            think_chars = 0
+            text_chars = 0
 
             try:
                 async for event in adapter.stream_response(
@@ -376,7 +480,23 @@ async def run_direct_stream(
                     endpoint_url=session.endpoint_url,
                     effort=session.effort,
                 ):
+                    if first_token_at is None and event.type in (
+                        "thinking_delta", "text_delta", "tool_start",
+                    ):
+                        first_token_at = time.monotonic()
+                    if event.type == "thinking_delta":
+                        think_chars += len(event.text or "")
+                        if not thinking_open:
+                            thinking_open = True
+                            yield {"type": "thinking", "data": {"phase": "start"}}
+                        yield {"type": "thinking", "data": {"phase": "delta", "text": event.text}}
+                        continue
+                    if thinking_open and event.type != "tool_input_delta":
+                        thinking_open = False
+                        yield {"type": "thinking", "data": {"phase": "end", "text": ""}}
+
                     if event.type == "text_delta":
+                        text_chars += len(event.text or "")
                         yield {"type": "text", "data": {"content": event.text}}
 
                     elif event.type == "tool_start":
@@ -390,6 +510,19 @@ async def run_direct_stream(
 
                     elif event.type == "tool_input_delta":
                         pass  # tool input accumulated inside adapter
+
+                    elif event.type == "tool_result":
+                        # A server-side tool (Anthropic web_search / web_fetch /
+                        # code_execution) ran inside the API and returned: the
+                        # dashboard's tool row ends here — the runner never
+                        # executes these, so no tool_stop / result message.
+                        yield {
+                            "type": "tool_end",
+                            "data": {
+                                "tool_use_id": event.tool_id,
+                                "result_preview": (event.text or "")[:200],
+                            },
+                        }
 
                     elif event.type == "tool_stop":
                         # Parse accumulated JSON for MCP tool input
@@ -412,6 +545,7 @@ async def run_direct_stream(
                             total_usage.output_tokens += event.usage.output_tokens
                             total_usage.cache_write_tokens += event.usage.cache_write_tokens
                             total_usage.cache_read_tokens += event.usage.cache_read_tokens
+                            total_usage.web_search_requests += event.usage.web_search_requests
                             # Snapshot for context gauge (last call only)
                             last_call_usage = event.usage
 
@@ -426,6 +560,9 @@ async def run_direct_stream(
                         return
 
             except ProviderError as e:
+                if thinking_open:
+                    thinking_open = False
+                    yield {"type": "thinking", "data": {"phase": "end", "text": ""}}
                 logger.error(
                     f"Provider error ({session.provider}): status={e.status_code}, "
                     f"message={e.message}"
@@ -444,6 +581,24 @@ async def run_direct_stream(
                     if isinstance(last_content, str):
                         session.messages.pop()
                 return
+
+            if thinking_open:
+                # Stream ended on a reasoning fragment (no stop event).
+                yield {"type": "thinking", "data": {"phase": "end", "text": ""}}
+
+            _now = time.monotonic()
+            logger.info(
+                f"Direct call {loop_count} for session {session.session_id[:8]}: "
+                f"ttft={((first_token_at or _now) - call_started):.1f}s "
+                f"total={(_now - call_started):.1f}s "
+                f"in={last_call_usage.input_tokens} cached={last_call_usage.cache_read_tokens} "
+                f"written={last_call_usage.cache_write_tokens} "
+                f"out={last_call_usage.output_tokens} "
+                f"searches={last_call_usage.web_search_requests} "
+                f"think_chars={think_chars} "
+                f"text_chars={text_chars} tool_calls={len(tool_calls)} "
+                f"tools_sent={len(session.tools)}"
+            )
 
             # Store assistant message via adapter's serialization
             if raw_content is not None:
@@ -466,27 +621,55 @@ async def run_direct_stream(
                 # in acceptEdits, sensitive prompts in both prompting modes,
                 # critical prompts everywhere and is denied in unattended
                 # `auto` sessions (nobody can answer).
+                # Client-side builtins (Read / Write / … — builtins.py) run the
+                # CLI hook's two-pass gate inline: path policy, then the
+                # builtin tier × mode table (Delete prompts even in acceptEdits,
+                # like `rm`). They execute in-process, never via the MCP manager.
                 from services.mcp import mcp_permissions
                 perm_mode = get_session_mode(session.session_id) or "auto"
 
-                approved_calls: list[dict] = []
+                approved_calls: list[dict] = []   # MCP tools
+                builtin_calls: list[dict] = []    # in-process builtins
                 denied_calls: list[tuple[dict, str]] = []
 
                 for tc in tool_calls:
-                    parts = (tc["name"] or "").split("__", 2)
-                    tier = mcp_permissions.resolve_tool_tier(
-                        parts[1] if len(parts) >= 2 else "",
-                        parts[2] if len(parts) >= 3 else "",
-                    )
-                    outcome = mcp_permissions.tier_decision(tier, perm_mode)
-                    if outcome == "allow":
-                        approved_calls.append(tc)
-                        continue
-                    if outcome == "deny":
-                        denied_calls.append((tc, (
+                    # A deferred tool called directly by its exact name is
+                    # loaded on first use: weaker models skip tool_search and
+                    # call the catalog entry outright (the MCP server
+                    # validates the arguments and reports what is wrong).
+                    _cat = session.catalog
+                    _name = tc["name"] or ""
+                    if (
+                        _cat is not None and _name in _cat.deferred
+                        and not _cat.is_loaded(_name)
+                    ):
+                        session.tools.extend(_cat.load(
+                            [_name],
+                            whole_server=tool_catalog.batch_loads_for(session.provider),
+                        ))
+                        logger.info(
+                            f"Deferred tool {_name} loaded on direct call "
+                            f"(session {session.session_id[:8]})"
+                        )
+                    is_builtin = direct_builtins.is_builtin(_name)
+                    if is_builtin:
+                        outcome, deny_reason = direct_builtins.gate(session, tc, perm_mode)
+                    else:
+                        parts = (tc["name"] or "").split("__", 2)
+                        tier = mcp_permissions.resolve_tool_tier(
+                            parts[1] if len(parts) >= 2 else "",
+                            parts[2] if len(parts) >= 3 else "",
+                        )
+                        outcome = mcp_permissions.tier_decision(tier, perm_mode)
+                        deny_reason = (
                             f"{tc['name']} requires interactive user approval "
                             "and this session runs unattended."
-                        )))
+                        )
+                    if outcome == "allow":
+                        (builtin_calls if is_builtin else approved_calls).append(tc)
+                        continue
+                    if outcome == "deny":
+                        denied_calls.append((tc, deny_reason))
                         continue
                     request_id = str(uuid.uuid4())
                     perm_queue = get_permission_queue(session.session_id)
@@ -498,22 +681,37 @@ async def run_direct_stream(
                     })
                     approved = await wait_for_permission(request_id, session.session_id, timeout=604800.0)
                     if approved:
-                        approved_calls.append(tc)
+                        (builtin_calls if is_builtin else approved_calls).append(tc)
                     else:
                         denied_calls.append((tc, "Tool use denied by user."))
 
-                # Execute approved tools
+                # Execute approved tools — builtins in-process, then MCP tools
                 results: list[dict] = []
+                for tc in builtin_calls:
+                    _t0 = time.monotonic()
+                    content = await direct_builtins.execute(
+                        session, tc["name"], tc.get("input") or {},
+                    )
+                    results.append({"tool_use_id": tc["id"], "content": content})
+                    logger.info(
+                        f"Builtin {tc['name']} ran in {time.monotonic() - _t0:.2f}s "
+                        f"(session {session.session_id[:8]})"
+                    )
                 if approved_calls and session.mcp_manager:
-                    results = await session.mcp_manager.execute_tools(approved_calls)
+                    _t0 = time.monotonic()
+                    results.extend(await session.mcp_manager.execute_tools(approved_calls))
+                    logger.info(
+                        f"MCP tools {[tc['name'] for tc in approved_calls]} ran in "
+                        f"{time.monotonic() - _t0:.2f}s (session {session.session_id[:8]})"
+                    )
                 elif approved_calls:
-                    results = [
+                    results.extend(
                         {
                             "tool_use_id": tc["id"],
                             "content": "Error: No MCP tools available",
                         }
                         for tc in approved_calls
-                    ]
+                    )
 
                 # Add denied results
                 for tc, reason in denied_calls:

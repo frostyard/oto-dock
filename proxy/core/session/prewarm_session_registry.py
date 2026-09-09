@@ -97,7 +97,12 @@ async def reap_stale(ttl: float = PREWARM_TTL_S) -> int:
     for sid, e in stale:  # close OUTSIDE the lock (async, and these are ours alone)
         try:
             from core.session.session_manager import get_execution_layer
-            layer = get_execution_layer(
+            from storage.pg import run_db
+            # get_execution_layer reads the agent row + (for remote targets)
+            # the machine row and platform settings — a 30 s periodic loop
+            # must not do that on the event loop.
+            layer = await run_db(
+                get_execution_layer,
                 e.agent, execution_path=e.exec_path or None,
                 user_sub=e.user_sub or None, role=e.role or "manager",
             )

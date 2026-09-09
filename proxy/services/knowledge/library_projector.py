@@ -87,9 +87,9 @@ import shutil
 import time
 from pathlib import Path
 
-import config
 from storage import db_knowledge_libraries, db_library_mirror_state, recover_bin_store
 from storage.db_knowledge_libraries import subtree_covers
+from services.infra.path_confinement import join_under, safe_agent_dir
 
 logger = logging.getLogger("claude-proxy.knowledge-libraries")
 
@@ -119,14 +119,15 @@ def _lock(source_agent: str) -> asyncio.Lock:
 
 
 def source_knowledge_dir(source_agent: str) -> Path:
-    return config.get_agent_dir(source_agent) / "knowledge"
+    return safe_agent_dir(source_agent) / "knowledge"
 
 
 def mirror_dir(consumer_agent: str, source_agent: str) -> Path:
     """The consumer's mirror root for one SOURCE (slug segment). Library
     subtrees of that source live below it at their own ``subdir``."""
-    return (config.get_agent_dir(consumer_agent) / "knowledge"
-            / SHARED_SUBDIR / source_agent)
+    return join_under(
+        safe_agent_dir(consumer_agent) / "knowledge" / SHARED_SUBDIR, source_agent,
+    )
 
 
 def is_excluded_rel(rel: str) -> bool:

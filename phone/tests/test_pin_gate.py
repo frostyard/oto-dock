@@ -57,6 +57,7 @@ async def test_correct_pin_passes(make_pipeline, fresh_store):
     assert conn.hangups == 0
     assert p.state.call_outcome == "completed"
     assert p.state.pin_attempts == 1
+    assert p.state.pin_verified is True       # rides the proxy warmup
 
 
 async def test_wrong_pin_three_attempts_then_hangup(make_pipeline, fresh_store):
@@ -67,6 +68,7 @@ async def test_wrong_pin_three_attempts_then_hangup(make_pipeline, fresh_store):
     assert conn.hangups == 1
     assert p.state.call_outcome == "pin_failed"
     assert p.state.pin_attempts == 3
+    assert p.state.pin_verified is False
     # 3 wrong entries → 3 failures on both windows.
     assert not store.number_locked("+16085550100")
     assert len(store._numbers["16085550100"]) == 3

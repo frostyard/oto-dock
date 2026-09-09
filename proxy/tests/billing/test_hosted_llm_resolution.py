@@ -34,7 +34,7 @@ def store(monkeypatch):
     m.list_personal.return_value = []          # no personal sub unless a test sets one
     m.list_platform_pool.return_value = []     # tests populate the platform pool
     monkeypatch.setattr("services.engines.subscription_pool.subscription_store", m)
-    monkeypatch.setattr("config.get_model_provider", lambda model: {
+    monkeypatch.setattr("config.get_model_provider", lambda model, layer="": {
         "claude-sonnet-5": "anthropic",
         "gpt-5.4-mini": "openai",
         "qwen/qwen3.6-27b": "groq",

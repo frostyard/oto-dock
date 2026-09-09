@@ -15,6 +15,7 @@ import contextlib
 import hashlib
 import io
 import logging
+import re
 import tarfile
 import uuid
 from pathlib import Path
@@ -576,6 +577,19 @@ class SetDeviceGrantsRequest(BaseModel):
     grants: list[str]
 
 
+class SetBrowserModeRequest(BaseModel):
+    # "dedicated" (the per-agent browser profile) or "own" (the machine
+    # user's signed-in Chrome/Edge/Brave through the Playwright Extension).
+    # "own" needs the "browser" device grant.
+    mode: str
+
+
+class SetBrowserTokenRequest(BaseModel):
+    # The token shown on the Playwright Extension's page; the whole
+    # `PLAYWRIGHT_MCP_EXTENSION_TOKEN=…` line its copy button yields is fine.
+    token: str
+
+
 class ExchangeTokenRequest(BaseModel):
     machine_id: str
     pairing_token: str
@@ -686,6 +700,7 @@ async def list_machines(user: UserContext | None = Depends(get_current_user)):
         # device_grants is a TEXT JSON-array column → parse to a list so the
         # dashboard receives string[].
         m["device_grants"] = sorted(remote_store._parse_device_grants(m.get("device_grants")))
+        _shape_browser_fields(m)
         m["cli_pins"] = cli_pins
         _merge_live_status(m)
     return {"machines": machines}
@@ -708,6 +723,7 @@ async def get_machine(
         machine["capabilities"] = {}
     # device_grants TEXT JSON-array → list for the dashboard.
     machine["device_grants"] = sorted(remote_store._parse_device_grants(machine.get("device_grants")))
+    _shape_browser_fields(machine)
     machine["assigned_agents"] = remote_store.get_agents_for_machine(machine_id)
     import config as app_config
     machine["cli_pins"] = {
@@ -895,13 +911,19 @@ async def admin_set_max_sessions(
     physical max on its own, so no push is needed.
     """
     _require_admin(user)
-    machine = remote_store.get_remote_machine(machine_id)
+    from storage.pg import run_db
+    machine = await run_db(remote_store.get_remote_machine, machine_id)
     if not machine:
         raise HTTPException(status_code=404, detail="Machine not found")
     value = body.max_sessions
     if value is not None and value < 1:
         raise HTTPException(status_code=422, detail="max_sessions must be >= 1 or empty")
-    remote_store.set_remote_machine_max_sessions(machine_id, value)
+    await run_db(remote_store.set_remote_machine_max_sessions, machine_id, value)
+    # Refresh the per-connection cache the capacity pre-check reads (it never
+    # touches the DB on the loop); a no-op for an offline machine, whose next
+    # register() re-reads the row.
+    from core.remote.satellite_connection import get_connection_manager
+    get_connection_manager().note_max_sessions(machine_id, value)
     return {"ok": True, "max_sessions": value}
 
 
@@ -1010,6 +1032,188 @@ async def user_set_device_grants(
     remote_store.set_device_grants(machine_id, grants)
     await _push_policy_update(machine_id)
     return {"ok": True, "device_grants": grants}
+
+
+# --- Own-browser mode (browser-control) ---
+#
+# Per-machine opt-in that points the browser-control MCP at the machine
+# user's signed-in browser (Playwright Extension) instead of the dedicated
+# per-agent profile. Same consent register as the device grants: only the
+# role that owns the machine's consent may flip it (owner for user-paired,
+# admin for admin-paired — an admin never reaches a user's personal browser).
+# Changes apply at the next session warmup; running sessions keep the
+# browser they were built with.
+
+_BROWSER_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,256}$")
+_BROWSER_TOKEN_PREFIX = "PLAYWRIGHT_MCP_EXTENSION_TOKEN="
+
+
+def _validate_browser_mode(mode: str) -> str:
+    if mode not in remote_store.BROWSER_MODES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown browser mode {mode!r}. Valid: {list(remote_store.BROWSER_MODES)}",
+        )
+    return mode
+
+
+def _normalize_browser_token(raw: str) -> str:
+    """The extension's copy button copies the whole ``NAME=value`` line and
+    people paste it quoted — accept all of that and keep only the token
+    (32 random bytes, base64url without padding → 43 chars)."""
+    tok = (raw or "").strip().strip("'\"").strip()
+    if tok.upper().startswith(_BROWSER_TOKEN_PREFIX):
+        tok = tok[len(_BROWSER_TOKEN_PREFIX):].strip().strip("'\"")
+    if not _BROWSER_TOKEN_RE.match(tok):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "That does not look like a Playwright Extension token — copy it "
+                "from the extension's page (its toolbar icon) and paste it here."
+            ),
+        )
+    return tok
+
+
+def _browser_machine_for_admin(machine_id: str, user: UserContext | None) -> dict:
+    _require_admin(user)
+    machine = remote_store.get_remote_machine(machine_id)
+    if not machine:
+        raise HTTPException(status_code=404, detail="Machine not found")
+    if machine.get("pairing_scope") == "user":
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Own-browser mode on a user-paired machine is its owner's "
+                "choice — only they can change it (Settings → Remote machines)."
+            ),
+        )
+    return machine
+
+
+def _browser_machine_for_owner(machine_id: str, user: UserContext | None) -> dict:
+    u = _require_user_authenticated(user)
+    machine = remote_store.get_remote_machine(machine_id)
+    if not machine:
+        raise HTTPException(status_code=404, detail="Machine not found")
+    if machine.get("pairing_scope") != "user":
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "This is an admin-paired (platform) machine. Ask an admin to "
+                "change its browser mode from the admin Remote Machines page."
+            ),
+        )
+    if machine["registered_by"] != u.sub:
+        raise HTTPException(status_code=403, detail="Not your machine")
+    return machine
+
+
+def _apply_browser_mode(machine: dict, mode: str) -> dict:
+    mode = _validate_browser_mode(mode)
+    granted = remote_store._parse_device_grants(machine.get("device_grants"))
+    if mode == "own" and "browser" not in granted:
+        raise HTTPException(
+            status_code=422, detail="Grant browser control on this machine first.",
+        )
+    remote_store.set_browser_mode(machine["id"], mode)
+    return {
+        "ok": True,
+        "browser_mode": mode,
+        # The token survives a mode switch (store rule) — the flag reports
+        # what is stored, whichever mode is now selected.
+        "browser_extension_token_set": bool(machine.get("browser_extension_token_set")),
+    }
+
+
+def _apply_browser_token(machine: dict, token: str | None) -> dict:
+    if token is None:
+        remote_store.set_browser_extension_token(machine["id"], None)
+        return {"ok": True, "browser_extension_token_set": False}
+    if remote_store._parse_browser_mode(machine.get("browser_mode")) != "own":
+        raise HTTPException(
+            status_code=422, detail="Turn on \"Use my own browser\" first.",
+        )
+    remote_store.set_browser_extension_token(
+        machine["id"], _normalize_browser_token(token),
+    )
+    return {"ok": True, "browser_extension_token_set": True}
+
+
+@router.put("/v1/admin/remote-machines/{machine_id}/browser-mode")
+async def admin_set_browser_mode(
+    machine_id: str,
+    body: SetBrowserModeRequest,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """Set the browser-control mode of an ADMIN-paired machine. Body:
+    ``{mode: "dedicated" | "own"}``; ``own`` needs the ``browser`` grant
+    (422). The stored extension token survives a switch back to ``dedicated``;
+    it is only delivered while the mode is ``own``. User-paired machines reject
+    with 403 (the owner decides)."""
+    return _apply_browser_mode(_browser_machine_for_admin(machine_id, user), body.mode)
+
+
+@router.put("/v1/admin/remote-machines/{machine_id}/browser-token")
+async def admin_set_browser_token(
+    machine_id: str,
+    body: SetBrowserTokenRequest,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """Store the Playwright Extension token of an ADMIN-paired machine in
+    ``own`` mode (422 otherwise). The value is encrypted at rest and never
+    returned; ``browser_extension_token_set`` on the machine row says whether
+    one is stored."""
+    return _apply_browser_token(_browser_machine_for_admin(machine_id, user), body.token)
+
+
+@router.delete("/v1/admin/remote-machines/{machine_id}/browser-token")
+async def admin_clear_browser_token(
+    machine_id: str,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """Forget the stored extension token — sessions go back to asking for a
+    click in the browser."""
+    return _apply_browser_token(_browser_machine_for_admin(machine_id, user), None)
+
+
+@router.put("/v1/users/me/remote-machines/{machine_id}/browser-mode")
+async def user_set_browser_mode(
+    machine_id: str,
+    body: SetBrowserModeRequest,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """Owner-scoped browser-control mode (user-paired machines only; 403 for
+    admin-paired and for anyone but the pairing user). Same body + rules as
+    the admin route."""
+    return _apply_browser_mode(_browser_machine_for_owner(machine_id, user), body.mode)
+
+
+@router.put("/v1/users/me/remote-machines/{machine_id}/browser-token")
+async def user_set_browser_token(
+    machine_id: str,
+    body: SetBrowserTokenRequest,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """Owner-scoped: store the extension token of the caller's own machine."""
+    return _apply_browser_token(_browser_machine_for_owner(machine_id, user), body.token)
+
+
+@router.delete("/v1/users/me/remote-machines/{machine_id}/browser-token")
+async def user_clear_browser_token(
+    machine_id: str,
+    user: UserContext | None = Depends(get_current_user),
+):
+    """Owner-scoped: forget the stored extension token."""
+    return _apply_browser_token(_browser_machine_for_owner(machine_id, user), None)
+
+
+def _shape_browser_fields(machine: dict) -> None:
+    """Public shape of the two own-browser columns on a machine row: the mode
+    normalised, the token reduced to a presence flag (the ciphertext never
+    leaves the store)."""
+    machine["browser_mode"] = remote_store._parse_browser_mode(machine.get("browser_mode"))
+    machine["browser_extension_token_set"] = bool(machine.get("browser_extension_token_set"))
 
 
 async def _push_policy_update(machine_id: str) -> None:
@@ -1250,6 +1454,7 @@ async def list_my_machines(user: UserContext | None = Depends(get_current_user))
         # device_grants is a TEXT JSON-array column → parse to a list so the
         # dashboard receives string[].
         m["device_grants"] = sorted(remote_store._parse_device_grants(m.get("device_grants")))
+        _shape_browser_fields(m)
         _merge_live_status(m)
     targets = remote_store.get_user_remote_targets(u.sub)
     return {

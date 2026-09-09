@@ -9,6 +9,7 @@ All functions are synchronous (called via asyncio.to_thread).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import uuid
@@ -81,7 +82,7 @@ def list_subscriptions(
             params.append(contribute_platform)
         if not include_disabled:
             sql += " AND status != 'disabled'"
-        sql += " ORDER BY is_primary DESC, active_sessions ASC"
+        sql += " ORDER BY active_sessions ASC"
         rows = conn.execute(sql, params).fetchall()
         return [_row_to_dict(r) for r in rows]
 
@@ -110,7 +111,7 @@ def list_platform_pool(layer: str | None = None, provider: str | None = None) ->
         if provider:
             sql += " AND s.provider = %s"
             params.append(provider)
-        sql += " ORDER BY s.is_primary DESC, s.active_sessions ASC"
+        sql += " ORDER BY s.active_sessions ASC"
         rows = conn.execute(sql, params).fetchall()
         return [_row_to_dict(r) for r in rows]
 
@@ -145,7 +146,7 @@ def list_personal(
         if provider:
             sql += " AND provider = %s"
             params.append(provider)
-        sql += " ORDER BY is_primary DESC, active_sessions ASC"
+        sql += " ORDER BY active_sessions ASC"
         rows = conn.execute(sql, params).fetchall()
         return [_row_to_dict(r) for r in rows]
 
@@ -165,7 +166,7 @@ def list_admin_managed(layer: str | None = None, *, include_disabled: bool = Tru
             params.append(layer)
         if not include_disabled:
             sql += " AND status != 'disabled'"
-        sql += " ORDER BY is_primary DESC, active_sessions ASC"
+        sql += " ORDER BY active_sessions ASC"
         rows = conn.execute(sql, params).fetchall()
         return [_row_to_dict(r) for r in rows]
 
@@ -190,7 +191,6 @@ def add_subscription(
     label: str = "",
     credential_data: dict | None = None,
     oauth_email: str = "",
-    is_primary: bool = False,
 ) -> dict:
     """Add a new subscription. Returns the created record.
 
@@ -205,22 +205,14 @@ def add_subscription(
     enc = _encrypt(json.dumps(credential_data or {}))
 
     with get_conn() as conn:
-        # If marking as primary, unset existing primaries for the same owner+layer
-        if is_primary:
-            conn.execute(
-                """UPDATE execution_layer_subscriptions
-                   SET is_primary = FALSE, updated_at = %s
-                   WHERE layer = %s AND owner_sub = %s""",
-                (now, layer, owner_sub),
-            )
         conn.execute(
             """INSERT INTO execution_layer_subscriptions
                (id, layer, provider, auth_type, owner_sub, use_personal,
-                contribute_platform, label, is_primary, credential_data_enc,
+                contribute_platform, label, credential_data_enc,
                 oauth_email, active_sessions, status, created_at, updated_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, 'active', %s, %s)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, 'active', %s, %s)""",
             (sub_id, layer, provider, auth_type, owner_sub, use_personal,
-             contribute_platform, label, is_primary, enc, oauth_email, now, now),
+             contribute_platform, label, enc, oauth_email, now, now),
         )
         conn.commit()
         return get_subscription_unlocked(conn, sub_id)
@@ -232,13 +224,12 @@ def update_subscription(
 ) -> dict | None:
     """Update subscription fields.
 
-    Supports: label, is_primary, status, use_personal, contribute_platform,
-    oauth_email (the provider-reported account identity — stamped on
-    reconnect so pre-identity rows converge).
+    Supports: label, status, use_personal, contribute_platform, oauth_email
+    (the provider-reported account identity — stamped on reconnect so
+    pre-identity rows converge).
     """
     allowed = {
-        "label", "is_primary", "status", "use_personal",
-        "contribute_platform", "oauth_email",
+        "label", "status", "use_personal", "contribute_platform", "oauth_email",
     }
     updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
     if not updates:
@@ -246,20 +237,6 @@ def update_subscription(
 
     now = _now()
     with get_conn() as conn:
-        # If setting primary, unset others for the same owner+layer
-        if updates.get("is_primary"):
-            row = conn.execute(
-                "SELECT layer, owner_sub FROM execution_layer_subscriptions WHERE id = %s",
-                (sub_id,),
-            ).fetchone()
-            if row:
-                conn.execute(
-                    """UPDATE execution_layer_subscriptions
-                       SET is_primary = FALSE, updated_at = %s
-                       WHERE layer = %s AND owner_sub = %s""",
-                    (now, row["layer"], row["owner_sub"]),
-                )
-
         set_clauses = ", ".join(f"{k} = %s" for k in updates)
         values = list(updates.values())
         values.append(now)
@@ -329,6 +306,63 @@ def update_credential_data(sub_id: str, credential_data: dict) -> None:
             (enc, now, sub_id),
         )
         conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Local endpoints — one self-hosted server, listed once across the engines
+# ---------------------------------------------------------------------------
+
+def normalize_endpoint_url(url: str) -> str:
+    """Canonical form for grouping sibling rows: trimmed, no trailing slash."""
+    return (url or "").strip().rstrip("/")
+
+
+def local_endpoint_group_key(provider: str, endpoint_url: str) -> str:
+    digest = hashlib.sha256(normalize_endpoint_url(endpoint_url).encode()).hexdigest()[:12]
+    return f"{provider}:{digest}"
+
+
+def group_local_endpoint_rows(rows: list[tuple[dict, dict]]) -> list[dict]:
+    """Fold ``(subscription row, decrypted credential blob)`` pairs into one
+    entry per (provider, endpoint_url) carrying the per-layer sibling rows —
+    the admin's shared "Local models" view. Subscription rows stay per layer
+    in the schema; the grouping is the only link between siblings. Pure so
+    it is testable without a database; ``list_local_endpoint_groups`` feeds
+    it."""
+    groups: dict[str, dict] = {}
+    for row, creds in rows:
+        url = normalize_endpoint_url(creds.get("endpoint_url", ""))
+        key = local_endpoint_group_key(row["provider"], url)
+        g = groups.setdefault(key, {
+            "group": key, "provider": row["provider"], "endpoint_url": url,
+            "label": "", "has_api_key": False, "engines": {},
+        })
+        if row.get("label") and not g["label"]:
+            g["label"] = row["label"]
+        g["has_api_key"] = g["has_api_key"] or bool(creds.get("api_key"))
+        g["engines"][row["layer"]] = {
+            "id": row["id"],
+            "status": row.get("status", "active"),
+            "active_sessions": row.get("active_sessions", 0),
+            "owner_sub": row.get("owner_sub", ""),
+        }
+    return list(groups.values())
+
+
+def list_local_endpoint_groups() -> list[dict]:
+    """Every ``local_endpoint`` row across the layers, grouped (admin only —
+    the endpoint URL is decrypted; the key never leaves as more than a flag)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT * FROM execution_layer_subscriptions
+               WHERE auth_type = 'local_endpoint'
+               ORDER BY created_at, layer""",
+        ).fetchall()
+    pairs: list[tuple[dict, dict]] = []
+    for r in rows:
+        creds = json.loads(_decrypt(r["credential_data_enc"])) if r["credential_data_enc"] else {}
+        pairs.append((dict(r), creds))
+    return group_local_endpoint_rows(pairs)
 
 
 def get_pool_stats(layer: str) -> dict:

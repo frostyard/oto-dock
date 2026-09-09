@@ -180,6 +180,9 @@ def test_all_keys_always_present():
         # v3 additions: memory toggles, default scope, task type.
         "OTO_MEMORY_USER_ENABLED", "OTO_MEMORY_AGENT_ENABLED",
         "OTO_DEFAULT_SCOPE", "OTO_TASK_TYPE",
+        # External routes: the caller's channel / id / PIN-verified flag
+        # (empty / "false" for every session that is not external).
+        "OTO_EXTERNAL_CHANNEL", "OTO_EXTERNAL_ID", "OTO_EXTERNAL_VERIFIED",
     }
     for username, role in [
         ("alice", "manager"),

@@ -132,6 +132,16 @@ def authorize_spawn(
     then scope clamping to the target's mode, then identity + role for the
     FINAL scope, and the per-creator cap last — all before any row exists.
     """
+    # 0. External principals (phone callers who are not platform users) never
+    #    delegate — a worker would run with the agent's full rights. The
+    #    delegation MCP is not even attached to their sessions; this is the
+    #    API-side belt-and-braces for a session that holds its JWT.
+    if getattr(user, "is_external", False):
+        raise HTTPException(
+            status_code=403,
+            detail="Delegation is not available on external routes.",
+        )
+
     # 1. Platform kill-switch. The mcp_state row exists only where the
     #    delegation-mcp manifest was scanned — the public cut ships without
     #    the folder, so these endpoints are dormant there by construction.

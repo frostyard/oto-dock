@@ -8,7 +8,6 @@ The notifier (`_notify_admins_machine_state_change`), `_seconds_since_iso`, and
 tests there) and are imported lazily.
 """
 
-import asyncio
 import logging
 
 logger = logging.getLogger("claude-proxy.satellite")
@@ -52,9 +51,10 @@ class SatelliteAdminAlertsMixin:
             _OFFLINE_ALERT_GRACE_S,
         )
         from storage import remote_store
+        from storage.pg import run_db
         from services.remote.remote_status import get_live_machine_status
 
-        machines = await asyncio.to_thread(remote_store.get_all_remote_machines)
+        machines = await run_db(remote_store.get_all_remote_machines)
         for m in machines:
             if (m.get("pairing_scope") or "") != "admin":
                 continue
@@ -65,13 +65,13 @@ class SatelliteAdminAlertsMixin:
                 continue
             machine_id = m["id"]
             alerted = bool(m.get("offline_alerted"))
-            live = get_live_machine_status(machine_id)
+            # Pass the row we already hold: the evaluator runs on the loop
+            # every 30 s and must not re-read every machine from the DB.
+            live = get_live_machine_status(machine_id, machine=m)
 
             if live["reachable"]:
                 if alerted:
-                    await asyncio.to_thread(
-                        remote_store.set_offline_alerted, machine_id, False
-                    )
+                    await run_db(remote_store.set_offline_alerted, machine_id, False)
                     await _notify_admins_machine_state_change(
                         machine_id, online=True
                     )
@@ -82,9 +82,7 @@ class SatelliteAdminAlertsMixin:
                 continue
             downtime = _seconds_since_iso(m.get("last_seen"))
             if downtime is not None and downtime > _OFFLINE_ALERT_GRACE_S:
-                await asyncio.to_thread(
-                    remote_store.set_offline_alerted, machine_id, True
-                )
+                await run_db(remote_store.set_offline_alerted, machine_id, True)
                 await _notify_admins_machine_state_change(
                     machine_id, online=False
                 )

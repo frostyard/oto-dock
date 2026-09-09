@@ -34,7 +34,7 @@ class OutboundCall:
         "pending_question", "question_answer", "_question_ready",
         "_answer_ready", "question_history",
         "_transcript_updated", "_transcript_version",
-        "route_id", "warmup_client",
+        "route_id", "warmup_client", "pregen_task",
     )
 
     def __init__(
@@ -67,6 +67,10 @@ class OutboundCall:
         # Pre-warmed proxy client (its live session generated the opening); the
         # live pipeline reuses it for session continuity, then owns its teardown.
         self.warmup_client = None
+        # The task pre-generating the opening during ringing — the live
+        # pipeline waits for it (or cancels it on a timeout) rather than
+        # sending the opening prompt a second time on the same session.
+        self.pregen_task: asyncio.Task | None = None
         # Question/answer support for mid-call Q&A with the calling agent
         self.pending_question: str | None = None
         self.question_answer: str | None = None
@@ -126,10 +130,9 @@ class CallManager:
         )
         self._calls[call_id] = call
         self._uuid_index[audio_uuid] = call_id
-        logger.info(
-            f"Registered call {call_id} → {phone_number} "
-            f"(audio_uuid={audio_uuid})"
-        )
+        # The dialed number is personal data: it lives on the call record,
+        # never in the log line.
+        logger.info(f"Registered call {call_id} (audio_uuid={audio_uuid})")
         return call
 
     def get_call(self, call_id: str) -> OutboundCall | None:
@@ -213,6 +216,9 @@ class CallManager:
             "started_at": _iso(call.created_at),
             "ended_at": _iso(call.ended_at),
             "duration_s": int(call.duration_s) if call.duration_s is not None else None,
+            # The session pre-warmed during origination (the pipeline reuses
+            # it) — the proxy joins the identity + tools from it.
+            "session_id": call.warmup_session_id or "",
         }
         # sync/test context without a loop — skip, never raise
         with contextlib.suppress(RuntimeError):

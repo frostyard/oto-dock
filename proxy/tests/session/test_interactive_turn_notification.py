@@ -281,8 +281,15 @@ async def test_turn_end_attached_marks_read():
     # upsert + live clear fire right after the ready broadcast.
     s = _new_session(otodock_attached=True)
     s._apply_turn_signal("end_turn")
-    assert _calls["read"] == [("chat-1", "user-1")], _calls["read"]
+    # The live clear fires synchronously; the marker upsert runs as an
+    # ordered job on the DB executor (never on the loop — 2026-09-04), so
+    # give it a moment to land.
     assert _calls["read_bcast"] == [("user-1", "chat-1", "researcher")], _calls["read_bcast"]
+    for _ in range(100):
+        if _calls["read"]:
+            break
+        await asyncio.sleep(0.02)
+    assert _calls["read"] == [("chat-1", "user-1")], _calls["read"]
 
 
 async def test_turn_end_detached_keeps_unread():

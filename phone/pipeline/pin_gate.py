@@ -86,6 +86,7 @@ class PinGateMixin:
             return False
 
         if ok:
+            self.state.pin_verified = True
             logger.info(
                 f"[{peer}] PIN gate: passed "
                 f"(attempt {self.state.pin_attempts}; "

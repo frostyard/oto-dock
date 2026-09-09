@@ -159,6 +159,12 @@ class CommonEvent:
         cost_is_delta: True if cost_usd is already a per-turn delta (Direct LLM,
         Codex). False/absent if cost_usd is cumulative session total (CLI).
         The pump computes delta for cumulative, uses directly for delta.
+        The pump then stamps ``cost_billed`` (bool) on the forwarded/persisted
+        metadata block — False when the session's credential is a
+        subscription (oauth) or a local model (local_endpoint), so the chat
+        hides the cost; the producers never set it. A meeting cost event
+        (``_meeting_cost``) may carry ``session_id`` = the speaker's session
+        so the flag is resolved per participant.
 
     DONE:
         {}

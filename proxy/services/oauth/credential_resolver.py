@@ -25,7 +25,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
-import config
 from storage import credential_store
 from storage import mcp_store
 from storage import database as task_store
@@ -489,7 +488,16 @@ def _resolve_oauth_mcp(
     import os as _os
     from pathlib import Path as _Path
     from core.sandbox.sandbox import _verified_literal_path
+    from services.infra.path_confinement import PathOutsideRoot, safe_agent_dir
 
+    try:
+        root_real = _Path(_os.path.realpath(safe_agent_dir(agent_name)))
+    except PathOutsideRoot:
+        logger.error(
+            "Refusing credential materialization for %s/%s: agent name "
+            "would leave the agents tree", agent_name, mcp_name,
+        )
+        return None
     result: dict[str, str] = {}
     for env_var, subpath in cred_entries:
         # Destination paths MUST match the virtual paths resolved by
@@ -509,7 +517,6 @@ def _resolve_oauth_mcp(
         # chain is literal (also normalizes away a traversal-shaped manifest
         # ``subpath``), refuse + skip on mismatch: the MCP just shows up
         # unconnected.
-        root_real = _Path(_os.path.realpath(config.AGENTS_DIR / agent_name))
         if username and task_scope == "user":
             rel_parts = ("users", username, ".credentials",
                          *_Path(subpath).parts)

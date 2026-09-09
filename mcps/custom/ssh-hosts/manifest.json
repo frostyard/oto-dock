@@ -2,7 +2,7 @@
   "name": "ssh-hosts",
   "label": "SSH",
   "description": "SSH access to admin-configured hosts, straight from the agent's shell",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "category": "custom",
   "server": {
     "runtime": "python",
@@ -57,7 +57,7 @@
     "keys": "keys/"
   },
   "assignment_mode": "explicit",
-  "exclude_from": [],
+  "exclude_from": ["external"],
   "skills": [],
   "permissions": {
     "default_tier": "standard",

@@ -83,8 +83,28 @@ def test_warmup_reply_routes_via_control_queue():
         sid = await c._ws_warmup()
         assert sid == "s1"
         assert c.session_id == "s1"
+        # The PIN-gate result always rides the warmup (False by default).
+        assert ws.sent[-1]["type"] == "warmup"
+        assert ws.sent[-1]["pin_verified"] is False
 
         ws.end()
+        await c._recv_task
+    asyncio.run(run())
+
+
+def test_warmup_carries_the_pin_gate_result():
+    async def run():
+        c = ProxyClient(llm_mode="direct", phone_mode=True, caller_phone="+3021",
+                        pin_verified=True)
+        c._ws = FakeWS()
+        c._ws_connected = True
+        c._ws.push({"type": "warmup_ready",
+                    "data": {"session_id": "s2", "llm_mode": "direct"}})
+        c._recv_task = asyncio.create_task(c._recv_loop())
+        assert await c._ws_warmup() == "s2"
+        sent = c._ws.sent[-1]
+        assert sent["pin_verified"] is True and sent["caller_phone"] == "+3021"
+        c._ws.end()
         await c._recv_task
     asyncio.run(run())
 

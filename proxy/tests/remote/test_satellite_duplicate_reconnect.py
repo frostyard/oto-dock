@@ -6,6 +6,11 @@ handler's ``finally: deregister(...)`` then fires. Pre-fix it popped the
 entry unconditionally, unregistering the LIVE connection and marking the
 machine offline while the satellite kept its healthy new socket ("all
 remote machines down" on the proxy, every satellite showing connected).
+
+Status writes are OFF-loop since 2026-09-04 (the per-machine persister, see
+``SatelliteConnectionManager._request_persist``): tests ``drain_persists()``
+before asserting on the store mock, and the mock is patched at
+``storage.remote_store`` because the persister resolves it at call time.
 """
 
 import asyncio
@@ -29,7 +34,8 @@ class _FakeWS:
 
 def _register(mgr, machine_id, ws):
     with patch("storage.remote_store.update_machine_status"), \
-         patch("storage.remote_store.update_machine_capabilities"):
+         patch("storage.remote_store.update_machine_capabilities"), \
+         patch("storage.remote_store.get_remote_machine", return_value=None):
         return asyncio.get_event_loop().run_until_complete(
             _register_async(mgr, machine_id, ws)
         )
@@ -43,15 +49,18 @@ async def _register_async(mgr, machine_id, ws):
 async def test_stale_deregister_does_not_evict_new_connection():
     mgr = SatelliteConnectionManager()
     with patch("storage.remote_store.update_machine_status") as status, \
-         patch("storage.remote_store.update_machine_capabilities"):
+         patch("storage.remote_store.update_machine_capabilities"), \
+         patch("storage.remote_store.get_remote_machine", return_value=None):
         old_ws, new_ws = _FakeWS(), _FakeWS()
         old_conn = await mgr.register("m1", old_ws, {})
         new_conn = await mgr.register("m1", new_ws, {})  # duplicate
         assert old_ws.closed  # old socket closed by register
+        assert await mgr.drain_persists()
 
         # The OLD handler's finally fires with ITS connection → no-op.
         status.reset_mock()
         await mgr.deregister("m1", expected=old_conn)
+        assert await mgr.drain_persists()
         assert mgr.get_connection("m1") is new_conn
         # No "disconnected" status write from the stale path.
         assert not any(
@@ -60,14 +69,17 @@ async def test_stale_deregister_does_not_evict_new_connection():
 
         # The CURRENT handler's deregister still tears down for real.
         await mgr.deregister("m1", expected=new_conn)
+        assert await mgr.drain_persists()
         assert mgr.get_connection("m1") is None
+        assert status.call_args_list[-1].args[:2] == ("m1", "disconnected")
 
 
 @pytest.mark.asyncio
 async def test_duplicate_register_carries_inflight_sessions():
     mgr = SatelliteConnectionManager()
     with patch("storage.remote_store.update_machine_status"), \
-         patch("storage.remote_store.update_machine_capabilities"):
+         patch("storage.remote_store.update_machine_capabilities"), \
+         patch("storage.remote_store.get_remote_machine", return_value=None):
         old_conn = await mgr.register("m1", _FakeWS(), {})
         q = asyncio.Queue()
         old_conn.session_queues["sid-1"] = q
@@ -82,13 +94,16 @@ async def test_duplicate_register_carries_inflight_sessions():
         await asyncio.sleep(0)
         assert old_conn.writer_task.cancelled() or old_conn.writer_task.done()
         await mgr.deregister("m1", expected=new_conn)
+        assert await mgr.drain_persists()
 
 
 @pytest.mark.asyncio
 async def test_unguarded_deregister_keeps_old_behavior():
     mgr = SatelliteConnectionManager()
     with patch("storage.remote_store.update_machine_status"), \
-         patch("storage.remote_store.update_machine_capabilities"):
+         patch("storage.remote_store.update_machine_capabilities"), \
+         patch("storage.remote_store.get_remote_machine", return_value=None):
         await mgr.register("m1", _FakeWS(), {})
         await mgr.deregister("m1")  # no expected → unconditional
         assert mgr.get_connection("m1") is None
+        assert await mgr.drain_persists()

@@ -16,7 +16,7 @@ import asyncio
 
 import pytest
 
-from core.events.stream_pump import ChatStreamPump
+from core.events.stream_pump import ChatStreamPump, _record_usage
 from services.engines import subscription_pool as sp
 from storage import agent_store
 from storage import database as task_store
@@ -87,7 +87,9 @@ class TestPumpPayerAttribution:
             pump._llm_cost_delta = 0.01
             pump._input_tokens = 100
             pump._output_tokens = 50
-            pump._record_usage(task_store.get_chat(chat_id))
+            # The cost job's shape: values snapshotted on the loop, the row
+            # written from the executor.
+            _record_usage(task_store.get_chat(chat_id), pump._usage_snapshot())
             producer.cancel()
 
         # asyncio.run(): the deprecated get_event_loop().run_until_complete()

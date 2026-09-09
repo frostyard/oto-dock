@@ -25,8 +25,12 @@ import contextlib
 
 logger = logging.getLogger("mcp-manager")
 
-# Timeout for individual tool calls (seconds)
+# Timeout for individual tool calls (seconds). The default bounds phone
+# calls and app-action clicks (a caller / a click must never wait longer);
+# chat, task and meeting sessions use the chat figure (Codex's 300 s) so a
+# document render or a browser flow behind a sidecar MCP can finish.
 TOOL_CALL_TIMEOUT = 60
+TOOL_CALL_TIMEOUT_CHAT = 300
 
 # The registry's Claude-JSON config format spells streamable HTTP as "http"
 # (the CLI's alias for it) — both spellings are the same transport here. The
@@ -99,13 +103,15 @@ class MCPServerConnection:
                  credential_env: dict[str, str] | None = None,
                  session_id: str = "",
                  sandbox_builder=None,
-                 agent_name: str = ""):
+                 agent_name: str = "",
+                 tool_timeout: int = TOOL_CALL_TIMEOUT):
         self.name = name
         self.config = server_config
         self.credential_env = credential_env
         self.session_id = session_id
         self.sandbox_builder = sandbox_builder  # SandboxBuilder or None
         self.agent_name = agent_name
+        self.tool_timeout = tool_timeout  # per-call cap, set by the manager
         self.session: ClientSession | None = None
         self.tools: list[dict] = []  # Anthropic API format
         # Set when a call fails at the TRANSPORT level (closed pipe, dead
@@ -329,7 +335,7 @@ class MCPServerConnection:
         try:
             result = await asyncio.wait_for(
                 self.session.call_tool(tool_name, arguments),
-                timeout=TOOL_CALL_TIMEOUT,
+                timeout=self.tool_timeout,
             )
             # Concatenate all text content from the result
             parts = []
@@ -341,7 +347,7 @@ class MCPServerConnection:
             return "\n".join(parts) if parts else "(empty result)"
         except asyncio.TimeoutError:
             # A slow tool is NOT a dead server — timeouts never mark dead.
-            return f"Error: Tool '{tool_name}' timed out after {TOOL_CALL_TIMEOUT}s"
+            return f"Error: Tool '{tool_name}' timed out after {self.tool_timeout}s"
         except Exception as e:
             # Tool-level failures come back as result.isError above; an
             # EXCEPTION here is transport/protocol trouble (closed stream,
@@ -380,17 +386,27 @@ class AgentMCPManager:
                  session_id: str = "",
                  sandbox_builder=None,
                  prebuilt_config: tuple | None = None,
-                 enable_http_transport: bool = False):
+                 enable_http_transport: bool = False,
+                 tool_timeout: int = TOOL_CALL_TIMEOUT,
+                 external: bool = False):
         self.agent_name = agent_name
         self.phone_mode = phone_mode
+        # An EXTERNAL session (a phone caller who is not a platform user)
+        # never attaches the platform-management MCPs — the rebuild below
+        # applies the same exclusion rule the phone builder used, so the
+        # tools cannot exist here when the prompt says they do not.
+        self.external = external
         self.credential_env = credential_env
         self.excluded_mcps = excluded_mcps or set()
         self.session_id = session_id
         # Sidecar HTTP MCPs (registry Claude-JSON ``type: "http"``) are opt-in
-        # per manager: the app-action executor enables them; Direct-LLM chats
-        # keep them off — connecting would grow every chat's tool schema and
-        # put heavy tools behind the 60 s call cap.
+        # per manager: the app-action executor and Direct-LLM chat / task /
+        # meeting sessions enable them (their schemas ride the deferred-tools
+        # catalog, and the chat call cap is 300 s); phone calls keep them off
+        # — a document render must never hang a caller.
         self.enable_http_transport = enable_http_transport
+        # Per-call cap handed to every connection (see TOOL_CALL_TIMEOUT).
+        self.tool_timeout = tool_timeout
         self.sandbox_builder = sandbox_builder  # SandboxBuilder or None
         # Optional (config_path, secret_bundles) built by the CALLER — used by
         # the headless app-action executor, whose identity (personal-app owner
@@ -421,6 +437,7 @@ class AgentMCPManager:
                 self.agent_name, None,
                 phone_mode=self.phone_mode,
                 is_remote=False,
+                external=self.external,
             )
         # Credential broker: provision THIS session's per-MCP secret
         # bundles so _start_stdio can merge each server's secrets in-process.
@@ -463,7 +480,8 @@ class AgentMCPManager:
                                        credential_env=self.credential_env,
                                        session_id=self.session_id,
                                        sandbox_builder=self.sandbox_builder,
-                                       agent_name=self.agent_name)
+                                       agent_name=self.agent_name,
+                                       tool_timeout=self.tool_timeout)
             self.servers[name] = conn
             tasks.append(self._start_server(conn))
 
@@ -600,8 +618,18 @@ class MCPPool:
         credential_env: dict[str, str] | None = None,
         excluded_mcps: set[str] | None = None,
         sandbox_builder=None,
+        enable_http_transport: bool = False,
+        tool_timeout: int = TOOL_CALL_TIMEOUT,
+        external: bool = False,
     ) -> AgentMCPManager:
-        """Get an existing manager or create and start a new one."""
+        """Get an existing manager or create and start a new one.
+
+        ``enable_http_transport`` / ``tool_timeout`` are the session policy
+        (``layer.direct_mcp_policy``): sidecar HTTP MCPs + the chat call cap
+        for chats, tasks and meetings; stdio-only + 60 s for phone calls.
+        ``external`` marks a session whose caller is not a platform user
+        (the management MCPs are never started for it).
+        """
         async with self._lock:
             mgr = self._managers.get(session_id)
             if mgr:
@@ -614,6 +642,9 @@ class MCPPool:
                 excluded_mcps=excluded_mcps,
                 session_id=session_id,
                 sandbox_builder=sandbox_builder,
+                enable_http_transport=enable_http_transport,
+                tool_timeout=tool_timeout,
+                external=external,
             )
             self._managers[session_id] = mgr
 

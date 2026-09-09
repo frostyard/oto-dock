@@ -8,6 +8,7 @@ its literal key would trip the naming guard.
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import httpx
 import pytest
@@ -153,7 +154,7 @@ def test_missing_credentials_are_a_400(monkeypatch):
 # ── inbound provisioning ───────────────────────────────────────────
 
 
-def test_provision_inbound_sets_voice_url(monkeypatch):
+def test_provision_inbound_sets_voice_url(monkeypatch, caplog):
     posted = {}
 
     def handler(request):
@@ -166,8 +167,12 @@ def test_provision_inbound_sets_voice_url(monkeypatch):
         return httpx.Response(200, json=_number(voice_url=WEBHOOK))
 
     _mock(monkeypatch, handler)
-    handle = asyncio.run(make_adapter().provision_route({
-        "id": "r1", "direction": "inbound", "did": "1 (555) 111-2222"}))
+    with caplog.at_level(logging.INFO, logger="claude-proxy"):
+        handle = asyncio.run(make_adapter().provision_route({
+            "id": "r1", "direction": "inbound", "did": "1 (555) 111-2222"}))
+    # The number is personal data: the log line names the route, not the DID.
+    assert "route r1" in caplog.text
+    assert "555" not in caplog.text
     assert posted["path"].endswith("/IncomingPhoneNumbers/PN1.json")
     assert posted["form"] == {"VoiceUrl": WEBHOOK, "VoiceMethod": "POST"}
     assert handle.adapter_data == {

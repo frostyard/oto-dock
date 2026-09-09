@@ -160,6 +160,12 @@ def main():
     if not proxy_url or not api_key or not session_id:
         return
 
+    # Codex app-server sessions that run the hook floor (OTO_HOOK_NO_FORWARD
+    # set by the spawn): the JSON-RPC stream already carries every tool
+    # result to the proxy, a forward here would render each card twice.
+    if os.environ.get("OTO_HOOK_NO_FORWARD"):
+        return
+
     # Interactive TUI (OTO_INTERACTIVE set by the spawn): rendering is
     # redundant — the terminal shows tool results itself, and forwarding was
     # surfacing "PostToolUse hook error" noise. But a successful mcp__ tool

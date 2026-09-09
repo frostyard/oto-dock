@@ -62,7 +62,6 @@ export function SubscriptionRow({
           <Badge variant={STATUS_VARIANT[sub.status] || 'default'}>{sub.status}</Badge>
           <Badge>{AUTH_TYPE_LABELS[sub.auth_type] || sub.auth_type}</Badge>
           {sub.provider !== 'anthropic' && <Badge variant="blue">{sub.provider}</Badge>}
-          {sub.is_primary ? <Badge variant="blue">primary</Badge> : null}
         </div>
         {sub.oauth_email && sub.label && (
           <p className="text-xs text-p-text-light truncate">{sub.oauth_email}</p>
@@ -105,15 +104,6 @@ export function SubscriptionRow({
             title="Discover available models from this provider"
           >
             Discover
-          </button>
-        )}
-        {manageable && !sub.is_primary && (
-          <button
-            onClick={() => updateMut.mutate({ layer, id: sub.id, is_primary: true })}
-            className="text-xs text-p-text-secondary hover:text-brand transition-colors sm:opacity-0 sm:group-hover:opacity-100"
-            title="Set as primary"
-          >
-            Primary
           </button>
         )}
         {manageable && (

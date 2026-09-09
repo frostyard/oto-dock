@@ -119,7 +119,8 @@ class TestManifestSanity:
         # itself with nobody watching) and meetings (self-reconfiguration
         # mid-discussion, possibly on another participant's suggestion —
         # and meetings multiply tool-schema cost per turn).
-        assert manifest["exclude_from"] == ["task", "meeting"]
+        # "external" (2026-09): never on a phone caller's session either.
+        assert manifest["exclude_from"] == ["task", "meeting", "external"]
 
     def test_schema_handler_coherence(self):
         mod = _load_server({

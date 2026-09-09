@@ -954,6 +954,10 @@ def load_session_security() -> None:
             saved_at = float(d.get("_saved_at", 0) or 0)
             if now - saved_at > _SECURITY_TTL_S:
                 continue  # stale crash orphan — its JWT would be expired
+            if d.get("principal") == "external":
+                # A phone call never survives a proxy restart; keeping the
+                # context would only re-validate a token that should be dead.
+                continue
             _session_security[sid] = _deserialize_security_ctx(d)
             _session_security_ts[sid] = saved_at or now
             loaded += 1
@@ -991,6 +995,21 @@ def set_session_security(session_id: str, ctx) -> None:
 def get_session_security(session_id: str):
     """Get the security context for a session, or None if not set."""
     return _session_security.get(session_id)
+
+
+def register_session_state(session_id: str, permission_mode: str, security_context) -> None:
+    """Register a session's permission mode + security context.
+
+    Every local layer calls this BEFORE it spawns the session's process: the
+    session JWT minted into that process's env derives its external claim
+    from the registered context (``auth/session_token.py``), and the
+    permission hook fails closed without one. A layer whose spawn fails
+    calls :func:`cleanup_session_permission_state` so a replayed token never
+    finds a live context for a session that never ran.
+    """
+    set_session_mode(session_id, permission_mode)
+    if security_context is not None:
+        set_session_security(session_id, security_context)
 
 
 def refresh_target_allow_full_fs(machine_id: str, allow_full_fs: bool) -> int:
@@ -1240,6 +1259,7 @@ def set_meeting_session_info(
     pump_session_id: str,
     agent_slug: str,
     parent_chat_id: str,
+    is_moderator: bool = False,
 ) -> None:
     """Register a meeting agent session's parent and pump context.
 
@@ -1254,12 +1274,48 @@ def set_meeting_session_info(
         "pump_session_id": pump_session_id,
         "agent_slug": agent_slug,
         "parent_chat_id": parent_chat_id,
+        "is_moderator": is_moderator,
+        # Per-turn state of the turn-end backstop (api/hooks): the routing
+        # tool the hook saw this turn ("" = none yet) and how much response
+        # text the orchestrator has collected — the deny reason and the
+        # end_meeting summary salvage read the same number.
+        "routed_tool": "",
+        "turn_text_chars": 0,
     }
 
 
 def get_meeting_session_info(agent_session_id: str) -> dict | None:
     """Get meeting context for an agent session, or None if not a meeting session."""
     return _meeting_session_info.get(agent_session_id)
+
+
+def mark_meeting_turn_routed(agent_session_id: str, tool: str) -> None:
+    """Record that a meeting participant's turn passed a routing tool
+    (``direct_to`` / ``end_meeting`` / ``propose_conclude`` /
+    ``leave_meeting``). No-op for non-meeting sessions."""
+    info = _meeting_session_info.get(agent_session_id)
+    if info is None:
+        return
+    # First routing call wins, except that a CLOSING call (end_meeting /
+    # leave_meeting) after a direct_to supersedes it — it is the stronger,
+    # final signal and unlocks the on-the-way-out memory writes.
+    if not info.get("routed_tool") or tool in ("end_meeting", "leave_meeting"):
+        info["routed_tool"] = tool
+
+
+def clear_meeting_turn_routed(agent_session_id: str) -> None:
+    """Reset the per-turn backstop state at a turn boundary."""
+    info = _meeting_session_info.get(agent_session_id)
+    if info is not None:
+        info["routed_tool"] = ""
+        info["turn_text_chars"] = 0
+
+
+def note_meeting_turn_text(agent_session_id: str, chars: int) -> None:
+    """Record the response text collected so far in the current turn."""
+    info = _meeting_session_info.get(agent_session_id)
+    if info is not None:
+        info["turn_text_chars"] = chars
 
 
 def cleanup_meeting_session_info(agent_session_id: str) -> None:

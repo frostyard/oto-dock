@@ -14,6 +14,92 @@ changed default — is called out explicitly under its version.
 
 ## [Unreleased]
 
+## [1.6.0] — 2026-09-09
+
+### Added
+- **GPT-6 Astra on the Codex engine.** OpenAI's new flagship is a predefined
+  Codex model. "Auto" keeps choosing GPT-5.6 Sol: Astra costs 2.5 times more.
+- **Local models, everywhere.** A Codex agent on a paired machine can run on a
+  local endpoint; one endpoint serves both the Direct LLM API and Codex engines
+  and can carry an API key; chats show a local model's thinking and pass effort.
+- **The Direct LLM API engine catches up.** OpenAI models use the Responses API
+  (effort with tools, reasoning shown, web search with sources, nothing stored).
+  Agents get file tools and the sidecar MCPs. Tools and skills load on demand
+  (`DIRECT_LLM_TOOL_SEARCH=off` restores the old way). Needs the current relay.
+- **Phone routes know who is calling.** Each caller gets a private folder and
+  memory (*Per caller*, the default), or the call runs as a chosen platform user
+  (role capped at manager); callers are viewers with no platform or shell tools.
+- **Caller data retention.** Callers' folders, conversations and the call log
+  age out together (Setup → Phone → Caller Data, 90 days, "Forget all").
+  Callers' folders count against a new per-agent quota (1 GB).
+- **Browser control can use your own browser.** A remote machine can opt in to
+  "Use my own browser": the agent works in the Chrome, Edge or Brave you are
+  signed into, through the Playwright Extension (save its token for tasks).
+- **The video-tools MCP, 0.4.0 to 0.4.2.** Colour-managed grading (HLG and PQ
+  to Rec.709, LUT chains, clarity, sharpness), a colour-managed `edit_video`,
+  an `align_audio` tool, Rec.709 renders at 48 kHz. Update it from the catalog.
+- **Sandbox limits and a stall watchdog.** Each local sandbox's `/tmp` is capped
+  (`SANDBOX_TMP_SIZE_MB`, 4096 MB, at most half the host's memory). A watchdog
+  logs the blocking stack on event-loop stalls (`LOOP_WATCHDOG_THRESHOLD_S`, 2 s).
+
+### Changed
+- **Codex CLI 0.153.4 and Claude Code 2.1.263.** Paired machines update at
+  their next reconnect. Codex's plan tool stays on so its checklist keeps working.
+- **Cost shown only when the turn cost money.** API-key and hosted relay chats
+  keep the badge, subscription and local-model chats hide it; usage is unchanged.
+- **Phone routes on upgrade.** Existing routes come up in *Per caller* mode: a
+  caller who worked in the shared space gets a private one and no longer sees
+  the shared memory (tie the route to a platform user to keep the old way).
+- **Phone daemon** (rebuild it with the proxy): call-log retention follows the
+  caller-data window; outbound calls wait for their pre-generated opening; the
+  `PHONE_AGENT_ROLES` setting is gone; admin-only agents no longer run as admin.
+- **"Primary" is gone from AI Engines.** The model decides the provider. System
+  Default prefers a provider with a subscription, so a local-only install no
+  longer defaults to a hosted model. Stored primary flags are cleared on upgrade.
+- Claude models on Direct LLM search the web with the basic search tool again.
+- Satellite 0.5.118 (fleet auto-update): unattended Codex sessions on paired
+  machines run the same permission floor as on the server; lean skill cards.
+
+### Fixed
+- **Dictation no longer repeats words.** The 1.5.0 fix for vanishing words could
+  print the last words of a phrase twice. It now commits exactly what was heard.
+- **Codex on local models.** Discover finds an Ollama server's models again. On
+  Ollama 0.34 the MCP tools load on demand (0.34.0-rc1 cannot call them yet,
+  reported upstream). A slow first prompt no longer dies at five minutes.
+- **Codex sessions start clean.** The first turn waits for every MCP server. A
+  stale ChatGPT login no longer shadows an API key or a local model. llama.cpp
+  and LM Studio are told they drop MCP tools. Meeting tools no longer prompt.
+- **Direct LLM chats.** A chat on an agent pinned to a paired machine no longer
+  believes it runs there. Switching provider mid-chat works. Web search, fetch
+  and code rows finish. A cut-off tool call no longer breaks the next request.
+- **Phone calls.** No two-second dead air after each sentence with ElevenLabs
+  voices (`close_at_flush`). The ambience plays through gaps. A call ends at the
+  agent's end marker. A timed-out audio read no longer leaves the call deaf.
+- **The proxy no longer stalls on a slow database disk.** Status, turn saves,
+  chat actions and log writes run off the event loop. Tunneled MCP streams are
+  no longer cut every 15 minutes. `send_files` sees same-turn remote files.
+- **Server sandbox.** Bash commands that start with a variable assignment run
+  again. The permission gate looks past `do`, `then`, `if` and `( … )` wrappers.
+  The session scratchpad under `/tmp` is writable.
+- **Company map.** Zooming out of a department lands on the same whole-map
+  view that paging between departments uses, with no second zoom-out step.
+- **Meetings end each turn at the routing call.** A participant that kept
+  working after `direct_to` stalled the meeting, and a summary written after
+  `end_meeting` was lost. Later tool calls are refused, the summary is kept.
+- **Smaller fixes.** New models show in the pickers at once. No "Default Session
+  Mode" on a Direct LLM agent. `write_xlsx` charts and conditional formatting
+  come out as asked and survive later edits.
+
+### Security
+- Sessions without a human user (tasks, triggers, meetings, phone) are tighter:
+  permission state clears when a local session closes, agent configuration and
+  warmup need the master key, the memory API refuses foreign-agent sessions,
+  phone-minted tokens die at hangup, delegation refuses external principals.
+- Uploads, context files, recover-bin restores and previews re-check their
+  destination on the resolved path (a planted symlink cannot redirect a read
+  or write); the file tools check every path with the platform, including
+  container-absolute ones. Phone numbers no longer appear in logs.
+
 ## [1.5.0] — 2026-09-03
 
 Two headline additions — your agents on your own machines, and your agents
@@ -617,7 +703,8 @@ a coding tool into a team of coworkers.
 - **Self-hosted install** via Docker Compose, with your chats, files, memory and
   credentials staying on hardware you run.
 
-[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/OtoDock/oto-dock/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/OtoDock/oto-dock/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/OtoDock/oto-dock/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/OtoDock/oto-dock/compare/v1.3.2...v1.4.0
 [1.3.2]: https://github.com/OtoDock/oto-dock/compare/v1.3.1...v1.3.2

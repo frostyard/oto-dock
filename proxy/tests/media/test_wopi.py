@@ -13,6 +13,7 @@ Covers:
 """
 
 import base64
+import os
 from unittest.mock import AsyncMock
 
 import pytest
@@ -353,3 +354,37 @@ async def test_put_file_host_cache_view_token_still_403(
     )
     assert resp.status_code == 403
     push.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# generate_wopi_url — the request's agent AND file_path are confined
+# ---------------------------------------------------------------------------
+
+
+def test_wopiurl_agent_segment_cannot_leave_agents_tree(temp_db, tmp_path, monkeypatch):
+    """``can_access_agent`` says yes to ANY name for an admin, so the agent
+    field is confined to the agents tree before the file path is confined to
+    the agent: a traversal agent answers 403, never a token."""
+    import config
+    app = _make_url_app(monkeypatch, tmp_path, role="admin", username="root", is_admin=True)
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path / "agents")
+    stray = tmp_path / "stray" / "workspace" / "doc.docx"
+    stray.parent.mkdir(parents=True)
+    stray.write_bytes(b"doc")
+    r = TestClient(app).post(
+        "/v1/documents/wopi-url",
+        json={"file_path": "workspace/doc.docx", "agent": "../stray", "edit": False},
+    )
+    assert r.status_code == 403
+
+
+def test_wopiurl_symlink_out_of_agent_is_403(temp_db, tmp_path, monkeypatch):
+    import config
+    app = _make_url_app(monkeypatch, tmp_path, role="manager", username="alice")
+    monkeypatch.setattr(config, "AGENTS_DIR", tmp_path / "agents")
+    outside = tmp_path / "outside-doc.docx"
+    outside.write_bytes(b"doc")
+    ws = tmp_path / "agents" / "test-agent" / "workspace"
+    ws.mkdir(parents=True)
+    os.symlink(outside, ws / "link.docx")
+    assert _ask_url(app, "workspace/link.docx").status_code == 403

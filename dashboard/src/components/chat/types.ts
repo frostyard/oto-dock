@@ -37,7 +37,10 @@ export type MessageBlock =
   | { type: 'artifact_interaction'; token: string; title?: string; payload?: unknown }
   | { type: 'app_action'; appId: string; slug?: string; title?: string; actionId: string; label?: string; prompt?: string }
   | { type: 'document_preview'; wopiUrl: string; filename: string; fileId: string; downloadUrl: string; dbMessageId?: number; snapshotId?: string; generation?: number }
-  | { type: 'metadata'; costUsd: number; durationMs: number }
+  // costBilled false = the turn ran on a subscription or a local model: the cost
+  // is an activity estimate and its badge is hidden. Missing = shown (rows
+  // persisted before the flag existed).
+  | { type: 'metadata'; costUsd: number; durationMs: number; costBilled?: boolean }
 
 export interface DisplayMessage {
   id: string

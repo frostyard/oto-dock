@@ -37,14 +37,30 @@ export interface PhoneRoute {
   // When set, the proxy fetches the trigger row at warmup and enriches the
   // session prompt via manifest agent_context `${trigger.*}` tokens.
   trigger_slug: string | null
+  // Who the caller IS on this route and what the session may touch.
+  // 'caller' = every caller gets a private space (external principal; on a
+  // shared-only agent that is the shared space with no per-caller memory),
+  // 'user' = the call runs as identity_user_sub's own session. 'shared' is
+  // a legacy value (option removed 2026-09-07) the API no longer accepts.
+  // `remember_callers` off makes every caller ephemeral.
+  identity_mode: 'caller' | 'shared' | 'user'
+  identity_user_sub: string | null
+  // Server echo of a column kept for compatibility: an external caller
+  // always runs as viewer (the per-route role selector was removed
+  // 2026-09-08); the API ignores whatever a client sends.
+  role: 'viewer' | 'editor' | 'manager'
+  remember_callers: boolean
   // Server-computed mask flag — the PIN value itself never leaves the proxy
   // (write-only sub-resource, useSetRoutePin/useDeleteRoutePin).
   pin_configured: boolean
+  // Server-computed advisories for this route (a user-tied line without a
+  // PIN, a Codex agent on an external route, a tied user that lost access).
+  warnings: string[]
   created_at: string
   updated_at: string
 }
 
-export type PhoneRouteCreate = Omit<PhoneRoute, 'id' | 'created_at' | 'updated_at' | 'pin_configured'>
+export type PhoneRouteCreate = Omit<PhoneRoute, 'id' | 'created_at' | 'updated_at' | 'pin_configured' | 'warnings' | 'role'>
 export type PhoneRouteUpdate = Partial<PhoneRouteCreate>
 
 export interface PhoneCallLogEntry {
@@ -63,6 +79,11 @@ export interface PhoneCallLogEntry {
   started_at: string
   ended_at: string | null
   duration_s: number | null
+  // Audit trail of the warmed session: the daemon reports the session id,
+  // the proxy fills the caller identity label and the tools the call ran.
+  session_id: string
+  identity: string
+  tools_run: string[]
   created_at: string
 }
 
@@ -198,6 +219,91 @@ export function usePhoneRouteCallLog(routeId: string, open: boolean, offset = 0,
       const res = await apiFetch(`/v1/admin/phone/call-log?${params}`)
       if (!res.ok) throw new Error('Failed to fetch the call log')
       return res.json()
+    },
+  })
+}
+
+// What a session on a route with this agent + identity would attach — the
+// agent's MCPs minus the phone exclusions and (for the external identities)
+// minus what never reaches external callers. Manifest-level, no processes;
+// the RouteModal shows it before saving.
+export interface RouteMcpPreview {
+  attached: { name: string; label: string }[]
+  excluded: { name: string; label: string; reason: string }[]
+}
+
+export function useRouteMcpPreview(agent: string, identityMode: PhoneRoute['identity_mode']) {
+  return useQuery({
+    queryKey: ['phone-route-mcp-preview', agent, identityMode],
+    enabled: !!agent,
+    queryFn: async (): Promise<RouteMcpPreview> => {
+      const params = new URLSearchParams({ agent, identity_mode: identityMode })
+      const res = await apiFetch(`/v1/admin/phone/routes/mcp-preview?${params}`)
+      if (!res.ok) throw new Error('Failed to preview the tools on this route')
+      return res.json()
+    },
+  })
+}
+
+// Caller data (external routes): the retention window for what callers leave
+// behind (their private trees, the phone conversations, the call-log rows),
+// what is on disk right now, and "Forget all".
+export interface ExternalDataStatus {
+  enabled: boolean
+  days: number
+  callers: number
+  bytes: number
+  agents: Record<string, { callers: number; bytes: number }>
+  phone_chats: number
+  call_log_rows: number
+}
+
+export interface ForgetExternalDataResult {
+  callers_forgotten: number
+  callers_busy_skipped: number
+  phone_chats_deleted: number
+  phone_chats_busy_skipped: number
+  call_log_rows_deleted: number
+  caller_bytes_freed: number
+}
+
+export function useExternalData() {
+  return useQuery({
+    queryKey: ['phone-external-data'],
+    queryFn: async (): Promise<ExternalDataStatus> => {
+      const res = await apiFetch('/v1/admin/phone/external-data')
+      if (!res.ok) throw new Error('Failed to fetch the caller-data status')
+      return res.json()
+    },
+  })
+}
+
+export function useSaveExternalData() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (data: { enabled?: boolean; days?: number }) => {
+      const res = await apiFetch('/v1/admin/phone/external-data', {
+        method: 'PUT',
+        body: JSON.stringify(data),
+      })
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Failed to save')
+      return res.json() as Promise<ExternalDataStatus>
+    },
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['phone-external-data'] }) },
+  })
+}
+
+export function useForgetExternalData() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async () => {
+      const res = await apiFetch('/v1/admin/phone/external-data/forget', { method: 'POST' })
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || 'Failed to forget caller data')
+      return res.json() as Promise<ForgetExternalDataResult>
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['phone-external-data'] })
+      qc.invalidateQueries({ queryKey: ['phone-call-log'] })
     },
   })
 }

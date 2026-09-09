@@ -37,6 +37,9 @@ from core.config.task_config_builder import (
 from core.session import warmup_registry, visibility as _vis
 from core import execution_mode
 from core.session import interactive_session
+import functools
+from storage.pg import run_db
+from core.events import chat_writer
 # Imported by ws/dashboard.py AFTER its helpers are defined —
 # safe intra-unit circularity (see the class assembly there).
 from ws.dashboard import (
@@ -72,6 +75,12 @@ class WarmupController:
             if not pin:
                 return {}
             agent = chat.get("agent") or ""
+            # A Direct LLM chat always runs on the server (config_builder
+            # pins it local whatever the agent's target says), so there is
+            # nothing to move it to — no banner, even when the agent's own
+            # layer default resolves to a machine.
+            if resolve_execution_path(agent, chat.get("execution_path") or "") == "direct-llm":
+                return {}
             role = _effective_agent_role(self.user_sub, agent)
             if chat.get("user_sub") != self.user_sub and role != "admin":
                 return {}
@@ -113,7 +122,7 @@ class WarmupController:
         if not self._can_access_agent(agent):
             await self._send_error(f"Access denied for agent '{agent}'")
             return
-        if not agent_store.agent_exists(agent):
+        if not await run_db(agent_store.agent_exists, agent):
             await self._send_error(f"Agent '{agent}' no longer exists")
             return
 
@@ -127,7 +136,9 @@ class WarmupController:
         # Role is part of the match key so per-agent role
         # reassignments (e.g. user demoted from editor to viewer) invalidate
         # the pre-warm and force a fresh session with the right role.
-        pw_effective_role = _effective_agent_role(self.user_sub, agent, fallback_user=self.user)
+        pw_effective_role = await run_db(
+            _effective_agent_role, self.user_sub, agent, fallback_user=self.user,
+        )
 
         # Already pre-warmed for same agent+model+role and alive -> reuse.
         # Model is part of the match key because CLI sessions are spawned with
@@ -261,7 +272,7 @@ class WarmupController:
         # the slug in ``user_agents`` (so _can_access_agent passes) until the JWT
         # refreshes, so gate on live existence too. Its chats are already gone
         # (delete_agent), this stops a NEW chat from spawning on the dead slug.
-        if not agent_store.agent_exists(agent):
+        if not await run_db(agent_store.agent_exists, agent):
             await self._send_error(f"Agent '{agent}' no longer exists")
             return
 
@@ -274,12 +285,12 @@ class WarmupController:
         # against it, fail-closed. New chats (no row yet) keep the frame agent.
         _rebind_cid = msg.get("chat_id")
         if _rebind_cid:
-            _chat_agent = (task_store.get_chat(_rebind_cid) or {}).get("agent") or ""
+            _chat_agent = ((await run_db(task_store.get_chat, _rebind_cid)) or {}).get("agent") or ""
             if _chat_agent and _chat_agent != agent:
                 if not self._can_access_agent(_chat_agent):
                     await self._send_error(f"Access denied for agent '{_chat_agent}'")
                     return
-                if not agent_store.agent_exists(_chat_agent):
+                if not await run_db(agent_store.agent_exists, _chat_agent):
                     await self._send_error(f"Agent '{_chat_agent}' no longer exists")
                     return
                 logger.warning(
@@ -348,8 +359,15 @@ class WarmupController:
         # interactive toggle. '' = unset (use stored/resolver default).
         requested_exec_mode = msg.get("execution_mode", "")
         logger.info(f"WS dashboard warmup: agent={agent}, requested_exec_path='{requested_exec_path}', model='{requested_model}', execution_mode='{requested_exec_mode}'")
-        warmup_role = _effective_agent_role(self.user_sub, agent, fallback_user=self.user)
-        self.layer = get_execution_layer(agent, execution_path=requested_exec_path, user_sub=self.user_sub, role=warmup_role)
+        def _warm_role_layer():
+            # Role + layer in ONE executor job (the layer reads remote_store
+            # for a remote target).
+            role = _effective_agent_role(self.user_sub, agent, fallback_user=self.user)
+            return role, get_execution_layer(
+                agent, execution_path=requested_exec_path, user_sub=self.user_sub, role=role,
+            )
+
+        warmup_role, self.layer = await run_db(_warm_role_layer)
         effective_exec_path = resolve_execution_path(agent, requested_exec_path)  # actual path for storage (never "remote")
         permission_mode = msg.get("permission_mode", "default")
         requested_model = msg.get("model", "")  # frontend sends current selection
@@ -374,14 +392,14 @@ class WarmupController:
 
         if cid:
             # Reuse existing chat
-            chat = task_store.get_chat(cid)
+            chat = await run_db(task_store.get_chat, cid)
             if chat and _rewarm_chat_allowed(
                     chat, cid, self.user_sub, self.user_agents):
                 self.chat_id = cid
                 # Persist the prompt at send-time for an existing-chat cold send
                 # (resumed dead session): the frontend warmup carries the text
                 # when its session is cold, and the server-kick skips re-persist.
-                self._persist_first_prompt(self.chat_id, msg.get("text", ""))
+                await self._persist_first_prompt(self.chat_id, msg.get("text", ""))
                 old_session_id = chat.get("session_id")
                 permission_mode = chat.get("permission_mode", permission_mode)
                 chat_model = chat.get("model", "")
@@ -390,7 +408,12 @@ class WarmupController:
                 # in the same mode).
                 chat_exec_mode = requested_exec_mode or chat.get("execution_mode", "") or ""
                 if requested_exec_mode and requested_exec_mode != (chat.get("execution_mode") or ""):
-                    task_store.update_chat(cid, execution_mode=requested_exec_mode)
+                    await chat_writer.submit(
+                        cid,
+                        functools.partial(task_store.update_chat, cid,
+                                          execution_mode=requested_exec_mode),
+                        label="exec_mode",
+                    )
                 # Use chat's stored execution_path if available
                 if chat.get("execution_path"):
                     effective_exec_path = chat["execution_path"]
@@ -508,7 +531,9 @@ class WarmupController:
             # since the pre-warm spawned (e.g. manager→editor via admin UI/SQL), the
             # pre-warm's SecurityContext is stale → the tail's match fails and it
             # spawns a fresh session with the right role baked into its mounts/policy.
-            consume_effective_role = _effective_agent_role(self.user_sub, agent, fallback_user=self.user)
+            consume_effective_role = await run_db(
+                _effective_agent_role, self.user_sub, agent, fallback_user=self.user,
+            )
 
             # The pre-warmed-reuse-vs-fresh decision moved into _spawn_tail: it must
             # first await the eager pre-warm (no longer done on the WS loop), so the
@@ -521,8 +546,18 @@ class WarmupController:
             if self.deferred_mode:
                 permission_mode = self.deferred_mode
                 self.deferred_mode = ""
-            task_store.create_chat(self.chat_id, _vis.chat_history_owner(self.agent_name, self.user_sub), self.agent_name, permission_mode, model=chat_model, execution_path=effective_exec_path, execution_mode=chat_exec_mode)
-            self._persist_first_prompt(self.chat_id, msg.get("text", ""))
+            # The chat row first, then the prompt — both on the chat's lane.
+            await chat_writer.submit(
+                self.chat_id,
+                functools.partial(
+                    task_store.create_chat, self.chat_id,
+                    _vis.chat_history_owner(self.agent_name, self.user_sub),
+                    self.agent_name, permission_mode, model=chat_model,
+                    execution_path=effective_exec_path, execution_mode=chat_exec_mode,
+                ),
+                label="create_chat",
+            )
+            await self._persist_first_prompt(self.chat_id, msg.get("text", ""))
 
         # For existing chats with no model stored, fill from agent default
         if not chat_model:
@@ -626,14 +661,20 @@ class WarmupController:
             # (the claim clears the column and doesn't return the raw reason).
             seed_reason_claimed = ""
             if wants_interactive:
-                _pre_claim_reason = (
-                    (task_store.get_chat(wcid) or {}).get("pending_history_seed") or ""
+                def _seed_claim_job():
+                    # Pre-claim read + the destructive claim, one lane job.
+                    reason = (task_store.get_chat(wcid) or {}).get("pending_history_seed") or ""
+                    # Smaller cap than the -p path (48k): the digest is
+                    # bracketed-pasted into the live TUI, so keep it light to
+                    # render fast (well under the Enter backstop) —
+                    # build_history_seed is newest-biased, so this keeps the
+                    # most recent context.
+                    digest, notice = consume_pending_seed_digest(wcid, max_chars=16_000)
+                    return reason, digest, notice
+
+                _pre_claim_reason, seed_digest, seed_notice = await chat_writer.submit(
+                    wcid, _seed_claim_job, label="seed_claim",
                 )
-                # Smaller cap than the -p path (48k): the digest is bracketed-pasted
-                # into the live TUI, so keep it light to render fast (well under the
-                # Enter backstop) — build_history_seed is newest-biased, so this
-                # keeps the most recent context.
-                seed_digest, seed_notice = consume_pending_seed_digest(wcid, max_chars=16_000)
                 if seed_notice:
                     seed_reason_claimed = _pre_claim_reason
             # A reseeded prompt's digest is multi-line → keep it off Codex's launch
@@ -807,7 +848,11 @@ class WarmupController:
                             chat_exec_mode=w_exec_mode, chat_theme=w_theme,
                             first_prompt=argv_first_prompt,
                         )
-                        task_store.update_chat(wcid, session_id=new_sid)
+                        await chat_writer.submit(
+                            wcid,
+                            functools.partial(task_store.update_chat, wcid, session_id=new_sid),
+                            label="session_bind",
+                        )
                         logger.info(
                             f"WS dashboard warmup (new): session={new_sid}, "
                             f"chat={wcid}, agent={w_agent}, model={chat_model}"
@@ -881,6 +926,7 @@ class WarmupController:
                     if ut:
                         om = remote_store.get_remote_machine(ut["machine_id"]) or {}
                         offline_machine_name = str(om.get("name") or "")
+                _mismatch = await run_db(self._target_mismatch_fields, wcid)
                 await warmup_registry.emit(wcid, {
                     "type": "warmup_ready",
                     "session_id": res.session_id,
@@ -892,7 +938,7 @@ class WarmupController:
                     "fallback_reason": res.fallback_reason,
                     "offline_machine_name": offline_machine_name,
                     "interactive": res.interactive,
-                    **self._target_mismatch_fields(wcid),
+                    **_mismatch,
                 })
                 # surface the "restored from history" card live (also persisted
                 # to chat_messages by the digest claim, so it renders on reload).
@@ -1131,7 +1177,9 @@ class WarmupController:
         # admin role changes / per-agent role re-assignments mid-WS. New
         # sessions must see the current state so editor/viewer demotions
         # take effect without forcing the user to reconnect.
-        effective_role = _effective_agent_role(self.user_sub, agent, fallback_user=self.user)
+        effective_role = await run_db(
+            _effective_agent_role, self.user_sub, agent, fallback_user=self.user,
+        )
 
         # Spawn-collision guard (incident 2026-08-06): a LIVE interactive
         # session already owns this session id — a second runtime on the same
@@ -1370,7 +1418,7 @@ class WarmupController:
         originating chat was reaped while the user views a DIFFERENT chat — warm
         it WITHOUT clobbering the viewed attributes and run headless on the
         returned ``_SpawnResult``. Raises on spawn failure (the caller handles)."""
-        chat_rec = task_store.get_chat(t_chat_id) if t_chat_id else None
+        chat_rec = await run_db(task_store.get_chat, t_chat_id) if t_chat_id else None
         chat_perm_mode = (chat_rec or {}).get("permission_mode", "default")
         chat_model = (chat_rec or {}).get("model", "")
         chat_agent = (chat_rec or {}).get("agent") or self.agent_name
@@ -1411,10 +1459,15 @@ class WarmupController:
             # Flag the DB-digest reseed: the resume gate refused, so this fresh
             # session has no context. The turn that triggered this auto-resume
             # claims the flag at the _start_new_stream chokepoint right after
-            # this returns and prepends the digest.
-            task_store.update_chat(
-                t_chat_id, session_id=new_sid,
-                pending_history_seed="resume_failed",
+            # this returns and prepends the digest — awaited so the claim
+            # can never run ahead of the flag.
+            await chat_writer.submit(
+                t_chat_id,
+                functools.partial(
+                    task_store.update_chat, t_chat_id, session_id=new_sid,
+                    pending_history_seed="resume_failed",
+                ),
+                label="resume_failed_flag",
             )
         return res
 
@@ -1433,7 +1486,7 @@ async def spawn_detached_prewarm(
     ``_spawn_tail``; unclaimed → the TTL reaper frees it. Returns the
     session_id, or None when skipped (remote/interactive) or not spawnable.
     """
-    role = _effective_agent_role(user_sub, agent, fallback_user=user)
+    role = await run_db(_effective_agent_role, user_sub, agent, fallback_user=user)
     new_sid = str(uuid.uuid4())
     try:
         agent_cfg = await build_agent_config(

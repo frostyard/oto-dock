@@ -20,7 +20,7 @@ Platform (proxy)                    Satellite (remote machine)
 
 - **No bwrap on satellite** -- agents run as direct subprocesses on the host filesystem
 - **Dumb pipe** -- the satellite does not parse, filter, or interpret stdout. Every raw NDJSON/JSONL line is forwarded verbatim. All turn-end decisions (settle, JOB_DONE, bg-agent tracking) live on the proxy via `ClaudeCLIEventTranslator` + `SettleController`. The satellite exits its stdout read loop when the proxy sends `stop_turn` or the process EOFs.
-- **Hooks shipped with each session** -- `permission_gate.py` and `tool_result_forwarder.py` scripts are bundled into every `start_session` payload and written into the session's `.claude/` or `.codex/` dir before the CLI is spawned. Satellites never need hooks pre-deployed and always run the current proxy version.
+- **Hooks shipped with each session** -- `permission_gate.py` and `tool_result_forwarder.py` scripts are bundled into every `start_session` payload and written into the session's `.claude/` or `.codex/` dir before the CLI is spawned. Satellites never need hooks pre-deployed and always run the current proxy version. Claude sessions always run them; a Codex session runs them when trusted -- the interactive TUI by CLI flag, and (0.5.118) an unattended app-server session (task / phone / meeting / trigger) when the payload's `codex_hooks_floor` is set: `[features] hooks = true`, thread-level `bypass_hook_trust`, deny-only hook output. Attended Codex dashboard chats gate through the JSON-RPC approval bridge instead.
 - **Hooks call platform over the WS tunnel** -- at runtime, hook scripts (and Docker MCPs) hit the satellite's local `aiohttp` server at `http://127.0.0.1:<port>` (the `PROXY_URL` value injected on the satellite), which multiplexes each request back to the proxy over the same WebSocket as `http_request` frames. No separate network path, no inbound ports.
 - **File sync over WS** -- agent directories synced bidirectionally between platform and satellite. Generated/build dirs (cargo `target/`, gradle `build/`, NuGet `obj/`, CMake/Meson trees, ...) are excluded by the marker-confirmed sync-ignore rules the proxy ships in the auth handshake (0.5.110+; engine in `transport/file_sync.py`)
 - **Process-per-turn for Codex** -- each message spawns a new `codex exec` process (thread ID enables resume)
@@ -207,13 +207,14 @@ The satellite communicates with the platform via JSON messages over WebSocket.
 | `session_aborted` | Abort acknowledged |
 | `pause` | Deliberate pause (tray) — suppresses the admin-offline alert before the WS closes |
 | `http_request` / `http_request_chunk` | Hook/MCP HTTP request multiplexed to the proxy (the loopback tunnel) |
+| `http_abort` | (0.5.115+) The local client of a tunneled stream went away (disconnect, first-frame/mid-stream timeout, write reset) — the proxy closes its upstream at once instead of waiting for its idle sweep. Older proxies ignore it. |
 
 ### Platform -> Satellite
 
 | Type | Purpose |
 |------|---------|
 | `auth_result` | Authentication response |
-| `start_session` | Spawn CLI or Codex session. Includes `hook_scripts`, `use_native_permissions` (CLI), `multi_value_envs` (`{env_var: separator}` map for joined sandbox-path-list env vars like `OTO_ALLOWED_ROOTS=":"` and `ALLOWED_FILE_DIRS=":"`), and the session's MCP `env` (manifest-declared `path_env` values + standard `OTO_*` set, all sandbox-style virtual paths). `path_translator.translate_env` rewrites virtual paths to satellite-absolute paths before subprocess spawn; for env vars listed in `multi_value_envs` it splits on the separator, translates each segment, drops empties, and rejoins. Mirror of bwrap on local. Codex payloads add `sandbox_mode`, already-mapped `effort`, `auth_json`. |
+| `start_session` | Spawn CLI or Codex session. Includes `hook_scripts`, `use_native_permissions` (CLI), `multi_value_envs` (`{env_var: separator}` map for joined sandbox-path-list env vars like `OTO_ALLOWED_ROOTS=":"` and `ALLOWED_FILE_DIRS=":"`), and the session's MCP `env` (manifest-declared `path_env` values + standard `OTO_*` set, all sandbox-style virtual paths). `path_translator.translate_env` rewrites virtual paths to satellite-absolute paths before subprocess spawn; for env vars listed in `multi_value_envs` it splits on the separator, translates each segment, drops empties, and rejoins. Mirror of bwrap on local. Codex payloads add `sandbox_mode`, already-mapped `effort`, `auth_json`, and (0.5.116+) `local_model_provider` — `{base_url, env_key}` for a local OpenAI-compatible endpoint, written into `config.toml` as `model_provider = "oto_local"` + `[model_providers.oto_local]` by both Codex writers; the key rides the payload `env` under the `env_key` name and the satellite host dials `base_url` as configured. 0.5.117+ adds `stream_idle_timeout_ms` (into the provider table) and `catalog_json` (written as `<CODEX_HOME>/models.json`, referenced by the root `model_catalog_json` key with its absolute path; removed when absent) so Codex defers its MCP tools on an Ollama model; the Codex MCP warm gate then waits for every configured server (90 s cap on a local model) before the `start_session` ack. |
 | `send_message` | Send user message to session |
 | `stop_turn` | Exit the current stdout read loop — turn is over according to proxy's `SettleController`. Triggers `turn_ended` reply. |
 | `abort` | Interrupt running session: tree-kill for CLI (hard fallback since 0.5.89 — see `interrupt_turn`); Codex soft-interrupts its daemon turn (`turn/interrupt`, daemon + MCPs survive) — since 2026-07-09 the proxy treats that as its GRACEFUL codex path (producer stays alive for the terminal turn event; the `session_aborted` ack only triggers a proxy-side queue drain when a hard abort armed it). |
@@ -260,13 +261,13 @@ The satellite has no turn-end intelligence of its own — it does not inspect ev
 
 ### Codex CLI (`execution_path: "codex-cli"`)
 
-Process-per-turn. The satellite:
-1. Writes hook scripts (from payload), AGENTS.md, config.toml (with `~` expanded), and auth.json into `.codex/`.
-2. On each `send_message`: spawns `codex exec --json <prompt>` (or `codex exec resume <thread_id>`), **using the `sandbox_mode` and `effort` values already mapped by the proxy** (effort: `max` → `xhigh`; permission_mode → `workspace-write`/`workspace-write-auto`/`danger-full-access`).
-3. Captures `thread_id` from `thread.started`, reports to platform.
-4. Forwards JSONL events from stdout verbatim to platform via WS.
+Persistent `codex app-server` JSON-RPC daemon (`sessions/codex_session.py`; the old process-per-turn `codex exec` model is gone). The satellite:
+1. Writes hook scripts (from payload), AGENTS.md, `hooks.json`, config.toml and auth.json (or removes a stale one) into `.codex/`. The config.toml is composed here: the app-server header (`project_doc_max_bytes`, `[memories]` off, `[tools]` plan tool on, one `[features]` table -- `plugins = false`, `hooks = true` for unattended sessions, merged with any block the proxy prepends), the proxy's `[mcp_servers.*]` sections (`~` expanded, MCP env paths translated, `DISPLAY` injected, interceptor-wrapped) and, on a local endpoint, the `oto_local` provider block.
+2. Spawns the daemon once, then `thread/start` (or `thread/resume` for a persisted `thread_id`) with the proxy-mapped `sandbox_mode` / `effort` and, for unattended sessions, `config = {"bypass_hook_trust": true}`; waits for the configured MCP servers to finish starting.
+3. Reports the thread id (`codex_thread_id`) so the proxy persists it for resume after a restart.
+4. On each `send_message`: `turn/start` with the per-turn approval policy + sandbox policy; a persistent forwarder ships every daemon notification verbatim to the platform as a `session_event`, including a background sub-agent's events after the main turn ends. Approval and question server-requests go to the proxy over the loopback tunnel (`/v1/hooks/permission`, `/v1/hooks/codex-question`).
 
-No duplicate effort mapping or sandbox defaulting happens on the satellite — the proxy is the single source of truth.
+No duplicate effort mapping or sandbox defaulting happens on the satellite — the proxy is the single source of truth (it also decides which sessions run the hook floor: `codex_hooks_floor`).
 
 **Execution path selection**: The proxy sends `execution_path` in the `start_session` command. The satellite dispatches to `CLISession` or `CodexSession` based on this field. The `execution_path` comes from `AgentConfig.execution_path` (set by the dashboard's layer selection), not from the agent's DB default.
 

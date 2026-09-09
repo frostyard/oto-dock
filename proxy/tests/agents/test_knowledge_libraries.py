@@ -1566,3 +1566,36 @@ class TestQuotaAccounting:
         source_dirs = [p.resolve() for p in sq.shared_scope_dirs(SRC)]
         assert not any(mirror_file.resolve().is_relative_to(d)
                        for d in source_dirs)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Path confinement — projector dirs and bulletin paths stay in the agents tree
+# ───────────────────────────────────────────────────────────────────────────
+
+
+class TestPathConfinement:
+    def test_projector_dirs_refuse_traversal_slugs(self):
+        from services.infra.path_confinement import PathOutsideRoot
+        from services.knowledge import library_projector
+        assert library_projector.source_knowledge_dir(SRC) == (
+            config.get_agent_dir(SRC) / "knowledge")
+        assert library_projector.mirror_dir(CON_A, SRC) == (
+            config.get_agent_dir(CON_A) / "knowledge" / "shared" / SRC)
+        for bad in ("..", "../x", ""):
+            with pytest.raises(PathOutsideRoot):
+                library_projector.source_knowledge_dir(bad)
+            with pytest.raises(PathOutsideRoot):
+                library_projector.mirror_dir(CON_A, bad)
+            with pytest.raises(PathOutsideRoot):
+                library_projector.mirror_dir(bad, SRC)
+
+    def test_bulletin_file_is_none_when_symlinked_out(self, kl_subdir_env, tmp_path):
+        from api.agents.knowledge_libraries import _bulletin_file, _has_bulletin
+        k = config.get_agent_dir(SRC) / "knowledge"
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "Marketing.md").write_text("leak")
+        shutil.rmtree(k / "marketing" / "bulletin", ignore_errors=True)
+        os.symlink(outside, k / "marketing" / "bulletin")
+        assert _bulletin_file(SRC, "marketing", "Marketing") is None
+        assert _has_bulletin(SRC, "marketing", "Marketing") is False

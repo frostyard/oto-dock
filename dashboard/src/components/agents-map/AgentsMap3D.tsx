@@ -124,6 +124,11 @@ import {
   type MapNode,
 } from './layout'
 import { applyWoodTexture, WOOD_FALLBACK_TINT } from './textures'
+import {
+  mapPoseFor as composeMapPose,
+  stageExitPath,
+  viewScaleFor,
+} from './camera'
 // The NIGHT world (operator round 10 — all generated in-house): a
 // ground-level starry-night panorama as the distant scenery (mirror-wrapped
 // equirect — mathematically seamless), walnut for the square bases, moonlit
@@ -205,6 +210,14 @@ const STAGE_CAM_MIN = 30
 // MapControls is disabled there.
 const ENTER_STAGE_DIST = 30
 const WHEEL_EXIT_ACCUM = 320
+// After the stage-exit flight lands, zoom-OUT wheel pulses are ignored
+// until BOTH this long has passed AND the wheel has gone quiet for
+// WHEEL_HOLD_GAP_MS — the gesture that triggered the exit keeps
+// delivering momentum for 1–2 s on a trackpad, and every pulse would push
+// the freshly-landed whole-map pose further out. A zoom-in pulse releases
+// the hold at once (a user who wheels in wants the stage back).
+const WHEEL_HOLD_MS = 450
+const WHEEL_HOLD_GAP_MS = 120
 // Gentle in-stage zoom range (factor on the composed camera distance).
 const STAGE_ZOOM_MIN = 0.78
 const STAGE_ZOOM_MAX = 1.3
@@ -439,6 +452,12 @@ interface SceneBag {
   mapLookGoal: THREE.Vector3 | null
   mapZoomT: number
   mapZoomC: number
+  /** Post-landing wheel hold (see WHEEL_HOLD_MS): the DOMHighResTimeStamp
+   * before which zoom-out pulses are swallowed (0 = no hold), and the last
+   * wheel event's time — the rAF timestamp and performance.now() share
+   * the same origin. */
+  wheelHoldUntil: number
+  lastWheelAt: number
   /** Next whole-map pose placement is INSTANT (no-favorite open). */
   mapSnap: boolean
   /** Fat-line materials need the viewport size — refreshed on resize. */
@@ -547,45 +566,23 @@ const TMP_RIGHT = new THREE.Vector3()
 const TMP_LOOK = new THREE.Vector3()
 const WORLD_UP = new THREE.Vector3(0, 1, 0)
 
-/** Resolution-aware framing factor (operator ask, 2026-08-25): every fit
- * in this file frames by FOV fraction, which draws the scene at the same
- * RELATIVE size on any screen — a 32" desktop showed the same departments
- * physically huge while the 2D UI around them stayed CSS-px sized. Pull
- * the camera back by the viewport's size relative to a ~13" laptop
- * reference (sqrt of the area ratio keeps it gentle), clamped so phones
- * and small laptops are untouched and big screens zoom out to show MORE
- * map instead of bigger cards. Read fresh at every fit — window resizes
- * self-correct on the next framing. */
-const VIEW_REF_W = 1366
-const VIEW_REF_H = 800
+/** Resolution-aware framing factor (camera.ts): big screens pull the
+ * camera back so the map shows MORE instead of bigger cards. Read fresh at
+ * every fit — window resizes self-correct on the next framing. */
 function viewScale(): number {
   if (typeof window === 'undefined') return 1
-  const f = Math.sqrt(
-    (window.innerWidth * window.innerHeight) / (VIEW_REF_W * VIEW_REF_H))
-  return Math.min(1.45, Math.max(1, f))
+  return viewScaleFor(window.innerWidth, window.innerHeight)
 }
 
-/** The composed whole-map pose for one department: camera BEHIND it,
- * outside the ring, at the ground-level ~8° elevation, looking across the
- * center — distance from the horizontal FOV (portrait phones pull back to
- * the clamp, desktop sits a little closer; big screens pull back by
- * viewScale on top). Shared by the stage-exit flight and the paged
- * whole-map machinery. */
+/** The composed whole-map pose for one department (camera.ts) for the
+ * live camera and viewport. Shared by the stage-exit flight (its landing)
+ * and the paged whole-map machinery (its goal) — the same numbers, so the
+ * flight lands exactly where paging between departments would put the
+ * camera and nothing moves after it. */
 function mapPoseFor(
   camera: THREE.PerspectiveCamera, cluster: MapCluster,
 ): { cam: THREE.Vector3; look: THREE.Vector3 } {
-  const vfov = (camera.fov * Math.PI) / 180
-  const hfov = 2 * Math.atan(
-    Math.tan(vfov / 2) * Math.max(0.4, camera.aspect),
-  )
-  const dist = Math.min(138, Math.max(112, 88 / Math.tan(hfov / 2)))
-    * viewScale()
-  return {
-    cam: new THREE.Vector3(
-      cluster.outX * dist, dist * 0.1405, cluster.outZ * dist,
-    ),
-    look: new THREE.Vector3(0, 0, 0),
-  }
+  return composeMapPose(camera.fov, camera.aspect, cluster, viewScale())
 }
 
 export default function AgentsMap3D({
@@ -973,6 +970,8 @@ export default function AgentsMap3D({
       mapLookGoal: null,
       mapZoomT: 1,
       mapZoomC: 1,
+      wheelHoldUntil: 0,
+      lastWheelAt: 0,
       mapSnap: false,
       lineRes: new THREE.Vector2(el.clientWidth, el.clientHeight),
       lineMats: [],
@@ -1003,12 +1002,34 @@ export default function AgentsMap3D({
     // MapControls owns the wheel (dolly) and the rAF's distance check
     // handles level switch UP.
     const onWheel = (ev: WheelEvent) => {
+      const now = performance.now()
+      if (bag.exitFly) {
+        // FIRST: the exit flight owns the camera. stageId is still set
+        // until the stage effect commits, so an unguarded pulse would
+        // re-accumulate wheelOut and re-trigger the exit; and once the
+        // effect lands the paged branch would feed the map zoom while the
+        // flight is still in the air.
+        ev.preventDefault()
+        bag.lastWheelAt = now
+        return
+      }
       if (bag.stageId === null) {
         if (bag.mapId === null) return // free-roam: MapControls owns it
         // Whole-map paged: wheel drives the gentle map zoom; diving past
         // the in-clamp enters the front department's stage (the dive
         // check lives in the rAF where the eased value crosses it).
         ev.preventDefault()
+        if (bag.wheelHoldUntil > 0) {
+          const released = ev.deltaY < 0
+            || (now >= bag.wheelHoldUntil
+              && now - bag.lastWheelAt >= WHEEL_HOLD_GAP_MS)
+          if (!released) {
+            bag.lastWheelAt = now
+            return
+          }
+          bag.wheelHoldUntil = 0
+        }
+        bag.lastWheelAt = now
         bag.mapZoomT = Math.min(
           1.25, Math.max(0.55, bag.mapZoomT + ev.deltaY * 0.0011),
         )
@@ -1116,14 +1137,19 @@ export default function AgentsMap3D({
         if (fly.t >= 1) {
           if (bag.mapId !== null && bag.mapCamPos && bag.mapLook) {
             // Land into the paged whole-map machinery: the flight's end
-            // IS the composed pose, so the handoff is seamless.
+            // IS the composed pose (same function as the paged goal), so
+            // nothing lerps after the handoff. A swipe that ran during the
+            // flight left parallax targets behind — drop them.
             bag.mapCamPos.copy(camera.position)
             bag.mapLook.copy(TMP_LOOK)
+            bag.par = { x: 0, y: 0, tx: 0, ty: 0, dragging: false }
           } else {
             controls.target.copy(fly.lookTo)
             controls.enabled = true
           }
           bag.exitFly = null
+          bag.wheelHoldUntil = now + WHEEL_HOLD_MS
+          bag.lastWheelAt = now
         }
       } else if (bag.mapId !== null && bag.mapCamPos && bag.mapCamGoal
         && bag.mapLook && bag.mapLookGoal) {
@@ -1192,7 +1218,9 @@ export default function AgentsMap3D({
             // the (empty) ring center, so the target test above never
             // fires on a dolly-in — a LOW camera over a department's
             // territory is the real "I zoomed into it" signal. The exit
-            // pose sits at y=40, safely above this trigger (hysteresis).
+            // pose is low too (0.1405 × distance ≈ 16–28) but sits ≥ 112
+            // from the center, far outside any cluster's territory, so
+            // landing never re-enters (hysteresis by distance, not height).
             const id = findClusterRef.current(
               camera.position.x, camera.position.z,
             )
@@ -2196,42 +2224,21 @@ export default function AgentsMap3D({
     // sits BEHIND the exited department looking across the ring (your
     // dais foreground, the company behind it) at the LOWEST allowed
     // angle — ~8°, just inside the polar clamp: the operator wants the
-    // whole map read from near ground level. Distance comes from the
-    // horizontal FOV (portrait phones pull back to the clamp; desktop a
-    // little further back than round 14), capped so the 3D distance
-    // stays inside the controls' 150 zoom-out clamp. The PATH arcs
-    // around the ring at altitude — round 14's straight lerp from a
-    // desktop stage pose cut through the empty center and read as a
-    // broken two-step zoom.
-    const vfov = (bag.camera.fov * Math.PI) / 180
-    const hfov = 2 * Math.atan(
-      Math.tan(vfov / 2) * Math.max(0.4, bag.camera.aspect),
-    )
-    const dist = Math.min(138, Math.max(112, 88 / Math.tan(hfov / 2)))
-    const end = new THREE.Vector3(
-      cluster.outX * dist, dist * 0.1405, cluster.outZ * dist,
-    )
-    const start = bag.camera.position.clone()
-    const mid = start.clone().lerp(end, 0.5)
-    const rHoriz = Math.max(
-      Math.hypot(start.x, start.z), Math.hypot(end.x, end.z), 60,
-    )
-    const midHoriz = Math.hypot(mid.x, mid.z)
-    if (midHoriz > 0.001) {
-      mid.x *= rHoriz / midHoriz
-      mid.z *= rHoriz / midHoriz
-    } else {
-      mid.x = end.x
-      mid.z = end.z
-    }
-    mid.y = Math.max(start.y, end.y) + 14
+    // whole map read from near ground level. The landing is THE paged
+    // whole-map pose (camera.ts, one function with the paged goal — the
+    // exit's own copy of the distance once lacked the viewScale factor,
+    // so the flight landed short and the paged lerp zoomed out again
+    // after it). The PATH arcs around the ring at altitude — round 14's
+    // straight lerp from a desktop stage pose cut through the empty
+    // center and read as a broken two-step zoom.
+    const pose = mapPoseFor(bag.camera, cluster)
     bag.camTarget = null
     bag.lookTarget = null
     bag.controls.enabled = false
     bag.exitFly = {
-      curve: new THREE.QuadraticBezierCurve3(start, mid, end),
+      curve: stageExitPath(bag.camera.position, pose.cam),
       lookFrom: (bag.stageLook ?? bag.controls.target).clone(),
-      lookTo: new THREE.Vector3(0, 0, 0),
+      lookTo: pose.look,
       t: 0,
     }
     // The flight lands into the paged whole-map machinery, standing
@@ -2791,9 +2798,12 @@ export default function AgentsMap3D({
           } else if (want < STAGE_ZOOM_MAX) {
             bag.wheelOut = 0 // inward pinch resets, mirroring the wheel
           }
-        } else if (bag.mapId !== null) {
+        } else if (bag.mapId !== null && !bag.exitFly) {
           // Whole-map paged: pinch drives the map zoom; the rAF dive
-          // check enters the front department past the in-clamp.
+          // check enters the front department past the in-clamp. The
+          // exit flight owns the camera until it lands (the pinch that
+          // triggered the exit is dropped above, but a new one can start
+          // mid-flight).
           bag.mapZoomT = Math.min(1.25, Math.max(0.55, want))
         }
       }

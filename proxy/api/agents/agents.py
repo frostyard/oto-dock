@@ -318,12 +318,21 @@ async def update_agent(name: str, req: UpdateAgentRequest, user: UserContext = D
         if _req_exec_mode in ("interactive", "-p"):
             _existing = agent_store.get_agent(name) or {}
             _dm = req.default_model or _existing.get("default_model", "")
-            _layers = config.get_model_layers(_dm) if _dm else []
-            if _layers and not ({"claude-code-cli", "codex-cli"} & set(_layers)):
+            _layers = set(config.get_model_layers(_dm)) if _dm else set()
+            # The CLI layer must be one THIS AGENT uses: a local model served
+            # by both Direct LLM and Codex resolves to codex-cli too, which
+            # would let a Direct-LLM-only agent store an interactive default
+            # it can never run (live-hit 2026-09-07).
+            _paths = set(
+                req.execution_paths if req.execution_paths is not None
+                else _get_execution_paths(_existing)
+            )
+            if _layers and not ({"claude-code-cli", "codex-cli"} & _layers & _paths):
                 raise HTTPException(
                     400,
                     "default_execution_mode can only be set when the agent's default "
-                    "model runs on a CLI execution layer (claude-code-cli or codex-cli).",
+                    "model runs on a CLI execution layer (claude-code-cli or codex-cli) "
+                    "that this agent uses.",
                 )
 
     # Validate execution_target

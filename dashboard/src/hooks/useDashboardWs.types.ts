@@ -55,12 +55,13 @@ export interface WsCallbacks {
   onPlanMode?: (data: { action: string; tool_input?: any }) => void
   onPlanReview?: (data: { request_id: string; plan: string; tool_input: any; filename?: string }) => void
   onSystem?: (data: { subtype: string; message?: string; agent?: string; agent_display_name?: string; agent_color?: string; round?: number; participants?: any[]; max_rounds?: number; max_turns?: number; meeting_id?: string }) => void
-  onMetadata?: (data: { cost_usd?: number; duration_ms?: number; duration_api_ms?: number; context_used?: number; context_max?: number; cache_read?: number; cache_write?: number; input_tokens?: number; output_tokens?: number }) => void
+  // cost_billed false = subscription / local-model turn (cost hidden); missing = shown
+  onMetadata?: (data: { cost_usd?: number; cost_billed?: boolean; duration_ms?: number; duration_api_ms?: number; context_used?: number; context_max?: number; cache_read?: number; cache_write?: number; input_tokens?: number; output_tokens?: number }) => void
   onDone?: () => void
   onError?: (message: string) => void
   onImages?: (data: { images: Array<{ url?: string; image_data?: string; mime_type?: string; caption?: string; attribution?: string; link_url?: string; download_url?: string }> }) => void
   onImageGenerating?: (data: { prompt_preview: string; model: string }) => void
-  onMcpCost?: (data: { cost_usd: number; provider: string; model: string; tool: string; mcp: string }) => void
+  onMcpCost?: (data: { cost_usd: number; cost_billed?: boolean; provider: string; model: string; tool: string; mcp: string }) => void
   onImageGenFailed?: () => void
   onUrl?: (data: { url: string; title: string; description: string }) => void
   onFile?: (data: { filename: string; download_url: string; description: string }) => void

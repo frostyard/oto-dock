@@ -85,6 +85,7 @@ async def test_goal_update_forwards_mirrors_and_persists(temp_db):
         # No turn block — panel-only state (reloads restore from the column).
         assert pump._turn_blocks == []
 
+        assert await stream_pump.chat_writer.drain("gc1", timeout=5)
         stored = json.loads(task_store.get_chat("gc1")["thread_goal"])
         assert stored == goal["goal"]
     finally:
@@ -102,14 +103,17 @@ async def test_goal_update_db_write_is_change_gated(temp_db):
     try:
         q = pump.attach()
         await pump._process_event(CommonEvent(GOAL_UPDATE, dict(GOAL_EVENT)))
+        assert await stream_pump.chat_writer.drain("gc2", timeout=5)
         updated_at = task_store.get_chat("gc2")["updated_at"]
 
         await pump._process_event(CommonEvent(GOAL_UPDATE, dict(GOAL_EVENT)))
+        assert await stream_pump.chat_writer.drain("gc2", timeout=5)
         assert task_store.get_chat("gc2")["updated_at"] == updated_at
         assert len(_drain(q)) == 2  # both still forwarded live
 
         progressed = dict(GOAL_EVENT, tokens_used=20000)
         await pump._process_event(CommonEvent(GOAL_UPDATE, progressed))
+        assert await stream_pump.chat_writer.drain("gc2", timeout=5)
         row = task_store.get_chat("gc2")
         assert row["updated_at"] != updated_at
         assert json.loads(row["thread_goal"])["tokens_used"] == 20000
@@ -136,6 +140,7 @@ async def test_goal_cleared_nulls_column_across_pumps(temp_db):
         frames = _drain(q)
         assert frames[0]["event"] == {"type": "goal_update", "goal": None}
         assert live["goal"] is None
+        assert await stream_pump.chat_writer.drain("gc3", timeout=5)
         assert task_store.get_chat("gc3")["thread_goal"] is None
     finally:
         stream_pump._chat_streaming_state.pop("gc3", None)

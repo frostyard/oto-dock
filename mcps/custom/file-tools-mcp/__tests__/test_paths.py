@@ -212,6 +212,31 @@ def test_resolve_via_proxy_defaults_to_read(monkeypatch):
     assert captured["json"]["writing"] is False
 
 
+def test_container_absolute_paths_go_through_the_proxy(monkeypatch):
+    """The mount holds every agent's tree, so a `/agents/...` path is not
+    trusted on its prefix alone: it is handed to the proxy in agents-relative
+    form and the session's path policy decides (2026-09-08)."""
+    calls = []
+
+    async def fake_proxy(p, writing=False):
+        calls.append((p, writing))
+        if "other-agent" in p:
+            return None, "403: outside this session's scope"
+        return p, ""
+
+    monkeypatch.setattr(shared, "_resolve_via_proxy", fake_proxy)
+    monkeypatch.setattr(shared, "_unicode_match_on_disk", lambda p: p)
+    out = asyncio.run(shared._resolve_path("/agents/pa/users/u/workspace/f.docx", writing=True))
+    assert out == "/agents/pa/users/u/workspace/f.docx"
+    assert calls == [("pa/users/u/workspace/f.docx", True)]
+    try:
+        asyncio.run(shared._resolve_path("/agents/other-agent/users/v/workspace/secret.docx"))
+    except ValueError as e:
+        assert "outside this session's scope" in str(e)
+    else:
+        raise AssertionError("another agent's tree must not resolve on the prefix alone")
+
+
 # ---------------------------------------------------------------------------
 # In-place edits are WRITES: their input must resolve with writing=True so
 # the proxy's write-RBAC fires (editor + /knowledge in-place edit → 403).

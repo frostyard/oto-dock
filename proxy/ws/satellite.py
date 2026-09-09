@@ -20,8 +20,14 @@ import config as app_config
 from core.remote import file_sync as file_sync_rules
 from core.remote.satellite_connection import get_connection_manager
 from storage import remote_store
+from storage.pg import run_db
 
 logger = logging.getLogger("claude-proxy.satellite-ws")
+
+# Every store call in the handshake below runs OFF the event loop (run_db on
+# the dedicated DB executor, or a persister lane): a reconnect storm after a
+# stall re-auths the whole fleet at once, and a synchronous commit here would
+# freeze the loop exactly when it must serve pings (the 09-03 incident).
 
 _AUTH_TIMEOUT_S = 5
 
@@ -231,7 +237,7 @@ async def ws_satellite_handler(websocket: WebSocket):
     # Tell the satellite to self-uninstall via close code 4006 so it
     # cleans up local files instead of looping forever in the reconnect
     # backoff trying with stale credentials.
-    machine = remote_store.get_remote_machine(machine_id)
+    machine = await run_db(remote_store.get_remote_machine, machine_id)
     if not machine:
         logger.info(
             "Satellite %s rejected: machine_id not found — instructing "
@@ -252,7 +258,7 @@ async def ws_satellite_handler(websocket: WebSocket):
     # verifying the secret is fine — the pairing_scope read is read-only.
     if (machine.get("pairing_scope") or "") != "admin":
         from storage import database as _db
-        if _db.get_platform_setting("allow_user_paired_machines") == "0":
+        if await run_db(_db.get_platform_setting, "allow_user_paired_machines") == "0":
             logger.info(
                 "Satellite %s rejected: user-paired machines disabled",
                 machine_id[:8],
@@ -266,7 +272,7 @@ async def ws_satellite_handler(websocket: WebSocket):
             return
 
     # Verify machine secret
-    if not remote_store.verify_machine_secret(machine_id, machine_secret):
+    if not await run_db(remote_store.verify_machine_secret, machine_id, machine_secret):
         logger.warning("Satellite auth failed for machine %s", machine_id[:8])
         await websocket.send_text(json.dumps({
             "type": "auth_result",
@@ -296,7 +302,8 @@ async def ws_satellite_handler(websocket: WebSocket):
     _pushed_target = _pending_pushed_updates.pop(machine_id, "")
     if _pushed_target and not _version_at_least(sat_version, _pushed_target):
         try:
-            attempts = remote_store.record_update_rollback(
+            attempts = await run_db(
+                remote_store.record_update_rollback,
                 machine_id, target_version=_pushed_target,
                 error=f"update to {_pushed_target} rolled back to {sat_version}",
             )
@@ -345,7 +352,11 @@ async def ws_satellite_handler(websocket: WebSocket):
             try:
                 from api.remote.remote_machines import get_satellite_tarball_with_hash
                 import base64 as _b64
-                tarball_bytes, expected_sha256 = get_satellite_tarball_with_hash()
+                # Cached after the first build, but that first build tars
+                # the satellite tree — off the loop.
+                tarball_bytes, expected_sha256 = await asyncio.to_thread(
+                    get_satellite_tarball_with_hash,
+                )
                 payload = {
                     "type": "update_required",
                     "target_version": SATELLITE_VERSION_LATEST,
@@ -370,8 +381,9 @@ async def ws_satellite_handler(websocket: WebSocket):
                     "Satellite %s: failed to push update: %s",
                     machine_id[:8], e,
                 )
-                remote_store.record_update_result(
-                    machine_id, error=f"push failed: {e}",
+                get_connection_manager().persist_lane(
+                    machine_id, "update_result",
+                    {"target_version": "", "error": f"push failed: {e}"},
                 )
             # Close so the satellite applies the update and reconnects.
             await websocket.close(code=4007, reason="updating")
@@ -404,7 +416,7 @@ async def ws_satellite_handler(websocket: WebSocket):
 
     # Auth succeeded — record the version we just observed.
     try:
-        remote_store.set_satellite_version(machine_id, sat_version)
+        await run_db(remote_store.set_satellite_version, machine_id, sat_version)
     except Exception:
         logger.exception("Failed to record satellite_version")
     # Include the satellite-host policy in auth_result
@@ -447,14 +459,15 @@ async def ws_satellite_handler(websocket: WebSocket):
         },
     }))
 
+    cm = get_connection_manager()
+
     # Clear a deliberate-pause flag on reconnect: a fresh auth means the
     # machine is back (tray Resume, or a reboot), so the sustained-outage
-    # evaluator should resume normal monitoring of it.
+    # evaluator should resume normal monitoring of it. Fire-and-forget
+    # through the persister: the satellite is authed but has no reader until
+    # register() below, so nothing here may wait on the database.
     if machine.get("paused"):
-        try:
-            remote_store.set_paused(machine_id, False)
-        except Exception:
-            logger.exception("Failed to clear paused flag on auth")
+        cm.persist_lane(machine_id, "paused", False)
 
     # If the satellite just came back with the new version after an
     # update was in flight, clear the update bookkeeping + notify
@@ -462,15 +475,15 @@ async def ws_satellite_handler(websocket: WebSocket):
     prev_version = machine.get("satellite_version") or ""
     if prev_version and prev_version != sat_version:
         try:
-            remote_store.record_update_result(
-                machine_id, target_version=sat_version, error=None,
+            cm.persist_lane(
+                machine_id, "update_result",
+                {"target_version": sat_version, "error": None},
             )
             await _broadcast_satellite_updated(machine_id, machine, sat_version)
         except Exception:
             logger.exception("Failed to record/announce satellite_updated")
 
     # --- Register connection ---
-    cm = get_connection_manager()
     conn = await cm.register(
         machine_id, websocket, capabilities, satellite_version=sat_version,
     )
@@ -557,7 +570,7 @@ async def _push_machine_event(machine: dict, event: dict) -> None:
     The dashboard handler at proxy/ws/dashboard.py::_handle_server_notification
     forwards items with our event types straight to the frontend WS."""
     from services.notifications import notification_manager
-    recipients = _dashboard_recipients_for_machine(machine)
+    recipients = await run_db(_dashboard_recipients_for_machine, machine)
     for sub in recipients:
         for conn in notification_manager.get_all_connections(sub):
             try:

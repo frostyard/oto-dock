@@ -351,16 +351,23 @@ class LocalTunnelServer:
             )
 
             # Await the first response frame (status + headers + maybe body).
-            try:
-                first = await asyncio.wait_for(
-                    stream.response_queue.get(),
-                    timeout=min(timeout_s + 5, 604800 + 60),
-                )
-            except asyncio.TimeoutError:
+            # Polled in short slices so a client that gives up while waiting
+            # (claude-code's HTTP timeout, an MCP client reconnecting its GET
+            # stream) is noticed and the platform told to close its side
+            # (``http_abort``) — before this the proxy held such streams
+            # until its idle sweep.
+            first = await self._wait_frame(
+                stream, request, min(timeout_s + 5, 604800 + 60),
+            )
+            if first is _CLIENT_GONE:
+                await self._send_abort(stream_id)
+                return web.Response(status=499, body=b"")
+            if first is None:
                 logger.warning(
                     "tunnel: stream %s timed out waiting for first frame",
                     stream_id[:8],
                 )
+                await self._send_abort(stream_id)
                 return web.Response(
                     status=504,
                     body=json.dumps({
@@ -407,16 +414,19 @@ class LocalTunnelServer:
                 await stream_resp.write(initial_body)
 
             while True:
-                try:
-                    chunk = await asyncio.wait_for(
-                        stream.response_queue.get(),
-                        timeout=timeout_s + 5,
-                    )
-                except asyncio.TimeoutError:
+                chunk = await self._wait_frame(stream, request, timeout_s + 5)
+                if chunk is _CLIENT_GONE:
+                    # Subprocess closed the connection mid-stream (an MCP
+                    # client reconnecting its GET stream, a hook script that
+                    # gave up) — close the platform side too.
+                    await self._send_abort(stream_id)
+                    break
+                if chunk is None:
                     logger.warning(
                         "tunnel: stream %s timed out mid-stream",
                         stream_id[:8],
                     )
+                    await self._send_abort(stream_id)
                     break
 
                 if chunk.get("error"):
@@ -430,9 +440,10 @@ class LocalTunnelServer:
                 if chunk_b64:
                     try:
                         await stream_resp.write(base64.b64decode(chunk_b64))
-                    except ConnectionResetError:
-                        # Subprocess closed the connection mid-stream.
-                        # Tell the platform via abort frame (future work).
+                    except (ConnectionResetError, ConnectionError):
+                        # Subprocess closed the connection mid-stream — tell
+                        # the platform so it closes its upstream now.
+                        await self._send_abort(stream_id)
                         break
 
                 if chunk.get("body_eof"):
@@ -449,11 +460,13 @@ class LocalTunnelServer:
         except (ConnectionResetError, ConnectionError) as e:
             # Same race for non-streaming responses: client gave up
             # before we could write the response. Log at debug — there's
-            # nothing to do and the connection is gone anyway.
+            # nothing to do locally; tell the platform so it drops the
+            # stream instead of waiting for its idle sweep.
             logger.debug(
                 "tunnel: client disconnected mid-handler for %s: %s",
                 path, e,
             )
+            await self._send_abort(stream_id)
             return web.Response(
                 status=499,  # nginx-style "client closed request"
                 body=b"",
@@ -467,6 +480,49 @@ class LocalTunnelServer:
             )
         finally:
             self._streams.pop(stream_id, None)
+
+    @staticmethod
+    def _client_gone(request: web.Request) -> bool:
+        """True once the local client (hook script / MCP client) has closed
+        its socket. aiohttp does not cancel handlers on disconnect, so the
+        frame waits below poll this between slices."""
+        try:
+            transport = request.transport
+        except Exception:  # noqa: BLE001 — defensive: mocked requests in tests
+            return False
+        return transport is None or transport.is_closing()
+
+    async def _wait_frame(self, stream: "_PendingStream", request: web.Request,
+                          timeout_s: float):
+        """Await the next platform frame for ``stream`` for up to
+        ``timeout_s``, checking every ``_CLIENT_POLL_S`` whether the local
+        client is still there. Returns the frame, ``_CLIENT_GONE`` when the
+        client disconnected, or ``None`` on timeout."""
+        deadline = asyncio.get_running_loop().time() + max(0.0, float(timeout_s))
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return None
+            try:
+                return await asyncio.wait_for(
+                    stream.response_queue.get(),
+                    timeout=min(remaining, _CLIENT_POLL_S),
+                )
+            except asyncio.TimeoutError:
+                if self._client_gone(request):
+                    return _CLIENT_GONE
+
+    async def _send_abort(self, stream_id: str) -> None:
+        """Best-effort ``http_abort`` so the platform closes its upstream for
+        a stream whose local client is gone. Older proxies ignore the frame
+        (unknown message types are dropped)."""
+        try:
+            await self.ws_client.enqueue_send({
+                "type": "http_abort",
+                "stream_id": stream_id,
+            })
+        except Exception:  # noqa: BLE001 — never let cleanup raise
+            logger.debug("tunnel: abort frame for %s not sent", stream_id[:8], exc_info=True)
 
     async def _send_request_frames(
         self,
@@ -522,6 +578,13 @@ class LocalTunnelServer:
 # Max body bytes per WS frame. Well under the 16 MB ws frame limit;
 # base64 + JSON overhead keeps the encoded frame ~340 KB on the wire.
 _MAX_FRAME_BODY = 256 * 1024
+
+# Local-client liveness polling while a handler waits for platform frames
+# (see ``_wait_frame``): aiohttp does not cancel a handler when its client
+# disconnects, so without this a client that gave up left the platform-side
+# stream open until the proxy's idle sweep. Sentinel returned on disconnect.
+_CLIENT_POLL_S = 5.0
+_CLIENT_GONE = object()
 
 
 # Hop-by-hop headers per RFC 7230 — must not be forwarded.

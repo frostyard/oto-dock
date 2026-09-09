@@ -59,6 +59,12 @@ logger = logging.getLogger("remote-layer")
 # genuinely dead/stuck processes.
 _REMOTE_INTERRUPT_WATCHDOG_S = 30.0
 
+# start_session ack budget for a Codex session on a LOCAL model: the satellite
+# acks after its pre-turn MCP warm gate, which waits for every server with a
+# 90 s cap on a local model (a changed tool list re-prefills for minutes
+# there), on top of the daemon spawn. Hosted sessions keep the 60 s budget.
+_LOCAL_MODEL_START_TIMEOUT_S = 180.0
+
 # Strong refs — a bare create_task is GC-collectable mid-flight.
 _remote_watchdog_tasks: set[asyncio.Task] = set()
 
@@ -628,7 +634,14 @@ class RemoteExecutionLayer(
             machine_id, session_id, execution_path
         )
 
-        # Send start_session command to satellite
+        # Send start_session command to satellite. The satellite acks AFTER the
+        # session started, which for Codex includes the pre-turn MCP warm gate;
+        # a local-model session waits for every server (its gate cap is 90 s,
+        # satellite ``_WARM_CAP_LOCAL_MODEL_S``), so its ack budget covers the
+        # cap on top of the spawn.
+        start_timeout = 60.0
+        if execution_path == "codex-cli" and payload.get("local_model_provider"):
+            start_timeout = _LOCAL_MODEL_START_TIMEOUT_S
         try:
             await self._cm.send_command(machine_id, {
                 "type": "start_session",
@@ -636,7 +649,7 @@ class RemoteExecutionLayer(
                 "agent_slug": config.agent_name,
                 "execution_path": execution_path,
                 "config": payload,
-            }, timeout=60.0)
+            }, timeout=start_timeout)
         except Exception:
             self._cm.remove_session_queue(machine_id, session_id)
             raise
@@ -2380,9 +2393,16 @@ class RemoteExecutionLayer(
         """Build the config payload sent to the satellite for start_session."""
         import config as app_config
         from core.layers.codex.helpers import (
+            LOCAL_ENDPOINT_KEY_ENV,
+            LOCAL_ENDPOINT_STREAM_IDLE_TIMEOUT_MS,
+            codex_hooks_floor,
             map_effort_to_codex,
             permission_to_sandbox,
             build_auth_json_from_env,
+            with_local_provider_note,
+        )
+        from core.layers.codex.local_model_catalog import (
+            LOCAL_MODEL_ROWS_ENV, local_model_catalog_json, parse_local_model_rows,
         )
 
         # Resolve the MOUNT username for CWD — "" for ANY agent-scope mount
@@ -2466,6 +2486,58 @@ class RemoteExecutionLayer(
         # as bwrap on local. See proxy/services/path_roles.py.
         env.update(config.extra_env)
         env.update(config.credential_env)
+        # A local OpenAI-compatible endpoint (a codex-cli ``local_endpoint``
+        # subscription) reaches the layer as two private variables. They never
+        # ride the satellite env in this form — popped for EVERY execution path.
+        # The satellite writes its own config.toml, so the provider travels as
+        # the ``local_model_provider`` payload field (satellite >= 0.5.116) and
+        # the key as the child-env variable the provider's ``env_key`` names —
+        # the same two artifacts the LOCAL layer produces (``_write_config_toml``).
+        # An older satellite would run the local model name against Codex's
+        # built-in OpenAI provider, which is exactly the leak this refuses.
+        local_endpoint = env.pop("_CODEX_ENDPOINT_URL", "")
+        local_api_key = env.pop("_CODEX_LOCAL_API_KEY", "")
+        local_provider = env.pop("_CODEX_ENDPOINT_PROVIDER", "")
+        local_model_rows = parse_local_model_rows(env.pop(LOCAL_MODEL_ROWS_ENV, ""))
+        local_model_provider: dict | None = None
+        if local_endpoint and execution_path == "codex-cli":
+            machine_id = config.execution_target
+            if not self._cm.satellite_supports_local_model_provider(machine_id):
+                _ver = self._cm.satellite_version(machine_id) or "an unknown version"
+                raise RuntimeError(
+                    "Local model endpoints need satellite 0.5.116 or newer — "
+                    f"{self._cm.satellite_name(machine_id)} runs {_ver}. Update it "
+                    "from the Remote Machines page, run this agent on the server, "
+                    "or pick a hosted model."
+                )
+            # Dialed by the SATELLITE host exactly as configured: no loopback
+            # rewrite (``loopback_if_host_self`` maps the PROXY host's own IPs
+            # for the sandbox splice); a loopback URL here means the satellite's
+            # own machine. There is no netns on a satellite, so no egress carve.
+            local_model_provider = {
+                "base_url": local_endpoint,
+                "env_key": LOCAL_ENDPOINT_KEY_ENV if local_api_key else "",
+            }
+            # The stream idle timeout and the per-session model catalog (Ollama
+            # only: Codex defers its MCP tools) are built here — the satellite
+            # has no model registry — and written by its two Codex writers from
+            # 0.5.117 on (core/layers/codex/local_model_catalog). An older
+            # satellite ignores the fields, so they are only sent (and the gap
+            # logged) when it can honour them.
+            if self._cm.satellite_supports_local_model_catalog(machine_id):
+                local_model_provider["stream_idle_timeout_ms"] = LOCAL_ENDPOINT_STREAM_IDLE_TIMEOUT_MS
+                local_model_provider["catalog_json"] = local_model_catalog_json(
+                    config.model, local_provider, local_model_rows,
+                )
+            else:
+                logger.warning(
+                    f"Remote Codex on a local model: {self._cm.satellite_name(machine_id)} "
+                    f"runs satellite {self._cm.satellite_version(machine_id) or 'unknown'} "
+                    "(< 0.5.117) — no deferred MCP tools, Codex's 5-minute idle timeout "
+                    "and the old MCP warm gate until it updates at its next reconnect"
+                )
+            if local_api_key:
+                env[LOCAL_ENDPOINT_KEY_ENV] = local_api_key
 
         # Common payload fields. Hook scripts travel with every start_session
         # so satellites never need to have them pre-deployed — they live only
@@ -2528,7 +2600,34 @@ class RemoteExecutionLayer(
         if execution_path == "codex-cli":
             payload["codex_dir_relative"] = codex_dir_relative
             payload["thread_id"] = config.codex_thread_id
-            payload["agents_md_content"] = config.system_prompt
+            # The PreToolUse permission FLOOR for unattended sessions — the
+            # same rule as the local layer (helpers.codex_hooks_floor). The
+            # satellite (>= 0.5.118) writes `[features] hooks = true`, trusts
+            # the hook per thread (bypass_hook_trust) and sets the deny-only /
+            # no-forward hook env; under `approvalPolicy: never` the approval
+            # bridge never fires, so without this a remote task / meeting /
+            # phone / trigger session is gated by the prompt rules only. An
+            # older satellite ignores the field: warn, never refuse — the
+            # session runs the way it did before this field existed.
+            floor = codex_hooks_floor(config.client_type, config.interactive)
+            payload["codex_hooks_floor"] = floor
+            if floor and not self._cm.satellite_supports_codex_hooks_floor(
+                    config.execution_target):
+                logger.warning(
+                    f"Remote Codex {config.client_type} session {session_id[:8]}: "
+                    f"{self._cm.satellite_name(config.execution_target)} runs satellite "
+                    f"{self._cm.satellite_version(config.execution_target) or 'unknown'} "
+                    "(< 0.5.118) — no PreToolUse permission floor for this unattended "
+                    "session until it updates at its next reconnect"
+                )
+            if local_model_provider:
+                payload["local_model_provider"] = local_model_provider
+                # Tell a local model the truth about its MCP tools for its
+                # server (one prompt string, both fields).
+                payload["system_prompt"] = with_local_provider_note(
+                    config.system_prompt, local_provider,
+                )
+            payload["agents_md_content"] = payload["system_prompt"]
             # Remote Codex interactive: the satellite builds the `codex` argv,
             # so it needs the resume signal + the cold first prompt (a FRESH codex
             # TUI auto-runs the prompt passed as a positional arg; resume rides the

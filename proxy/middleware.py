@@ -91,6 +91,44 @@ async def service_key_confinement(request: Request, call_next):
     return await call_next(request)
 
 
+async def external_session_confinement(request: Request, call_next):
+    """Liveness + confinement for session tokens minted on external routes.
+
+    A session JWT carrying an ``ext`` claim (every phone-minted token) is
+    accepted only while its session is live in a layer registry — so a token
+    lifted from a call dies at hangup. When the token also carries no real
+    user (an external principal: a caller who is not a platform user) it may
+    reach only the endpoints its tools use. See ``auth/external_endpoints.py``
+    for the allowlist + contributor contract.
+    """
+    from auth.external_endpoints import (
+        EXTERNAL_BLOCKED_DETAIL,
+        SESSION_DEAD_DETAIL,
+        is_external_endpoint_allowed,
+        session_token_claims,
+    )
+    claims = session_token_claims(request)
+    if claims and claims.get("ext"):
+        from starlette.responses import JSONResponse
+        from core.session.session_manager import is_session_registered
+        sid = claims.get("sid") or ""
+        if not is_session_registered(sid):
+            logger.info(
+                "External session token rejected (session not live): %s %s sid=%s",
+                request.method, request.url.path, sid[:8],
+            )
+            return JSONResponse({"detail": SESSION_DEAD_DETAIL}, status_code=401)
+        if not claims.get("user_sub") and not is_external_endpoint_allowed(
+            request.method, request.url.path,
+        ):
+            logger.warning(
+                "External session blocked from endpoint: %s %s sid=%s",
+                request.method, request.url.path, sid[:8],
+            )
+            return JSONResponse({"detail": EXTERNAL_BLOCKED_DETAIL}, status_code=403)
+    return await call_next(request)
+
+
 async def log_dashboard_requests(request: Request, call_next):
     """Log dashboard/task API requests with timing (DEBUG; errors at ERROR).
 
@@ -179,5 +217,6 @@ def register_middlewares(app):
     app.middleware("http")(security_headers)
     app.middleware("http")(limit_request_body_size)
     app.middleware("http")(service_key_confinement)
+    app.middleware("http")(external_session_confinement)
     app.middleware("http")(log_dashboard_requests)
     app.middleware("http")(refresh_session_cookie)

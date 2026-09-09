@@ -25,12 +25,21 @@ _ONLINE_MAX_AGE_S = 60.0
 _STALE_MAX_AGE_S = 90.0
 
 
-def get_live_machine_status(machine_id: str) -> dict[str, Any]:
+def get_live_machine_status(
+    machine_id: str, *, machine: dict | None = None,
+) -> dict[str, Any]:
     """Return the authoritative live status for a machine.
 
     Reads from the in-memory `SatelliteConnectionManager._connections` map
     first (source of truth for active WS); falls back to DB `last_seen` for
     machines not currently connected.
+
+    ``machine`` lets a caller that already holds the row (the 30 s admin
+    alert evaluator walks every machine) skip the DB read. For a CONNECTED
+    machine there is no DB read at all — ``last_seen_iso`` comes from the
+    connection's in-memory last contact, which is at least as fresh as the
+    coalesced DB copy. Loop-side callers must never trigger a read here for
+    a connected machine (see storage/pg.py's event-loop rule).
 
     Returns a dict:
         {
@@ -46,8 +55,6 @@ def get_live_machine_status(machine_id: str) -> dict[str, Any]:
 
     cm = get_connection_manager()
     conn = cm.get_connection(machine_id)
-    machine = remote_store.get_remote_machine(machine_id)
-    last_seen = (machine or {}).get("last_seen") or ""
 
     if conn is not None:
         age = time.monotonic() - conn.last_heartbeat
@@ -57,12 +64,21 @@ def get_live_machine_status(machine_id: str) -> dict[str, Any]:
             state = "stale"
         else:
             state = "disconnected"
+        last_seen = getattr(conn, "last_seen_iso", "") or ""
+        if not last_seen:
+            if machine is None:
+                machine = remote_store.get_remote_machine(machine_id)
+            last_seen = (machine or {}).get("last_seen") or ""
         return {
             "state": state,
             "last_heartbeat_age_s": int(age),
             "last_seen_iso": last_seen,
             "reachable": state in ("online", "stale"),
         }
+
+    if machine is None:
+        machine = remote_store.get_remote_machine(machine_id)
+    last_seen = (machine or {}).get("last_seen") or ""
 
     # Not currently connected. A deliberately-paused machine reports
     # "paused" (offline by intent — friendlier than "disconnected", and the

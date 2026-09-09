@@ -22,6 +22,7 @@ from pydantic import BaseModel
 import config
 from auth.providers import UserContext, get_current_user, mask_email, require_admin
 from services.phone import phone_adapters
+from storage import agent_store
 from storage import credential_store
 from storage import database as task_store
 from storage import phone_call_log_store
@@ -73,6 +74,16 @@ class PhoneRouteCreate(BaseModel):
     # context and threads it into ``get_dynamic_contexts`` so manifest
     # ``agent_context`` blocks resolve ``${trigger.*}`` tokens.
     trigger_slug: str | None = None
+    # Who the caller IS on this route and what the session may touch (see
+    # ``_validate_route_identity``): ``caller`` (default) / ``user``
+    # (+ ``identity_user_sub``); ``remember_callers`` off = every caller
+    # ephemeral. ``role`` is accepted for compatibility and ignored: an
+    # external caller always runs as viewer (the selector was removed
+    # 2026-09-08; the column is kept and always written as ``viewer``).
+    identity_mode: str = "caller"
+    identity_user_sub: str | None = None
+    role: str = "viewer"
+    remember_callers: bool = True
 
 
 class PhoneRouteUpdate(BaseModel):
@@ -97,6 +108,11 @@ class PhoneRouteUpdate(BaseModel):
     dial_prefix: str | None = None
     # Empty string clears the binding; null = field not supplied (exclude_unset).
     trigger_slug: str | None = None
+    identity_mode: str | None = None
+    # Empty string clears the tied user (same contract as trigger_slug).
+    identity_user_sub: str | None = None
+    role: str | None = None  # accepted, ignored (always viewer) — see PhoneRouteCreate
+    remember_callers: bool | None = None
 
 
 class PhoneServerCreate(BaseModel):
@@ -198,17 +214,129 @@ async def _assert_did_available(
 
 def _decorate_routes_with_pin(routes: list[dict]) -> list[dict]:
     """Boolean-flag masking (the ``_decorate_server`` pattern): the PIN value
-    itself never appears in any API response."""
-    return [
-        {
+    itself never appears in any API response. Also attaches the route's
+    server-computed ``warnings`` (identity advisories)."""
+    out = []
+    for r in routes:
+        pin_configured = (
+            r["direction"] == "inbound"
+            and bool(phone_route_store.get_route_pin(r["id"]))
+        )
+        out.append({
             **r,
-            "pin_configured": (
-                r["direction"] == "inbound"
-                and bool(phone_route_store.get_route_pin(r["id"]))
-            ),
-        }
-        for r in routes
-    ]
+            "pin_configured": pin_configured,
+            "warnings": _route_warnings(r, pin_configured=pin_configured),
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Route identity (who the caller IS on this route)
+# ---------------------------------------------------------------------------
+
+# ``shared`` was an option until 2026-09-07: per-caller on a Shared-only
+# agent IS the shared space (id kept, no per-caller memory) and
+# ``remember_callers`` off covers "no memory" elsewhere, so it added nothing.
+# A stored legacy value resolves as ``caller`` and is upgraded on the next save.
+_IDENTITY_MODES = ("caller", "user")
+_LEGACY_IDENTITY_MODE = "shared"
+# The only role an external caller runs with; the route column is written
+# as this on every save (services/phone/phone_identity.py ignores it anyway).
+_ROUTE_ROLE = "viewer"
+
+
+def _tied_user_problem(sub: str, agent: str) -> str:
+    """Why ``sub`` cannot back a ``user`` route on ``agent`` ("" = fine).
+
+    Shared by the save-time validator (400) and the warnings decoration
+    (a user who was fine at save time can be deleted, lose the agent, or be
+    locked later — the warmup falls back to per-caller identity then).
+    """
+    user = task_store.get_user(sub) if sub else None
+    if not user:
+        return "The tied user no longer exists"
+    if not user.get("username"):
+        return "The tied user has no username (has never logged in)"
+    if user.get("locked_until"):
+        return "The tied user account is locked"
+    if user.get("role") != "admin" and agent not in task_store.get_user_agent_roles(sub):
+        return "The tied user has no access to this agent"
+    return ""
+
+
+def _validate_route_identity(merged: dict) -> None:
+    """Save-time rules for the identity fields on the (post-edit) route.
+
+    - ``identity_mode`` is an enum.
+    - ``user`` needs an existing, unlocked platform user with a username who
+      is admin or assigned to the agent. Whether the line is PIN-protected is
+      an advisory (``_route_warnings``), not a block — an admin's deliberate
+      choice.
+    """
+    mode = merged.get("identity_mode") or "caller"
+    if mode not in _IDENTITY_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown identity_mode {mode!r} — expected one of {list(_IDENTITY_MODES)}",
+        )
+    agent = merged.get("agent") or ""
+    if mode == "user":
+        sub = merged.get("identity_user_sub") or ""
+        if not sub:
+            raise HTTPException(
+                status_code=400,
+                detail="identity_mode 'user' needs identity_user_sub (the platform user to run as)",
+            )
+        problem = _tied_user_problem(sub, agent)
+        if problem:
+            raise HTTPException(status_code=400, detail=problem)
+
+
+def _route_warnings(route: dict, *, pin_configured: bool | None = None) -> list[str]:
+    """Server-computed advisories shown next to the route (never a block).
+
+    - A user-tied inbound line without a PIN, or a user-tied outbound route:
+      whoever is on the line acts as that user.
+    - A tied platform admin on an admin-only agent: calls run with manager
+      rights (the cap for phone lines).
+    - A tied user that no longer qualifies (deleted / lost access / locked):
+      calls fall back to per-caller identity.
+    (External routes carry no engine or placement advisory: an external call
+    always runs in the local sandbox, on every engine — the external principal
+    is a viewer and the target resolver forces non-owner roles to local.)
+    """
+    warnings: list[str] = []
+    mode = route.get("identity_mode") or "caller"
+    agent = route.get("agent") or ""
+    if mode == "user":
+        sub = route.get("identity_user_sub") or ""
+        problem = _tied_user_problem(sub, agent)
+        if problem:
+            warnings.append(
+                f"{problem} — calls on this route fall back to the per-caller identity."
+            )
+            return warnings
+        user = task_store.get_user(sub) or {}
+        who = user.get("display_name") or user.get("name") or sub
+        if route.get("direction") == "outbound":
+            warnings.append(
+                f"Outbound calls on this route run as {who}: whoever answers "
+                "acts as that user."
+            )
+        else:
+            if pin_configured is None:
+                pin_configured = bool(phone_route_store.get_route_pin(route["id"]))
+            if not pin_configured:
+                warnings.append(
+                    f"This line has no PIN: anyone who dials it runs as {who}. "
+                    "Set a PIN on the route."
+                )
+        if user.get("role") == "admin" and agent_store.is_admin_only(agent):
+            warnings.append(
+                f"{who} is a platform admin on an admin-only agent; calls run "
+                "with manager rights on it (the cap for phone lines)."
+            )
+    return warnings
 
 
 @router.get("/v1/admin/phone/routes")
@@ -269,11 +397,13 @@ async def create_phone_route(
     """
     u = require_admin(user)
     data = req.model_dump()
+    data["role"] = _ROUTE_ROLE
     _validate_background_sound(data.get("background_sound", "off"))
     if data.get("trigger_slug"):
         await asyncio.to_thread(
             _validate_trigger_slug, data["trigger_slug"], data["agent"],
         )
+    await asyncio.to_thread(_validate_route_identity, data)
 
     server = await _resolve_verified_server(data.get("phone_server_id"))
     data["phone_server_id"] = server["id"]
@@ -308,7 +438,8 @@ async def create_phone_route(
     await notify_phone_config_changed()
     # ``provisioning_instructions`` is non-persisted human follow-up (e.g. the
     # manual adapter's AstDB command); the dashboard shows it after create.
-    return {**route, "provisioning_instructions": handle.instructions}
+    warnings = await asyncio.to_thread(_route_warnings, route, pin_configured=False)
+    return {**route, "provisioning_instructions": handle.instructions, "warnings": warnings}
 
 
 @router.put("/v1/admin/phone/routes/{route_id}")
@@ -326,6 +457,10 @@ async def update_phone_route(
     """
     u = require_admin(user)
     data = req.model_dump(exclude_unset=True)
+    if "role" in data:
+        # Ignored (always viewer); a legacy editor/manager row converges on
+        # its next save, like the legacy ``shared`` identity mode.
+        data["role"] = _ROUTE_ROLE
     if data.get("background_sound") is not None:
         _validate_background_sound(data["background_sound"])
     existing = await asyncio.to_thread(phone_route_store.get_route, route_id)
@@ -350,6 +485,15 @@ async def update_phone_route(
         await asyncio.to_thread(
             _validate_trigger_slug, data["trigger_slug"], target_agent,
         )
+    if (existing.get("identity_mode") == _LEGACY_IDENTITY_MODE
+            and "identity_mode" not in data):
+        # A row saved before the option was removed: upgrade it on this save.
+        data["identity_mode"] = "caller"
+    if any(k in data for k in ("identity_mode", "identity_user_sub",
+                               "agent", "direction")):
+        # Re-validate the identity rules on the post-edit row — the same PUT
+        # may rebind the agent or flip the direction.
+        await asyncio.to_thread(_validate_route_identity, {**existing, **data})
 
     identity_changed = any(
         f in data and data[f] != existing.get(f)
@@ -398,7 +542,8 @@ async def update_phone_route(
         raise HTTPException(status_code=404, detail="Route not found")
     logger.info(f"Admin {mask_email(u.email)} updated phone route: {route_id}")
     await notify_phone_config_changed()
-    return route
+    warnings = await asyncio.to_thread(_route_warnings, route)
+    return {**route, "warnings": warnings}
 
 
 @router.delete("/v1/admin/phone/routes/{route_id}")
@@ -493,7 +638,45 @@ async def delete_phone_route_pin(
     await asyncio.to_thread(phone_route_store.delete_route_pin, route_id)
     logger.info(f"Admin {mask_email(u.email)} removed the PIN on phone route {route_id}")
     await notify_phone_config_changed()
-    return {"status": "ok", "pin_configured": False}
+    # A user-tied inbound line just lost its gate — say so.
+    warnings = await asyncio.to_thread(_route_warnings, route, pin_configured=False)
+    return {"status": "ok", "pin_configured": False, "warnings": warnings}
+
+
+@router.get("/v1/admin/phone/routes/mcp-preview")
+async def preview_route_mcps(
+    agent: str,
+    identity_mode: str = "caller",
+    user: UserContext | None = Depends(get_current_user),
+):
+    """What a session on a route with this agent + identity would attach.
+
+    Manifest-level view (no processes started): the agent's configured MCPs
+    minus the phone exclusions and, for an external identity (``caller`` /
+    ``shared``), minus the MCPs that never reach external sessions. The
+    route form shows it before saving so a misconfiguration is visible.
+    """
+    require_admin(user)
+    if identity_mode not in _IDENTITY_MODES:
+        raise HTTPException(status_code=400, detail=f"Unknown identity_mode {identity_mode!r}")
+    if not await asyncio.to_thread(agent_store.agent_exists, agent):
+        raise HTTPException(status_code=404, detail="Agent not found")
+    from services.mcp import mcp_registry
+    attached, excluded = await asyncio.to_thread(
+        mcp_registry.preview_session_mcps, agent,
+        contexts={"phone"}, external=identity_mode != "user",
+    )
+    return {
+        "attached": [{"name": m.name, "label": m.label} for m in attached],
+        "excluded": [
+            {
+                "name": name,
+                "label": getattr(mcp_registry.get_manifest(name), "label", name) or name,
+                "reason": reason,
+            }
+            for name, reason in excluded.items()
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -847,3 +1030,65 @@ async def update_phone_settings(
     logger.info(f"Admin {mask_email(u.email)} updated phone settings: {list(req.keys())}")
     await notify_phone_config_changed()
     return {"status": "updated"}
+
+
+# ---------------------------------------------------------------------------
+# Caller data (external routes): retention settings, usage, Forget all
+# ---------------------------------------------------------------------------
+
+class ExternalDataSettings(BaseModel):
+    enabled: bool | None = None
+    days: int | None = None
+
+
+@router.get("/v1/admin/phone/external-data")
+async def get_external_data(user: UserContext | None = Depends(get_current_user)):
+    """Caller-data retention settings + what callers left behind (trees,
+    bytes, phone conversations, call-log rows) — the "Caller data" card."""
+    require_admin(user)
+    from services.infra import external_retention
+    return await asyncio.to_thread(external_retention.compute_usage)
+
+
+@router.put("/v1/admin/phone/external-data")
+async def update_external_data(
+    req: ExternalDataSettings, user: UserContext | None = Depends(get_current_user),
+):
+    """Set the caller-data window: ``enabled`` and/or ``days`` (1–3650)."""
+    u = require_admin(user)
+    from services.infra import external_retention
+    if req.days is not None and not (
+            external_retention.MIN_DAYS <= req.days <= external_retention.MAX_DAYS):
+        raise HTTPException(
+            status_code=400,
+            detail=f"days must be between {external_retention.MIN_DAYS} and "
+                   f"{external_retention.MAX_DAYS}",
+        )
+    if req.enabled is not None:
+        await asyncio.to_thread(
+            task_store.set_platform_setting, "external_retention_enabled",
+            "1" if req.enabled else "0",
+        )
+    if req.days is not None:
+        await asyncio.to_thread(
+            task_store.set_platform_setting, "external_retention_days", str(req.days),
+        )
+    logger.info(f"Admin {mask_email(u.email)} updated caller-data retention: {req.model_dump(exclude_none=True)}")
+    return await asyncio.to_thread(external_retention.compute_usage)
+
+
+@router.post("/v1/admin/phone/external-data/forget")
+async def forget_external_data(user: UserContext | None = Depends(get_current_user)):
+    """Forget all caller data now: every caller tree, every phone conversation,
+    every call-log row. Trees and conversations in use by a live call are
+    skipped and reported. Nothing lands in the Recover bin."""
+    u = require_admin(user)
+    from services.infra import external_retention, retention
+    async with retention._sweep_lock:
+        live = retention._build_live_snapshot()
+        result = await asyncio.to_thread(
+            external_retention.forget_all,
+            live.busy_external_homes, live.session_ids, live.pump_chat_ids,
+        )
+    logger.info(f"Admin {mask_email(u.email)} forgot all caller data: {result}")
+    return result

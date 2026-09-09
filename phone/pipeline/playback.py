@@ -39,10 +39,17 @@ class PlaybackMixin:
     _pace_stall_loop = 0
     # Voice-sender nesting depth: >0 while a TTS segment or filler clip is
     # actively sending. The ambience bed must NOT inject frames during a
-    # sender's stall — that decorates every >30 ms hiccup with an overlapping
-    # bed frame, an audible tick (audit F12: segment-scoped, fillers
-    # included). Inter-turn silence (depth 0) keeps the bed as before.
+    # sender's HICCUP — that decorates every >30 ms pacing stall with an
+    # overlapping bed frame, an audible tick (audit F12: segment-scoped,
+    # fillers included). Inter-turn silence (depth 0) keeps the bed as before.
     _voice_senders = 0
+    # …but a sender that has been silent this long is STARVED, not stalled —
+    # a synthesis gap, a barge-in pause, or a provider's end-of-utterance
+    # wait — and the line must keep its bed rather than go dead (live-hit
+    # 2026-09-07: 2 s of total silence after every sentence, heard as a
+    # dropout on every call). A pacing hiccup is 30–100 ms; this is 12 frame
+    # periods.
+    _BED_RESUME_GAP_S = 0.25
 
     def _select_tts(self, lang: str) -> TTSProvider:
         """(Re)select the call TTS voice for ``lang``.
@@ -78,22 +85,41 @@ class PlaybackMixin:
         next iteration's check, making it choppy and inaudible). The idle
         threshold is 1.5 frame periods so a voice sender lagging a few ms
         doesn't trigger the bed, while real silence picks up within ~30ms.
-        Absolute schedule so sleep jitter doesn't open gaps in the bed.
+        While a voice sender is ACTIVE the bed stands down for its hiccups
+        (F12) but returns after _BED_RESUME_GAP_S without a voice frame —
+        starvation is not a stall. Absolute schedule so sleep jitter doesn't
+        open gaps in the bed; a schedule that falls far behind (the loop was
+        starved) re-anchors instead of bursting frames at the PBX. A send
+        error is logged and the loop carries on — a closed transport ends it
+        through conn.is_closed; nothing else may silently kill the bed for
+        the rest of the call.
         """
         frame_s = self._frame_bytes_out / self._byte_rate_out
         idle_threshold = frame_s * 1.5
         next_t = time.monotonic()
+        last_warn = 0.0
         try:
             while self.state._running and not self.conn.is_closed:
-                if (self._voice_senders == 0
-                        and time.monotonic() - self.state._last_voice_sent
-                        >= idle_threshold):
+                now = time.monotonic()
+                since_voice = now - self.state._last_voice_sent
+                if since_voice >= idle_threshold and (
+                        self._voice_senders == 0
+                        or since_voice >= self._BED_RESUME_GAP_S):
                     try:
                         self.conn.send_audio(self._ambience.next_frame())
                         await self.conn.drain()
-                    except Exception:
-                        return
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        if now - last_warn >= 5.0:
+                            last_warn = now
+                            logger.warning(
+                                f"[{self.conn.peer_addr}] Ambience bed send "
+                                f"failed (continuing): {e}"
+                            )
                 next_t += frame_s
+                if time.monotonic() - next_t > 0.1:
+                    next_t = time.monotonic()  # starved: re-anchor, never burst
                 await asyncio.sleep(max(0.0, next_t - time.monotonic()))
         except asyncio.CancelledError:
             return
@@ -350,11 +376,25 @@ class PlaybackMixin:
         prebuffering = prebuffer_bytes > 0
         pending: list[bytes] = []
         pending_bytes = 0
+        # Starvation accounting (invisible to the pacer's own counters, which
+        # only see lateness INSIDE a chunk): the wait between the end of one
+        # chunk's playback and the next chunk's arrival, and the tail from the
+        # last frame to the natural end of the stream — where the dead air of
+        # a provider's end-of-utterance wait shows up (2026-09-07).
+        t_chunk_end = 0.0
+        gap_count = 0
+        gap_total_s = 0.0
+        t_stream_end = 0.0
         try:
             async for audio_chunk in self.tts.receive_audio():
                 if not self.state._tts_playing and chunk_count > 0:
                     # Cancelled after playback started
                     break
+                if t_chunk_end > 0:
+                    gap_s = time.monotonic() - t_chunk_end
+                    if gap_s > 0.1:
+                        gap_count += 1
+                        gap_total_s += gap_s
 
                 # Enable barge-in only once first audio chunk arrives
                 if chunk_count == 0:
@@ -548,9 +588,13 @@ class PlaybackMixin:
                             if not self.state._tts_playing:
                                 break
                             await self._paced_playback(c)
+                            t_chunk_end = time.monotonic()
                         pending, pending_bytes = [], 0
                     continue
                 await self._paced_playback(audio_chunk)
+                t_chunk_end = time.monotonic()
+            # The provider's stream ended on its own (not a cancel).
+            t_stream_end = time.monotonic()
             # Stream ended while still pre-buffering (utterance shorter than
             # the floor) — flush what was banked, unless cancelled (the fade
             # path owns a cancelled exit).
@@ -558,6 +602,7 @@ class PlaybackMixin:
                 if not self.state._tts_playing and chunk_count > 0:
                     break
                 await self._paced_playback(c)
+                t_chunk_end = time.monotonic()
         except asyncio.CancelledError:
             return
         except Exception as e:
@@ -567,6 +612,8 @@ class PlaybackMixin:
             if segment_marked:
                 self._voice_senders -= 1
             duration_s = total_bytes / self._byte_rate_out if total_bytes else 0
+            tail_s = (max(0.0, t_stream_end - t_chunk_end)
+                      if t_stream_end and t_chunk_end else 0.0)
             logger.info(
                 f"[{self.conn.peer_addr}] TTS playback done: "
                 f"{chunk_count} chunks, {total_bytes} bytes, {duration_s:.1f}s audio"
@@ -574,6 +621,8 @@ class PlaybackMixin:
                    f"{self._pace_stalls} stalls" if chunk_count else "")
                 + (f" (drain {self._pace_stall_drain} / loop "
                    f"{self._pace_stall_loop})" if self._pace_stalls else "")
+                + (f", gaps {gap_count}/{gap_total_s * 1000:.0f}ms" if chunk_count else "")
+                + (f", tail {tail_s * 1000:.0f}ms" if t_stream_end and chunk_count else "")
                 + (f", prebuffer {prebuffer_wait_ms:.0f}ms"
                    if prebuffer_wait_ms >= 0 else "")
             )

@@ -457,6 +457,77 @@ def is_remote_session(session_id: str) -> bool:
     return _get_remote_session_info(session_id) is not None
 
 
+def remote_machine_id(session_id: str) -> str:
+    """The satellite machine id behind a remote session, '' when local."""
+    info = _get_remote_session_info(session_id)
+    return info.machine_id if info is not None else ""
+
+
+async def stat_probe(session_id: str, rel_path: str) -> dict | None:
+    """Best-effort ``file_stat`` of an agent-tree path on the session's
+    satellite (0.5.95+): ``{"exists", "size", "mtime_ns"}`` — ``exists`` is
+    False for a directory as well as for an absent path. ``None`` when the
+    session is not remote, the path is non-canonical, the satellite predates
+    the probe, or the probe failed; callers then fall back to
+    ``pull_through`` (which re-probes and never trusts a missing answer).
+
+    A pure read: no lock, no platform-side write, no mkdir — the safe way to
+    ask "is this a file over there?" BEFORE ``pull_through`` creates the
+    parent chain for a path that may turn out to be a typo or a directory.
+    """
+    info = _get_remote_session_info(session_id)
+    if info is None:
+        return None
+    from core.remote.file_sync import is_canonical_rel_path
+    if not is_canonical_rel_path(rel_path):
+        return None
+    from core.remote.satellite_connection import get_connection_manager
+    from services.path_policy_v2 import PathRef
+    cm = get_connection_manager()
+    return await _probe_stat(
+        cm, info.machine_id, PathRef("agent_tree", rel_path),
+        agent_slug=info.agent_name,
+    )
+
+
+async def list_remote_files(session_id: str, rel_prefix: str) -> list[str] | None:
+    """Agent-tree-relative paths of the regular files under ``rel_prefix``
+    ('' = the whole tree) on the session's satellite, from ONE
+    ``request_manifest`` round trip — the initial-sync frame, so symlinks,
+    ``.partial`` staging files, runtime state and oversized files are already
+    excluded satellite-side. Sorted. ``None`` when the session is not remote
+    or the satellite could not answer (not connected, timeout, error) —
+    callers fall back to the platform copy.
+    """
+    info = _get_remote_session_info(session_id)
+    if info is None:
+        return None
+    from core.remote.satellite_connection import get_connection_manager
+    cm = get_connection_manager()
+    try:
+        ack = await cm.send_command(
+            info.machine_id,
+            {"type": "request_manifest", "agent_slug": info.agent_name},
+            timeout=30.0,
+        )
+    except Exception as e:
+        logger.info(
+            "list_remote_files: request_manifest failed for %s on %s: %s",
+            info.agent_name, info.machine_id[:8], e,
+        )
+        return None
+    want = rel_prefix.strip("/") + "/" if rel_prefix.strip("/") else ""
+    out: list[str] = []
+    for entry in (ack.get("files") or []) if isinstance(ack, dict) else []:
+        path = entry.get("path", "") if isinstance(entry, dict) else ""
+        if not path or path.endswith(".partial"):
+            continue
+        if want and not path.startswith(want):
+            continue
+        out.append(path)
+    return sorted(out)
+
+
 def _workspace_path(agent_slug: str, rel_path: str) -> Path:
     """Compute the platform's host path for (agent, rel_path).
 

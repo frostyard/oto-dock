@@ -729,6 +729,1132 @@ def _flush_coercion(tally: dict, idx: int, ot: str, sheet: str, notes, errors) -
 
 
 # ---------------------------------------------------------------------------
+# Write — operation catalogue
+# ---------------------------------------------------------------------------
+# Every write_xlsx operation with the keys it reads. Dispatch, key
+# validation, the `help` op and the unknown-op error all read from here, so
+# the accepted shape and the documented shape cannot drift apart. `keys`
+# are the canonical names (aliases map onto them); a `required` entry is a
+# key, or a tuple of alternatives one of which must be present.
+
+
+def _spec(keys, required=(), aliases=None, note="", detail=""):
+    return {
+        "keys": frozenset(keys),
+        "order": tuple(keys),
+        "required": tuple(required),
+        "aliases": dict(aliases or {}),
+        "note": note,
+        "detail": detail,
+    }
+
+
+_NUMBER_FORMAT_HELP = (
+    "number_format / format: preset (date, date-iso, datetime, time, "
+    "percent, number, integer, currency, currency:usd, currency:gbp, text) "
+    "or a raw Excel format code"
+)
+
+_OPS: dict[str, dict] = {
+    # --- sheets ---
+    "create_sheet": _spec(
+        ("name", "position"), ("name",),
+        note="position: 0-based index (default: last)",
+    ),
+    "delete_sheet": _spec(("name",), ("name",), note="refuses to delete the last sheet"),
+    "rename_sheet": _spec(
+        ("old_name", "new_name"), ("old_name", "new_name"), {"name": "old_name"},
+        note="rename sheets BEFORE adding charts that read from them",
+    ),
+    "copy_sheet": _spec(
+        ("source", "new_name"), ("source", "new_name"), {"name": "source"},
+        note="copies cells and styles; charts and images are not copied",
+    ),
+    "protect_sheet": _spec(
+        ("sheet", "password", "allow_formatting_cells", "allow_formatting_columns",
+         "allow_formatting_rows", "allow_insert_columns", "allow_insert_rows",
+         "allow_sort", "allow_filter"),
+        note="allow_* flags default false",
+    ),
+    # --- cells ---
+    "write_cells": _spec(
+        ("sheet", "cells", "data", "start_cell"), (("cells", "data"),),
+        {"rows": "data", "values": "data"},
+        note="cells: [{cell, value, type?, format?}] OR data: 2D row-major array + start_cell",
+        detail=(
+            "data[0][0] lands AT start_cell (default A1), data[0][1] one column "
+            "to its right. Formulas inline as '=SUM(B2:B9)'. Strict ISO strings "
+            "('2026-03-27', '2026-03-27T14:30', '14:30') become real dates "
+            "displayed dd/mm/yyyy; '27/03/2026'-style text is never guessed "
+            "and lands as TEXT with a warning. Per-cell type: date | datetime "
+            "| time (same strict ISO, warns on non-ISO) | text (opt out); "
+            f"{_NUMBER_FORMAT_HELP} — wins over the automatic date display."
+        ),
+    ),
+    "set_formula": _spec(
+        ("sheet", "cell", "formula"), ("cell", "formula"),
+        note="'=' is auto-prepended; INDIRECT/WEBSERVICE/DGET/RTD are blocked",
+    ),
+    "merge_cells": _spec(("sheet", "range"), ("range",)),
+    "unmerge_cells": _spec(("sheet", "range"), ("range",)),
+    "clear_range": _spec(
+        ("sheet", "range", "clear_styles"), ("range",),
+        note="clear_styles: true also resets fonts, fills, borders and formats",
+    ),
+    "copy_range": _spec(
+        ("sheet", "source_range", "target_start", "target_sheet"),
+        ("source_range", "target_start"),
+        note="copies values AND styles",
+    ),
+    # --- rows / columns ---
+    "insert_rows": _spec(("sheet", "row", "count"), ("row",)),
+    "delete_rows": _spec(("sheet", "row", "count"), ("row",)),
+    "insert_columns": _spec(
+        ("sheet", "column", "count"), ("column",), note="column: letter or 1-based index",
+    ),
+    "delete_columns": _spec(
+        ("sheet", "column", "count"), ("column",), note="column: letter or 1-based index",
+    ),
+    "set_column_width": _spec(("sheet", "column", "width"), ("column", "width")),
+    "set_row_height": _spec(("sheet", "row", "height"), ("row", "height")),
+    "auto_column_width": _spec(
+        ("sheet", "columns"), note="columns: list of letters (omit = every column)",
+    ),
+    "freeze_panes": _spec(
+        ("sheet", "cell"), ("cell",), note="'B2' freezes row 1 and column A",
+    ),
+    # --- formatting ---
+    "set_style": _spec(
+        ("sheet", "range", "bold", "italic", "underline", "strikethrough",
+         "font_size", "font_color", "font_name", "fill_color", "border",
+         "number_format", "alignment", "wrap_text", "text_rotation", "protection"),
+        ("range",),
+        {"color": "font_color", "fill": "fill_color", "background": "fill_color",
+         "format": "number_format"},
+        note="colours are 6-digit hex",
+        detail=(
+            "border: true or {style: thin|medium|thick|dashed|double, color, "
+            "left, right, top, bottom}; alignment: 'center' or {horizontal, "
+            "vertical, wrap_text, text_rotation, indent}; protection: true/false "
+            f"or {{locked, hidden}}; {_NUMBER_FORMAT_HELP}."
+        ),
+    ),
+    # --- features ---
+    "create_table": _spec(
+        ("sheet", "range", "name", "style", "show_first_column", "show_last_column",
+         "show_row_stripes", "show_column_stripes"),
+        ("range",),
+        note="range includes the header row; style e.g. TableStyleMedium9",
+    ),
+    "add_data_validation": _spec(
+        ("sheet", "range", "validation_type", "values", "operator", "value", "min",
+         "max", "formula", "allow_blank", "show_error", "error_title", "error_message",
+         "error_style", "show_prompt", "prompt_title", "prompt_message"),
+        ("range",),
+        {"type": "validation_type", "kind": "validation_type", "options": "values",
+         "items": "values", "list": "values"},
+        note="validation_type: list | whole | decimal | date | time | textLength | custom",
+        detail=(
+            "list: values = array of literal items, or a reference string "
+            "('=SupplierList', \"'Data'!$B$2:$B$50\"). whole/decimal/date/time: "
+            "operator (between | notBetween need min + max; greaterThan, "
+            "lessThan, equal, notEqual, greaterThanOrEqual, lessThanOrEqual "
+            "need value) — date/time bounds as ISO '2026-01-31' / '14:30'. "
+            "textLength: max (or operator + value). custom: formula. "
+            "show_error + error_title/error_message/error_style (stop|warning|"
+            "information), show_prompt + prompt_title/prompt_message, "
+            "allow_blank. Re-adding a rule on the same range replaces it; "
+            "Excel allows one rule per cell."
+        ),
+    ),
+    "remove_data_validation": _spec(
+        ("sheet", "range", "all"), (("range", "all"),),
+        note="range removes every rule whose cells intersect it ('B2:B50 D2:D50' allowed); all: true clears the sheet",
+    ),
+    "conditional_format": _spec(
+        ("sheet", "range", "rule_type", "operator", "formula", "fill_color",
+         "font_color", "bold", "italic", "stop_if_true", "colors", "start_type",
+         "start_value", "start_color", "mid_type", "mid_value", "mid_color",
+         "end_type", "end_value", "end_color", "color", "show_value", "min_length",
+         "max_length", "icon_style", "threshold_type", "values", "percent",
+         "reverse", "params"),
+        ("range", "rule_type"),
+        {"type": "rule_type", "rule": "rule_type", "fill": "fill_color",
+         "background": "fill_color", "value": "formula", "stopIfTrue": "stop_if_true",
+         "showValue": "show_value", "icon_set": "icon_style", "iconSet": "icon_style"},
+        note="rule_type: cell_is | formula | color_scale | data_bar | icon_set",
+        detail=(
+            "cell_is: operator (greaterThan, lessThan, between, notBetween, "
+            "equal, notEqual, greaterThanOrEqual, lessThanOrEqual — or > < >= "
+            "<= = !=; containsText, notContains, beginsWith, endsWith) + "
+            "formula (a number, a cell ref, or text — quoted automatically "
+            "unless it looks like a cell ref; between takes [low, high]) + at "
+            "least one style: fill_color, font_color, bold, italic. formula: "
+            "formula written for the range's top-left cell ('$C2>100') + the "
+            "same style keys. color_scale: colors [min_hex, max_hex] or [min, "
+            "mid, max] (or start_/mid_/end_ type|value|color with types min|"
+            "max|num|percent|percentile|formula). data_bar: color (default "
+            "638EC6), show_value. icon_set: icon_style (3TrafficLights1, "
+            "3Arrows, 3Symbols, 4Arrows, 4Rating, 5Rating, 5Arrows…), "
+            "threshold_type (percent | num | percentile), values (one per icon), "
+            "reverse, show_value. stop_if_true on any rule. params: {…} the "
+            "older nested form, same keys."
+        ),
+    ),
+    "remove_conditional_format": _spec(
+        ("sheet", "range", "all"), (("range", "all"),),
+        note="range removes every rule whose cells intersect it; all: true clears the sheet",
+    ),
+    "auto_filter": _spec(("sheet", "range"), ("range",)),
+    "define_name": _spec(
+        ("name", "range", "sheet"), ("name", "range"),
+        {"value": "range", "ref": "range", "refers_to": "range"},
+        note="a range containing '!' is used as-is; a bare range is qualified with sheet",
+    ),
+    # --- charts ---
+    "add_chart": _spec(
+        ("sheet", "chart_type", "anchor", "title", "x_axis_title", "y_axis_title",
+         "width", "height", "style", "stacked", "legend", "show_percent",
+         "show_values", "titles_from_data", "data_range", "categories", "series"),
+        (("data_range", "series"),),
+        {"type": "chart_type", "kind": "chart_type", "position": "anchor",
+         "cell": "anchor", "at": "anchor", "x_axis": "x_axis_title",
+         "x_label": "x_axis_title", "x_title": "x_axis_title",
+         "y_axis": "y_axis_title", "y_label": "y_axis_title", "y_title": "y_axis_title",
+         "chart_style": "style", "range": "data_range", "data": "data_range",
+         "categories_range": "categories", "labels": "categories",
+         "show_value": "show_values", "show_percentage": "show_percent"},
+        note="chart_type: column (vertical) | bar (HORIZONTAL) | line | pie | doughnut | scatter | area; anchor: top-left cell (default E1)",
+        detail=(
+            "DATA, one of: data_range 'A1:C7' or 'Data!A1:C7' — column 1 = "
+            "categories, row 1 = series names (titles_from_data: false ⇒ no "
+            "header row), one series per further column. OR categories + "
+            "series: categories = a range string ('A2:A7') or a list of labels; "
+            "series = [{name?, values}] where values is a one-column/one-row "
+            "range string ('B2:B7') or a list of numbers (a bare range string "
+            "or a list of range strings also works). Ranges are referenced in "
+            "place, never copied; literal lists are written to a data block "
+            "below the sheet's used range. Sheet-qualified ranges may read "
+            "any sheet. OPTIONS: title, x_axis_title, y_axis_title, width + "
+            "height in cm (default 15 x 7.5), style 1-48, stacked (bar/column/"
+            "line/area), legend (r | l | t | b | tr | false), show_percent and "
+            "show_values (data labels). Add charts LAST: renaming or deleting "
+            "a sheet later leaves their references dangling."
+        ),
+    ),
+    # --- images ---
+    "add_image": _spec(
+        ("sheet", "image_path", "cell", "width", "height"), ("image_path",),
+        {"path": "image_path", "image": "image_path", "anchor": "cell"},
+        note="cell: top-left anchor (default A1); width/height in pixels",
+    ),
+    "add_equation": _spec(
+        ("sheet", "latex", "cell", "height"), ("latex",),
+        {"equation": "latex", "formula": "latex", "anchor": "cell"},
+        note="LaTeX rendered as a picture at cell (default A1), height in px (default 40); the source is kept in a cell comment and re-running at the same cell replaces it",
+    ),
+    # --- meta ---
+    "help": _spec(
+        ("name",), (), {"op_name": "name", "operation_name": "name", "topic": "name"},
+        note="the full catalogue, or one operation's shape when name is given; never touches the file",
+    ),
+}
+
+_OP_GROUPS = (
+    ("SHEETS", ("create_sheet", "delete_sheet", "rename_sheet", "copy_sheet", "protect_sheet")),
+    ("CELLS", ("write_cells", "set_formula", "merge_cells", "unmerge_cells", "clear_range", "copy_range")),
+    ("ROWS / COLUMNS", ("insert_rows", "delete_rows", "insert_columns", "delete_columns",
+                        "set_column_width", "set_row_height", "auto_column_width", "freeze_panes")),
+    ("FORMATTING", ("set_style",)),
+    ("FEATURES", ("create_table", "add_data_validation", "remove_data_validation",
+                  "conditional_format", "remove_conditional_format", "auto_filter", "define_name")),
+    ("CHARTS", ("add_chart",)),
+    ("IMAGES", ("add_image", "add_equation")),
+    ("META", ("help",)),
+)
+
+# Spellings models reach for that are not the canonical op name. Cheap to
+# accept, and rejecting them cost real round-trips in the field.
+_OP_ALIASES = {
+    "add_sheet": "create_sheet", "new_sheet": "create_sheet",
+    "remove_sheet": "delete_sheet",
+    "duplicate_sheet": "copy_sheet",
+    "protect": "protect_sheet",
+    "write_cell": "write_cells", "set_cell": "write_cells", "set_cells": "write_cells",
+    "write": "write_cells", "set_value": "write_cells", "update_cells": "write_cells",
+    "add_formula": "set_formula", "write_formula": "set_formula",
+    "merge": "merge_cells", "unmerge": "unmerge_cells",
+    "clear": "clear_range", "clear_cells": "clear_range",
+    "copy": "copy_range", "copy_cells": "copy_range",
+    "autofit": "auto_column_width", "auto_fit": "auto_column_width",
+    "auto_fit_columns": "auto_column_width", "autofit_columns": "auto_column_width",
+    "freeze": "freeze_panes", "freeze_pane": "freeze_panes",
+    "format": "set_style", "format_cells": "set_style", "format_range": "set_style",
+    "style": "set_style", "style_range": "set_style", "apply_style": "set_style",
+    "add_table": "create_table", "table": "create_table",
+    "add_validation": "add_data_validation", "add_dropdown": "add_data_validation",
+    "data_validation": "add_data_validation",
+    "remove_validation": "remove_data_validation",
+    "clear_validation": "remove_data_validation",
+    "clear_data_validation": "remove_data_validation",
+    "add_conditional_format": "conditional_format",
+    "add_conditional_formatting": "conditional_format",
+    "conditional_formatting": "conditional_format",
+    "remove_conditional_formatting": "remove_conditional_format",
+    "clear_conditional_formatting": "remove_conditional_format",
+    "clear_conditional_format": "remove_conditional_format",
+    "add_filter": "auto_filter", "set_filter": "auto_filter", "autofilter": "auto_filter",
+    "add_auto_filter": "auto_filter", "set_auto_filter": "auto_filter",
+    "add_named_range": "define_name", "create_named_range": "define_name",
+    "named_range": "define_name",
+    "create_chart": "add_chart", "insert_chart": "add_chart", "chart": "add_chart",
+    "insert_image": "add_image", "add_picture": "add_image",
+    "equation": "add_equation", "add_latex": "add_equation",
+    "describe_ops": "help", "describe": "help", "catalogue": "help", "catalog": "help",
+    "list_ops": "help", "?": "help",
+}
+
+# Keys every op understands under another spelling.
+_KEY_ALIASES = {"sheet_name": "sheet", "worksheet": "sheet"}
+
+_DISPATCH_KEYS = ("op", "operation", "action")
+
+_HELP_HINT = ' ({"op":"help","name":"%s"} shows the full shape)'
+
+
+def _canonical_op(op: dict) -> tuple[str, dict]:
+    """(canonical op name, the op keyed by canonical names).
+
+    Idempotent, and run twice on purpose: by the parent BEFORE image path
+    pre-resolution (an aliased add_image must resolve like the real one)
+    and again by the worker core, so a caller that reaches the core
+    directly gets the same shape. Unknown names pass through for the core
+    to report; keys are only renamed here and validated in _check_keys."""
+    raw = str(_op_type(op) or "").strip()
+    name = _OP_ALIASES.get(raw, _OP_ALIASES.get(raw.lower(), raw))
+    spec = _OPS.get(name)
+    aliases = {**_KEY_ALIASES, **(spec["aliases"] if spec else {})}
+    items = [(k, v) for k, v in op.items() if k not in _DISPATCH_KEYS]
+    # A 'type' that names the operation itself is a dispatch echo
+    # ({"op":"add_chart","type":"add_chart"}), not a chart type.
+    if isinstance(op.get("type"), str):
+        echoed = op["type"].strip()
+        if _OP_ALIASES.get(echoed, echoed) == name:
+            items = [(k, v) for k, v in items if k != "type"]
+    # Canonical spellings first, so they win over an alias given alongside.
+    clean = {k: v for k, v in items if aliases.get(k, k) == k}
+    for k, v in items:
+        ck = aliases.get(k, k)
+        if ck != k and ck not in clean:
+            clean[ck] = v
+    clean["op"] = name
+    return name, clean
+
+
+def _unknown_op_error(idx: int, name: str) -> str:
+    return (
+        f"Op #{idx}: unknown operation '{name}' — valid: {', '.join(_OPS)} "
+        '({"op":"help"} describes every operation)'
+    )
+
+
+def _check_keys(idx: int, name: str, op: dict) -> str | None:
+    """Error text for an op with unknown or missing keys, else None.
+
+    Unknown keys fail the op loudly: a silently ignored `anchor` put every
+    chart at E1 while the result read as success."""
+    spec = _OPS[name]
+    unknown = sorted(k for k in op if k != "op" and k not in spec["keys"])
+    if unknown:
+        return (
+            f"Op #{idx} {name}: unknown key(s) "
+            f"{', '.join(repr(k) for k in unknown)} — accepted: "
+            f"{', '.join(spec['order'])}" + _HELP_HINT % name
+        )
+    missing = []
+    for req in spec["required"]:
+        alts = req if isinstance(req, tuple) else (req,)
+        if not any(op.get(a) is not None for a in alts):
+            missing.append(" or ".join(alts))
+    if missing:
+        return (
+            f"Op #{idx} {name}: missing required key(s): {', '.join(missing)}"
+            + _HELP_HINT % name
+        )
+    return None
+
+
+def _keys_line(name: str) -> str:
+    spec = _OPS[name]
+    required = set()
+    one_of = []
+    for req in spec["required"]:
+        if isinstance(req, tuple):
+            one_of.append(" | ".join(req))
+            required.update(req)
+        else:
+            required.add(req)
+    parts = [k if k in required else f"{k}?" for k in spec["order"]]
+    line = ", ".join(parts) if parts else "(no keys)"
+    if one_of:
+        line += " — one of " + "; ".join(one_of) + " required"
+    return line
+
+
+def _help_text(name=None) -> str:
+    """The op catalogue (all ops) or one op's full shape."""
+    if name:
+        raw = str(name).strip()
+        key = _OP_ALIASES.get(raw, _OP_ALIASES.get(raw.lower(), raw))
+        spec = _OPS.get(key)
+        if spec is None:
+            return f"No operation named '{raw}'. Valid operations: {', '.join(_OPS)}"
+        lines = [f"{key}: {_keys_line(key)}"]
+        if spec["note"]:
+            lines.append(f"  {spec['note']}")
+        if spec["detail"]:
+            lines.append(f"  {spec['detail']}")
+        also = sorted(a for a, c in _OP_ALIASES.items() if c == key)
+        if also:
+            lines.append(f"  also accepted as: {', '.join(also)}")
+        return "\n".join(lines)
+    out = [
+        'write_xlsx operations — each is {"op": "<name>", ...keys}; ? marks '
+        "an optional key. Unknown ops and keys are rejected. "
+        '{"op": "help", "name": "<op>"} shows one operation in full.'
+    ]
+    for group, names in _OP_GROUPS:
+        out.append(f"\n{group}")
+        for n in names:
+            spec = _OPS[n]
+            line = f"  {n}: {_keys_line(n)}"
+            if spec["note"]:
+                line += f" — {spec['note']}"
+            out.append(line)
+            if spec["detail"]:
+                out.append(f"      {spec['detail']}")
+    return "\n".join(out)
+
+
+_CLASS_REPR_RE = re.compile(r"<class '(?:[\w.]+\.)?(\w+)'>")
+_UNEXPECTED_KW_RE = re.compile(r"unexpected keyword argument '(\w+)'")
+
+
+def _friendly_error(exc: BaseException) -> str:
+    """Per-op failure text without library internals: openpyxl's class
+    reprs and Python's keyword-argument phrasing meant nothing to a caller."""
+    if isinstance(exc, KeyError) and exc.args:
+        return f"missing key {exc.args[0]!r}"
+    text = str(exc) or exc.__class__.__name__
+    m = _UNEXPECTED_KW_RE.search(text)
+    if m:
+        return f"unknown parameter '{m.group(1)}'"
+    return _CLASS_REPR_RE.sub(r"\1", text)
+
+
+# ---------------------------------------------------------------------------
+# Write — data validation
+# ---------------------------------------------------------------------------
+
+_DV_TYPES = ("list", "whole", "decimal", "date", "time", "textLength", "custom")
+
+_DV_TYPE_ALIASES = {
+    "dropdown": "list", "integer": "whole", "int": "whole", "number": "decimal",
+    "float": "decimal", "text_length": "textLength", "textlength": "textLength",
+    "length": "textLength", "formula": "custom", "expression": "custom",
+}
+
+
+def _dv_type(text) -> str:
+    raw = str(text).strip()
+    kind = _DV_TYPE_ALIASES.get(raw.lower(), raw)
+    if kind not in _DV_TYPES:
+        raise ValueError(
+            f"validation_type '{text}' is not one of: {', '.join(_DV_TYPES)}"
+        )
+    return kind
+
+
+def _dv_operator(text) -> str:
+    key = str(text).strip().replace("_", "").replace(" ", "").lower()
+    op = _CF_COMPARISONS.get(key)
+    if not op:
+        raise ValueError(
+            f"operator '{text}' is not one of: between, notBetween, equal, "
+            f"notEqual, greaterThan, greaterThanOrEqual, lessThan, "
+            f"lessThanOrEqual (or > < >= <= = !=)"
+        )
+    return op
+
+
+def _dv_bound(v, dv_type: str) -> str:
+    """A validation bound as formula text. ISO dates/times become DATE()/
+    TIME() — a bare '2026-01-31' inside the rule is text to Excel and the
+    rule silently rejects everything."""
+    s = _strip_leading_eq(str(v).strip())
+    if dv_type == "date":
+        if _ISO_DATETIME_RE.fullmatch(s):
+            raise ValueError(f"date bound '{v}' includes a time — use a date (YYYY-MM-DD)")
+        if _ISO_DATE_RE.fullmatch(s):
+            d = datetime.date.fromisoformat(s)
+            return f"DATE({d.year},{d.month},{d.day})"
+    if dv_type == "time" and _ISO_TIME_RE.fullmatch(s):
+        t = datetime.time.fromisoformat(s)
+        return f"TIME({t.hour},{t.minute},{t.second})"
+    return s
+
+
+# ---------------------------------------------------------------------------
+# Write — conditional formatting
+# ---------------------------------------------------------------------------
+
+_CF_RULE_TYPES = ("cell_is", "formula", "color_scale", "data_bar", "icon_set")
+
+_CF_RULE_ALIASES = {
+    "cellis": "cell_is", "cell": "cell_is", "value": "cell_is",
+    "expression": "formula", "colorscale": "color_scale", "colourscale": "color_scale",
+    "databar": "data_bar", "iconset": "icon_set", "icons": "icon_set",
+}
+
+# Operator spellings → the cellIs operator; symbols and snake_case included.
+_CF_COMPARISONS = {
+    "greaterthan": "greaterThan", ">": "greaterThan", "gt": "greaterThan",
+    "lessthan": "lessThan", "<": "lessThan", "lt": "lessThan",
+    "between": "between", "notbetween": "notBetween",
+    "equal": "equal", "equals": "equal", "=": "equal", "==": "equal", "eq": "equal",
+    "notequal": "notEqual", "!=": "notEqual", "<>": "notEqual", "ne": "notEqual",
+    "greaterthanorequal": "greaterThanOrEqual", ">=": "greaterThanOrEqual",
+    "ge": "greaterThanOrEqual",
+    "lessthanorequal": "lessThanOrEqual", "<=": "lessThanOrEqual", "le": "lessThanOrEqual",
+}
+
+# Text operators are not valid on a cellIs rule; Excel writes them as an
+# expression rule over the range's top-left cell, so that is what we emit.
+_CF_TEXT_OPERATORS = {
+    "containstext": "containsText", "contains": "containsText",
+    "notcontains": "notContains", "notcontainstext": "notContains",
+    "doesnotcontain": "notContains",
+    "beginswith": "beginsWith", "startswith": "beginsWith",
+    "endswith": "endsWith",
+}
+
+_CF_TEXT_EXPR = {
+    "containsText": "NOT(ISERROR(SEARCH({t},{tl})))",
+    "notContains": "ISERROR(SEARCH({t},{tl}))",
+    "beginsWith": "LEFT({tl},LEN({t}))={t}",
+    "endsWith": "RIGHT({tl},LEN({t}))={t}",
+}
+
+_ICON_SETS = (
+    "3Arrows", "3ArrowsGray", "3Flags", "3Signs", "3Symbols", "3Symbols2",
+    "3TrafficLights1", "3TrafficLights2", "4Arrows", "4ArrowsGray", "4Rating",
+    "4RedToBlack", "4TrafficLights", "5Arrows", "5ArrowsGray", "5Quarters", "5Rating",
+)
+
+# Characters that make an operand an expression rather than bare text.
+_CF_EXPR_CHARS = set("()<>=+-*/&$!:")
+
+# The nested `params` form uses openpyxl's own spellings; map them onto the
+# flat keys so both shapes build the same rule.
+_CF_PARAM_ALIASES = {
+    "fill": "fill_color", "background": "fill_color", "stopIfTrue": "stop_if_true",
+    "showValue": "show_value", "type": "threshold_type", "minLength": "min_length",
+    "maxLength": "max_length", "value": "formula", "icon_set": "icon_style",
+    "iconSet": "icon_style",
+}
+
+
+def _cf_operator(text) -> str:
+    key = str(text).strip().replace("_", "").replace(" ", "").lower()
+    op = _CF_COMPARISONS.get(key) or _CF_TEXT_OPERATORS.get(key)
+    if not op:
+        raise ValueError(
+            f"operator '{text}' is not one of: greaterThan, lessThan, between, "
+            f"notBetween, equal, notEqual, greaterThanOrEqual, lessThanOrEqual "
+            f"(or > < >= <= = !=), containsText, notContains, beginsWith, endsWith"
+        )
+    return op
+
+
+def _cf_operand(v) -> str:
+    """One cell_is operand as formula text: numbers, references and
+    expressions verbatim (a leading '=' stripped — it is invalid inside
+    <formula>), bare text quoted, since an unquoted word is a #NAME
+    reference in Excel."""
+    if isinstance(v, bool):
+        return "TRUE" if v else "FALSE"
+    if isinstance(v, (int, float)):
+        return str(v)
+    s = _strip_leading_eq(str(v).strip())
+    if not s:
+        raise ValueError("an empty operand")
+    if len(s) >= 2 and s.startswith('"') and s.endswith('"'):
+        return s
+    if s.upper() in ("TRUE", "FALSE"):
+        return s.upper()
+    try:
+        float(s)
+        return s
+    except ValueError:
+        pass
+    if any(ch in _CF_EXPR_CHARS for ch in s) or _A1_REF_RE.fullmatch(s):
+        return s
+    return '"' + s.replace('"', '""') + '"'
+
+
+def _cf_merge(op: dict) -> dict:
+    """Flat rule parameters: the nested `params` form (openpyxl spellings,
+    dict fill/font) folded under the top-level keys, which win."""
+    flat: dict = {}
+    params = op.get("params")
+    if params is not None:
+        if not isinstance(params, dict):
+            raise ValueError("params must be an object")
+        accepted = _OPS["conditional_format"]["keys"] - {"params", "sheet", "range", "rule_type"}
+        for k, v in params.items():
+            if k == "font":
+                if isinstance(v, dict):
+                    for fk, fv in v.items():
+                        if fk == "color":
+                            flat["font_color"] = fv
+                        elif fk in ("bold", "italic"):
+                            flat[fk] = fv
+                        else:
+                            raise ValueError(f"params.font: unknown key '{fk}' — accepted: color, bold, italic")
+                else:
+                    raise ValueError("params.font must be an object {color?, bold?, italic?}")
+                continue
+            ck = _CF_PARAM_ALIASES.get(k, k)
+            if ck == "fill_color" and isinstance(v, dict):
+                v = v.get("color") or v.get("fill_color") or v.get("start_color")
+            if ck not in accepted:
+                raise ValueError(
+                    f"params: unknown key '{k}' — accepted: {', '.join(sorted(accepted))}"
+                )
+            flat[ck] = v
+    for k, v in op.items():
+        if k not in ("op", "params", "sheet", "range", "rule_type") and v is not None:
+            flat[k] = v
+    return flat
+
+
+def _conditional_format(ws, op: dict, idx: int, notes: list, errors: list) -> None:
+    """Build and add one rule. dxf rules (cell_is / formula) take their look
+    ONLY from what was asked — there is no default fill."""
+    from openpyxl.formatting.rule import (
+        CellIsRule,
+        ColorScaleRule,
+        DataBarRule,
+        FormulaRule,
+        IconSetRule,
+    )
+    from openpyxl.styles import Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.cell_range import MultiCellRange
+
+    cf_range = str(op["range"]).strip()
+    try:
+        target = MultiCellRange(cf_range)
+    except (ValueError, TypeError):
+        raise ValueError(
+            f"range '{cf_range}' is not a valid A1 range (e.g. 'B2:B10' or 'B2:B10 D2:D10')"
+        ) from None
+    raw_type = str(op["rule_type"]).strip().lower().replace("-", "_")
+    rule_type = _CF_RULE_ALIASES.get(raw_type.replace("_", ""), raw_type)
+    if rule_type not in _CF_RULE_TYPES:
+        raise ValueError(
+            f"rule_type '{op['rule_type']}' is not one of: {', '.join(_CF_RULE_TYPES)}"
+        )
+    p = _cf_merge(op)
+
+    fill = font = None
+    if p.get("fill_color") is not None:
+        color = _ensure_ff(p["fill_color"])
+        fill = PatternFill(start_color=color, end_color=color, fill_type="solid")
+    font_kw = {}
+    if p.get("font_color") is not None:
+        font_kw["color"] = _ensure_ff(p["font_color"])
+    for key in ("bold", "italic"):
+        if p.get(key) is not None:
+            font_kw[key] = bool(p[key])
+    if font_kw:
+        font = Font(**font_kw)
+
+    if rule_type in ("cell_is", "formula") and fill is None and font is None:
+        raise ValueError(
+            f"a {rule_type} rule has no visible style — pass fill_color and/or "
+            f"font_color, bold, italic"
+        )
+
+    if rule_type == "cell_is":
+        if p.get("operator") is None or p.get("formula") is None:
+            raise ValueError(
+                "cell_is needs operator (e.g. greaterThan) and formula (the "
+                "value to compare with; [low, high] for between)"
+            )
+        operator = _cf_operator(p["operator"])
+        raw = p["formula"]
+        operands = [_cf_operand(o) for o in (raw if isinstance(raw, list) else [raw])]
+        if operator in ("between", "notBetween"):
+            if len(operands) != 2:
+                raise ValueError(f"{operator} needs formula: [low, high]")
+        elif len(operands) != 1:
+            raise ValueError(f"{operator} takes a single value, got {len(operands)}")
+        if operator in _CF_TEXT_EXPR:
+            first = min(target.ranges, key=lambda r: (r.min_row, r.min_col))
+            tl = f"{get_column_letter(first.min_col)}{first.min_row}"
+            expr = _CF_TEXT_EXPR[operator].format(t=operands[0], tl=tl)
+            rule = FormulaRule(formula=[expr], fill=fill, font=font)
+        else:
+            rule = CellIsRule(operator=operator, formula=operands, fill=fill, font=font)
+    elif rule_type == "formula":
+        raw = p.get("formula")
+        if raw is None:
+            raise ValueError(
+                "formula rules need formula: an expression written for the "
+                "range's top-left cell, e.g. '$C2>100'"
+            )
+        formulas = [_strip_leading_eq(str(x).strip()) for x in (raw if isinstance(raw, list) else [raw])]
+        if not formulas or not formulas[0]:
+            raise ValueError("formula must not be empty")
+        rule = FormulaRule(formula=formulas, fill=fill, font=font)
+    elif rule_type == "color_scale":
+        kw: dict = {}
+        colors = p.get("colors")
+        if colors is not None:
+            if not isinstance(colors, list) or len(colors) not in (2, 3):
+                raise ValueError("colors must be [min_hex, max_hex] or [min_hex, mid_hex, max_hex]")
+            kw = {"start_type": "min", "start_color": colors[0],
+                  "end_type": "max", "end_color": colors[-1]}
+            if len(colors) == 3:
+                kw.update(mid_type="percentile", mid_value=50, mid_color=colors[1])
+        for key in ("start_type", "start_value", "start_color", "mid_type", "mid_value",
+                    "mid_color", "end_type", "end_value", "end_color"):
+            if p.get(key) is not None:
+                kw[key] = p[key]
+        if not kw.get("start_color") or not kw.get("end_color"):
+            raise ValueError("color_scale needs colors: [min_hex, max_hex] (or [min, mid, max])")
+        kw.setdefault("start_type", "min")
+        kw.setdefault("end_type", "max")
+        if kw.get("mid_color") and not kw.get("mid_type"):
+            kw["mid_type"] = "percentile"
+            kw.setdefault("mid_value", 50)
+        for key in ("start_color", "mid_color", "end_color"):
+            if kw.get(key):
+                kw[key] = _ensure_ff(kw[key])
+        rule = ColorScaleRule(**kw)
+    elif rule_type == "data_bar":
+        rule = DataBarRule(
+            start_type=p.get("start_type") or "min", start_value=p.get("start_value"),
+            end_type=p.get("end_type") or "max", end_value=p.get("end_value"),
+            color=_ensure_ff(p.get("color") or "638EC6"), showValue=p.get("show_value"),
+            minLength=p.get("min_length"), maxLength=p.get("max_length"),
+        )
+    else:
+        style = str(p.get("icon_style") or "3TrafficLights1")
+        if style not in _ICON_SETS:
+            raise ValueError(f"icon_style '{style}' is not one of: {', '.join(_ICON_SETS)}")
+        n = int(style[0])
+        values = p.get("values")
+        if values is None:
+            values = [round(100 * i / n) for i in range(n)]
+        if not isinstance(values, list) or len(values) != n:
+            raise ValueError(f"icon_style {style} shows {n} icons, so values needs {n} thresholds")
+        rule = IconSetRule(
+            icon_style=style, type=p.get("threshold_type") or "percent", values=values,
+            showValue=p.get("show_value"), percent=p.get("percent"), reverse=p.get("reverse"),
+        )
+    if p.get("stop_if_true"):
+        rule.stopIfTrue = True
+    ws.conditional_formatting.add(cf_range, rule)
+    notes.append(f"conditional_format on '{ws.title}': {rule_type} rule on {cf_range}")
+
+
+def _remove_conditional_format(ws, op: dict, idx: int, notes: list, errors: list) -> None:
+    """Drop every rule whose cells intersect `range` (or all of them) and
+    rebuild the sheet's list — priorities renumber from 1 in the original
+    order."""
+    from openpyxl.formatting.formatting import ConditionalFormattingList
+    from openpyxl.worksheet.cell_range import MultiCellRange
+
+    target = None
+    if op.get("range"):
+        try:
+            target = MultiCellRange(str(op["range"]).strip())
+        except (ValueError, TypeError):
+            raise ValueError(f"range '{op['range']}' is not a valid A1 range") from None
+    elif not op.get("all"):
+        raise ValueError("provide range or all: true")
+    kept = ConditionalFormattingList()
+    removed = 0
+    for cf in ws.conditional_formatting:
+        if target is None or _sqref_intersects(cf.sqref, target):
+            removed += len(cf.rules)
+            continue
+        for rule in cf.rules:
+            rule.priority = 0
+            kept.add(str(cf.sqref), rule)
+    ws.conditional_formatting = kept
+    if removed == 0:
+        errors.append(
+            f"Op #{idx} remove_conditional_format: "
+            + (f"no conditional-format rules intersect {op['range']}" if target is not None
+               else "the sheet has no conditional-format rules")
+        )
+        return
+    notes.append(f"remove_conditional_format on '{ws.title}': {removed} rule(s) removed")
+
+
+# ---------------------------------------------------------------------------
+# Write — charts
+# ---------------------------------------------------------------------------
+
+_SHEET_QUALIFIED_RE = re.compile(r"^(?:'((?:[^']|'')+)'|([^'!]+))!(.+)$", re.DOTALL)
+
+_CHART_KINDS = ("column", "bar", "line", "pie", "doughnut", "scatter", "area")
+
+_CHART_KIND_ALIASES = {
+    "col": "column", "columns": "column", "vertical_bar": "column",
+    "horizontal_bar": "bar", "bars": "bar", "lines": "line",
+    "donut": "doughnut", "xy": "scatter",
+}
+
+_LEGEND_POSITIONS = {
+    "r": "r", "l": "l", "t": "t", "b": "b", "tr": "tr",
+    "right": "r", "left": "l", "top": "t", "bottom": "b", "top_right": "tr",
+}
+
+
+def _parse_ref_range(wb, ws, text, label: str):
+    """(worksheet, (min_col, min_row, max_col, max_row)) for 'B2:D10',
+    '$B$2:$D$10', 'Data!B2:D10' or "'My Sheet'!B2:D10". An unqualified
+    range belongs to `ws`; a chart may read any sheet of the workbook."""
+    from openpyxl.utils.cell import range_boundaries
+
+    s = str(text).strip()
+    m = _SHEET_QUALIFIED_RE.match(s)
+    if m:
+        title = (m.group(1) or m.group(2)).replace("''", "'")
+        if title not in wb.sheetnames:
+            raise ValueError(
+                f"{label}: sheet '{title}' not found. Available: {wb.sheetnames}"
+            )
+        ws = wb[title]
+        s = m.group(3)
+    try:
+        bounds = range_boundaries(s.replace("$", "").upper())
+    except (ValueError, TypeError):
+        raise ValueError(
+            f"{label} '{text}' is not a valid A1 range (e.g. 'B2:D10' or 'Data!B2:D10')"
+        ) from None
+    return ws, bounds
+
+
+def _parse_anchor(text) -> str:
+    """A single cell for chart placement, normalised to 'K23'."""
+    m = re.fullmatch(r"\$?([A-Za-z]{1,3})\$?(\d+)", str(text).strip())
+    if not m:
+        raise ValueError(f"anchor '{text}' is not a cell reference (e.g. 'K23')")
+    return f"{m.group(1).upper()}{int(m.group(2))}"
+
+
+def _chart_kind(text) -> tuple[str, bool]:
+    """(kind, stacked) from a chart_type spelling; `column_stacked` and
+    `stacked_bar` shapes fold into the stacked flag."""
+    raw = str(text or "column").strip().lower().replace("-", "_").replace(" ", "_")
+    stacked = raw.endswith("_stacked") or raw.startswith("stacked_")
+    for suffix in ("_stacked", "_clustered", "_chart"):
+        raw = raw.removesuffix(suffix)
+    raw = raw.removeprefix("stacked_")
+    kind = _CHART_KIND_ALIASES.get(raw, raw)
+    if kind not in _CHART_KINDS:
+        raise ValueError(
+            f"chart_type '{text}' is not one of: {', '.join(_CHART_KINDS)} "
+            "(bar = horizontal bars, column = vertical)"
+        )
+    return kind, stacked
+
+
+def _series_length(bounds, label: str) -> int:
+    """Point count of a one-column or one-row range; anything 2-D is an error
+    (a block reads as one series per column only through data_range)."""
+    c1, r1, c2, r2 = bounds
+    if c1 != c2 and r1 != r2:
+        raise ValueError(
+            f"{label} must be a single column or a single row (e.g. 'B2:B7'), "
+            f"not a block"
+        )
+    return (r2 - r1 + 1) if c1 == c2 else (c2 - c1 + 1)
+
+
+def _free_row(ws) -> int:
+    """First row of a literal chart-data block: below the used range with one
+    blank row between; row 1 on an empty sheet (max_row reads 1 there)."""
+    if not any(c.value is not None for c in ws._cells.values()):
+        return 1
+    return ws.max_row + 2
+
+
+def _add_chart(wb, ws, op: dict, idx: int, touch, notes: list, errors: list) -> None:
+    """Build and place one chart. Data comes from `data_range` (first column =
+    categories, header row = series names) or from `categories` + `series`,
+    each a range string referenced in place or a literal list written to a
+    data block. Every series is built through Series(): a one-row values
+    range must stay ONE series (chart.add_data splits it per column)."""
+    from openpyxl.chart import (
+        AreaChart,
+        BarChart,
+        DoughnutChart,
+        LineChart,
+        PieChart,
+        Reference,
+        ScatterChart,
+        Series,
+    )
+    from openpyxl.chart.label import DataLabelList
+    from openpyxl.utils import get_column_letter
+
+    kind, stacked = _chart_kind(op.get("chart_type"))
+    stacked = bool(op.get("stacked")) or stacked
+    anchor = _parse_anchor(op.get("anchor") or "E1")
+    warnings: list[str] = []
+
+    # (values Reference, title text | None, title_from_data)
+    entries: list[tuple] = []
+    cats = None
+    n_points: int | None = None
+
+    if op.get("data_range") is not None:
+        ws_d, (c1, r1, c2, r2) = _parse_ref_range(wb, ws, op["data_range"], "data_range")
+        tfd = bool(op.get("titles_from_data", True))
+        if c2 - c1 + 1 < 2:
+            raise ValueError(
+                f"data_range '{op['data_range']}' has a single column — a chart "
+                f"needs categories in the first column and at least one value "
+                f"column (e.g. A1:B7), or pass categories + series"
+            )
+        if tfd and r2 - r1 + 1 < 2:
+            raise ValueError(
+                f"data_range '{op['data_range']}' is only a header row — add "
+                f"data rows or pass titles_from_data: false"
+            )
+        first = r1 + 1 if tfd else r1
+        cats = Reference(ws_d, min_col=c1, min_row=first, max_row=r2)
+        n_points = r2 - first + 1
+        for n, col in enumerate(range(c1 + 1, c2 + 1), start=1):
+            ref = Reference(ws_d, min_col=col, min_row=r1 if tfd else first, max_row=r2)
+            entries.append((ref, None if tfd else f"Series {n}", tfd))
+    else:
+        series_in = op.get("series")
+        if isinstance(series_in, (dict, str)):
+            series_in = [series_in]
+        if not isinstance(series_in, list) or not series_in:
+            raise ValueError(
+                "series must be a list of {name?, values} objects (or range strings)"
+            )
+        specs: list[dict] = []
+        for i, item in enumerate(series_in):
+            if isinstance(item, str):
+                item = {"values": item}
+            if not isinstance(item, dict):
+                raise ValueError(
+                    f"series[{i}] must be an object {{name?, values}} or a range "
+                    f"string, got {type(item).__name__}"
+                )
+            item = {
+                {"title": "name", "label": "name", "data": "values", "range": "values",
+                 "y": "values", "y_values": "values"}.get(k, k): v
+                for k, v in item.items()
+            }
+            unknown = sorted(k for k in item if k not in ("name", "values"))
+            if unknown:
+                raise ValueError(
+                    f"series[{i}]: unknown key(s) {', '.join(repr(k) for k in unknown)}"
+                    f" — accepted: name, values"
+                )
+            if item.get("values") is None:
+                raise ValueError(f"series[{i}] has no values")
+            specs.append(item)
+
+        categories = op.get("categories")
+        cat_literal = isinstance(categories, list)
+        literal_cols = [i for i, sp in enumerate(specs) if isinstance(sp["values"], list)]
+        block_row = None
+        block_col = 1
+        tally = {"converted": 0, "warned": {}}
+
+        def _put(row: int, col: int, raw):
+            """Literal data lands with the same coercion as write_cells."""
+            val, kind_ = _coerce_cell_value(raw)
+            kind_ = _set_coerced(ws.cell(row=row, column=col), val, kind_, raw=raw)
+            if kind_ is not None:
+                _tally_coercion(tally, kind_, raw, f"{get_column_letter(col)}{row}")
+
+        if cat_literal or literal_cols:
+            block_row = _free_row(ws)
+
+        if categories is None:
+            pass
+        elif cat_literal:
+            n_points = len(categories)
+            ws.cell(row=block_row, column=block_col, value="Category")
+            for ri, cat in enumerate(categories):
+                _put(block_row + 1 + ri, block_col, cat)
+            cats = Reference(ws, min_col=block_col, min_row=block_row + 1,
+                             max_row=block_row + n_points)
+        else:
+            ws_c, b = _parse_ref_range(wb, ws, categories, "categories")
+            n_points = _series_length(b, "categories")
+            cats = Reference(ws_c, min_col=b[0], min_row=b[1], max_col=b[2], max_row=b[3])
+
+        for i, sp in enumerate(specs):
+            name = sp.get("name")
+            name = str(name) if name is not None else f"Series {i + 1}"
+            vals = sp["values"]
+            if isinstance(vals, list):
+                if n_points is None:
+                    n_points = len(vals)
+                if len(vals) != n_points:
+                    raise ValueError(
+                        f"series '{name}' has {len(vals)} values but there are "
+                        f"{n_points} categories"
+                    )
+                col = block_col + (1 if cat_literal else 0) + literal_cols.index(i)
+                ws.cell(row=block_row, column=col, value=name)
+                for ri, v in enumerate(vals):
+                    _put(block_row + 1 + ri, col, v)
+                ref = Reference(ws, min_col=col, min_row=block_row + 1,
+                                max_row=block_row + n_points)
+            else:
+                label = f"series '{name}' values"
+                ws_v, b = _parse_ref_range(wb, ws, vals, label)
+                length = _series_length(b, label)
+                if n_points is None:
+                    n_points = length
+                elif length != n_points:
+                    raise ValueError(
+                        f"series '{name}' covers {length} cells but there are "
+                        f"{n_points} categories"
+                    )
+                ref = Reference(ws_v, min_col=b[0], min_row=b[1], max_col=b[2], max_row=b[3])
+            entries.append((ref, name, False))
+
+        if block_row is not None:
+            n_block_cols = (1 if cat_literal else 0) + len(literal_cols)
+            last_row = block_row + (n_points or 0)
+            touch(ws, block_row, block_col, last_row, block_col + n_block_cols - 1)
+            notes.append(
+                f"add_chart on '{ws.title}': literal chart data written to "
+                f"{get_column_letter(block_col)}{block_row}:"
+                f"{get_column_letter(block_col + n_block_cols - 1)}{last_row}"
+            )
+        _flush_coercion(tally, idx, "add_chart", ws.title, notes, errors)
+
+    if not entries:
+        raise ValueError("no series — the chart would be empty")
+
+    chart = {
+        "column": BarChart, "bar": BarChart, "line": LineChart, "pie": PieChart,
+        "doughnut": DoughnutChart, "scatter": ScatterChart, "area": AreaChart,
+    }[kind]()
+    if kind in ("column", "bar"):
+        chart.type = "col" if kind == "column" else "bar"
+    if kind == "scatter":
+        if cats is None:
+            raise ValueError("scatter charts need categories (the X values)")
+        for ref, title, tfd in entries:
+            chart.series.append(Series(ref, xvalues=cats, title=title, title_from_data=tfd))
+    else:
+        for ref, title, tfd in entries:
+            chart.series.append(Series(ref, title=title, title_from_data=tfd))
+        if cats is not None:
+            chart.set_categories(cats)
+
+    if op.get("title"):
+        chart.title = str(op["title"])
+    for key, axis in (("x_axis_title", "x_axis"), ("y_axis_title", "y_axis")):
+        if op.get(key):
+            if hasattr(chart, axis):
+                getattr(chart, axis).title = str(op[key])
+            else:
+                warnings.append(f"{key} ignored — {kind} charts have no axes")
+    if op.get("style") is not None:
+        style = int(op["style"])
+        if not 1 <= style <= 48:
+            raise ValueError("style must be between 1 and 48")
+        chart.style = style
+    width, height = float(op.get("width") or 15), float(op.get("height") or 7.5)
+    if width <= 0 or height <= 0:
+        raise ValueError("width and height are centimetres and must be positive")
+    chart.width, chart.height = width, height
+    if stacked:
+        if kind in ("column", "bar"):
+            chart.grouping = "stacked"
+            chart.overlap = 100
+        elif kind in ("line", "area"):
+            chart.grouping = "stacked"
+        else:
+            warnings.append(f"stacked ignored — not meaningful for {kind} charts")
+    legend = op.get("legend")
+    if legend is False or (
+        isinstance(legend, str) and legend.strip().lower() in ("false", "none", "off", "hide")
+    ):
+        chart.legend = None
+    elif isinstance(legend, str):
+        pos = _LEGEND_POSITIONS.get(legend.strip().lower())
+        if pos is None:
+            raise ValueError("legend must be r, l, t, b, tr or false")
+        chart.legend.position = pos
+    if op.get("show_percent") or op.get("show_values"):
+        chart.dataLabels = DataLabelList()
+        if op.get("show_percent"):
+            chart.dataLabels.showPercent = True
+        if op.get("show_values"):
+            chart.dataLabels.showVal = True
+    if kind in ("pie", "doughnut") and len(entries) > 1:
+        warnings.append(f"{kind} charts show only the first series ({len(entries)} given)")
+
+    ws.add_chart(chart, anchor)
+    notes.append(
+        f"add_chart on '{ws.title}': {kind} chart, {len(entries)} series, "
+        f"anchored at {anchor}"
+    )
+    errors.extend(f"Op #{idx} add_chart: Warning: {w}" for w in warnings)
+
+
+def _series_ref_strings(series):
+    for src in (series.val, series.cat, series.xVal, series.yVal):
+        if src is None:
+            continue
+        for ref in (getattr(src, "numRef", None), getattr(src, "strRef", None)):
+            if ref is not None and ref.f:
+                yield ref.f
+    tx = series.tx
+    if tx is not None and tx.strRef is not None and tx.strRef.f:
+        yield tx.strRef.f
+
+
+def _dangling_chart_refs(wb) -> list[tuple[str, str]]:
+    """(chart sheet, missing sheet) pairs. Chart references are frozen
+    strings, so a sheet renamed or deleted AFTER a chart was added (in this
+    batch or a previous save) leaves the chart pointing at nothing — Excel
+    repairs the file without saying why."""
+    names = set(wb.sheetnames)
+    seen: list[tuple[str, str]] = []
+    for ws in wb.worksheets:
+        for chart in getattr(ws, "_charts", []):
+            for series in chart.series:
+                for f in _series_ref_strings(series):
+                    m = _SHEET_QUALIFIED_RE.match(f)
+                    if not m:
+                        continue
+                    title = (m.group(1) or m.group(2)).replace("''", "'")
+                    if title not in names and (ws.title, title) not in seen:
+                        seen.append((ws.title, title))
+    return seen
+
+
+# ---------------------------------------------------------------------------
 # Write — main handler
 # ---------------------------------------------------------------------------
 
@@ -740,8 +1866,15 @@ async def handle_write_xlsx(args: dict) -> str:
     session-bound and stay here; the whole op loop (which full-DOM-loads an
     existing workbook — the same allocation profile that took the read path
     down) runs in a bounded worker child."""
+    raw_ops, dropped = _normalize_operations(args.get("operations"))
+    ops = [_canonical_op(op)[1] for op in raw_ops]
+    help_ops = [op for op in ops if op["op"] == "help"]
+    ops = [op for op in ops if op["op"] != "help"]
+    help_text = "\n\n".join(_help_text(h.get("name")) for h in help_ops)
+    if help_ops and not ops:
+        # A question never creates or previews a workbook.
+        return help_text + _dropped_note(dropped)
     path = await _resolve_path(args["path"], writing=True)
-    ops, dropped = _normalize_operations(args.get("operations"))
     await _preresolve_image_ops(ops)
     try:
         msg = await run_parse(
@@ -754,29 +1887,13 @@ async def handle_write_xlsx(args: dict) -> str:
             os.unlink(path + _WORKER_TMP_SUFFIX)
         raise
     await _push_preview(path)
-    return msg
+    return msg + ("\n\n" + help_text if help_text else "")
 
 
 def _write_xlsx_core(path: str, ops: list, dropped: int, create_new: bool) -> str:
     """Worker core: op application + atomic save + readback message."""
     from openpyxl import Workbook, load_workbook
-    from openpyxl.chart import (
-        AreaChart,
-        BarChart,
-        LineChart,
-        PieChart,
-        Reference,
-        ScatterChart,
-        Series,
-    )
     from openpyxl.drawing.image import Image as XlImage
-    from openpyxl.formatting.rule import (
-        CellIsRule,
-        ColorScaleRule,
-        DataBarRule,
-        FormulaRule,
-        IconSetRule,
-    )
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Protection, Side
     from openpyxl.utils import (
         column_index_from_string,
@@ -787,29 +1904,16 @@ def _write_xlsx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
     from openpyxl.worksheet.datavalidation import DataValidation
     from openpyxl.worksheet.table import Table, TableStyleInfo
 
-    chart_warning = None
     if Path(path).exists() and not create_new:
+        # Charts, images and comments all survive the load+save round trip
+        # on the pinned openpyxl (charts are re-read from xl/charts and
+        # rewritten with their anchors and series).
         wb = load_workbook(path)
-        # openpyxl cannot round-trip charts: any load+save drops them. Warn
-        # up front so a chart-bearing workbook isn't silently flattened.
-        try:
-            import zipfile
-
-            with zipfile.ZipFile(path) as zf:
-                if any(n.startswith("xl/charts/") for n in zf.namelist()):
-                    chart_warning = (
-                        "this workbook contains charts; openpyxl does not "
-                        "preserve charts on load, so this write drops them"
-                    )
-        except Exception:
-            pass
     else:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         wb = Workbook()
 
     errors = []
-    if chart_warning:
-        errors.append(f"Warning: {chart_warning}")
     # Readback bookkeeping: bounding box of value-writing ops per sheet, so the
     # result can echo a coordinate grid of what actually landed where. Only
     # cell-level ops track — structural ops shift coordinates and get a textual
@@ -833,7 +1937,16 @@ def _write_xlsx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
         box[3] = max(box[3], col2)
 
     for idx, op in enumerate(ops):
-        ot = _op_type(op)
+        ot, op = _canonical_op(op)
+        if ot not in _OPS:
+            errors.append(_unknown_op_error(idx, ot))
+            continue
+        problem = _check_keys(idx, ot, op)
+        if problem:
+            errors.append(problem)
+            continue
+        if ot == "help":
+            continue  # answered by the parent; a no-op inside the workbook
         try:
             # =============================================================
             # SHEET OPERATIONS
@@ -852,7 +1965,7 @@ def _write_xlsx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
                     del wb[name]
 
             elif ot == "rename_sheet":
-                old = op.get("old_name") or op.get("name")
+                old = op["old_name"]
                 new = op["new_name"]
                 if old in wb.sheetnames:
                     wb[old].title = new
@@ -860,7 +1973,7 @@ def _write_xlsx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
                     errors.append(f"Op #{idx} rename_sheet: sheet '{old}' not found")
 
             elif ot == "copy_sheet":
-                source = op.get("source") or op.get("name")
+                source = op["source"]
                 target = op["new_name"]
                 if source in wb.sheetnames:
                     copied = wb.copy_worksheet(wb[source])
@@ -1114,7 +2227,7 @@ def _write_xlsx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
                     font_kw["strike"] = True
                 if op.get("font_size"):
                     font_kw["size"] = int(op["font_size"])
-                fc = op.get("font_color") or op.get("color")
+                fc = op.get("font_color")
                 if fc:
                     font_kw["color"] = _ensure_ff(fc)
                 if op.get("font_name"):
@@ -1123,7 +2236,7 @@ def _write_xlsx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
 
                 # Fill
                 fill = None
-                fill_val = op.get("fill_color") or op.get("fill") or op.get("background")
+                fill_val = op.get("fill_color")
                 if fill_val:
                     fc_str = _ensure_ff(fill_val)
                     fill = PatternFill(start_color=fc_str, end_color=fc_str, fill_type="solid")
@@ -1228,11 +2341,25 @@ def _write_xlsx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
             elif ot == "add_data_validation":
                 ws = _get_sheet(wb, op)
                 dv_range = op["range"]
-                dv_type = op.get("validation_type", "list")
+                if op.get("validation_type") is None:
+                    if op.get("values") is None:
+                        raise ValueError(
+                            "validation_type is required (list | whole | decimal | "
+                            "date | time | textLength | custom); values alone "
+                            "implies list"
+                        )
+                    dv_type = "list"
+                else:
+                    dv_type = _dv_type(op["validation_type"])
                 dv = DataValidation(type=dv_type)
 
                 if dv_type == "list":
-                    values = op.get("values", [])
+                    values = op.get("values")
+                    if values is None or values == [] or values == "":
+                        raise ValueError(
+                            "list validation needs values: an array of items or "
+                            "a reference string ('=Names', \"'Data'!$B$2:$B$50\")"
+                        )
                     if (
                         isinstance(values, list)
                         and len(values) == 1
@@ -1268,24 +2395,34 @@ def _write_xlsx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
                         ref = _strip_leading_eq(str(values))
                         dv.formula1 = ref
                         dv_name_refs.append((idx, ref))
-                elif dv_type in ("whole", "decimal"):
-                    dv.operator = op.get("operator", "between")
-                    if op.get("min") is not None:
-                        dv.formula1 = str(op["min"])
-                    if op.get("max") is not None:
-                        dv.formula2 = str(op["max"])
-                elif dv_type == "textLength":
-                    dv.operator = op.get("operator", "lessThanOrEqual")
-                    if op.get("max") is not None:
-                        dv.formula1 = str(op["max"])
-                elif dv_type == "date":
-                    dv.operator = op.get("operator", "between")
-                    if op.get("min"):
-                        dv.formula1 = str(op["min"])
-                    if op.get("max"):
-                        dv.formula2 = str(op["max"])
                 elif dv_type == "custom":
-                    dv.formula1 = _strip_leading_eq(str(op.get("formula", "")))
+                    if not op.get("formula"):
+                        raise ValueError("custom validation needs formula")
+                    dv.formula1 = _strip_leading_eq(str(op["formula"]))
+                else:
+                    # whole / decimal / date / time / textLength: a rule with
+                    # no bound accepts nothing and says nothing — refuse it.
+                    default_op = "lessThanOrEqual" if dv_type == "textLength" else "between"
+                    operator = _dv_operator(op.get("operator") or default_op)
+                    dv.operator = operator
+                    if operator in ("between", "notBetween"):
+                        if op.get("min") is None or op.get("max") is None:
+                            raise ValueError(
+                                f"{dv_type} validation with {operator} needs min and max"
+                            )
+                        dv.formula1 = _dv_bound(op["min"], dv_type)
+                        dv.formula2 = _dv_bound(op["max"], dv_type)
+                    else:
+                        bound = next(
+                            (op[k] for k in ("value", "formula", "max", "min")
+                             if op.get(k) is not None),
+                            None,
+                        )
+                        if bound is None:
+                            raise ValueError(
+                                f"{dv_type} validation with {operator} needs value"
+                            )
+                        dv.formula1 = _dv_bound(bound, dv_type)
 
                 if op.get("allow_blank") is not None:
                     dv.allow_blank = op["allow_blank"]
@@ -1350,40 +2487,11 @@ def _write_xlsx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
 
             elif ot == "conditional_format":
                 ws = _get_sheet(wb, op)
-                cf_range = op["range"]
-                rule_type = op.get("rule_type", "")
-                params = dict(op.get("params", {}))
+                _conditional_format(ws, op, idx, notes, errors)
 
-                def _fill_from_dict(d):
-                    color = _ensure_ff(d.get("color", "FFC7CE"))
-                    return PatternFill(start_color=color, end_color=color, fill_type="solid")
-
-                def _font_from_dict(d):
-                    kw = {}
-                    if "color" in d:
-                        kw["color"] = _ensure_ff(d["color"])
-                    if "bold" in d:
-                        kw["bold"] = d["bold"]
-                    return Font(**kw)
-
-                # Convert dict fill/font to openpyxl objects
-                if "fill" in params and isinstance(params["fill"], dict):
-                    params["fill"] = _fill_from_dict(params["fill"])
-                if "font" in params and isinstance(params["font"], dict):
-                    params["font"] = _font_from_dict(params["font"])
-
-                if rule_type == "color_scale":
-                    ws.conditional_formatting.add(cf_range, ColorScaleRule(**params))
-                elif rule_type == "data_bar":
-                    ws.conditional_formatting.add(cf_range, DataBarRule(**params))
-                elif rule_type == "icon_set":
-                    ws.conditional_formatting.add(cf_range, IconSetRule(**params))
-                elif rule_type == "cell_is":
-                    ws.conditional_formatting.add(cf_range, CellIsRule(**params))
-                elif rule_type == "formula":
-                    ws.conditional_formatting.add(cf_range, FormulaRule(**params))
-                else:
-                    errors.append(f"Op #{idx} conditional_format: unknown rule_type '{rule_type}'")
+            elif ot == "remove_conditional_format":
+                ws = _get_sheet(wb, op)
+                _remove_conditional_format(ws, op, idx, notes, errors)
 
             elif ot == "auto_filter":
                 ws = _get_sheet(wb, op)
@@ -1410,133 +2518,7 @@ def _write_xlsx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
 
             elif ot == "add_chart":
                 ws = _get_sheet(wb, op)
-                chart_type = op.get("chart_type", "bar")
-                chart_map = {
-                    "bar": BarChart,
-                    "line": LineChart,
-                    "pie": PieChart,
-                    "scatter": ScatterChart,
-                    "area": AreaChart,
-                }
-                ChartClass = chart_map.get(chart_type, BarChart)
-                chart = ChartClass()
-                chart.title = op.get("title", "")
-                if op.get("x_axis"):
-                    chart.x_axis.title = op["x_axis"]
-                if op.get("y_axis"):
-                    chart.y_axis.title = op["y_axis"]
-                if op.get("chart_style"):
-                    chart.style = int(op["chart_style"])
-                chart.width = float(op.get("width", 15))
-                chart.height = float(op.get("height", 7.5))
-
-                # Two modes:
-                # Mode 1: data_range — reference existing data on the sheet
-                # Mode 2: categories + series — inline data (written to hidden area)
-                categories = op.get("categories")
-                series_list = op.get("series")
-
-                if categories and series_list:
-                    # Mode 2: Write inline data to cells, then reference them
-                    # Find a safe area: below all existing data
-                    data_start_row = ws.max_row + 2 if ws.max_row else 1
-                    data_start_col = 1
-
-                    # Write header row: "Category", series names
-                    ws.cell(row=data_start_row, column=data_start_col, value="Category")
-                    for si, s in enumerate(series_list):
-                        ws.cell(row=data_start_row, column=data_start_col + 1 + si,
-                                value=s.get("name", f"Series {si + 1}"))
-
-                    # Write data rows — same value coercion as write_cells
-                    # (headers stay verbatim: a date-shaped series NAME must
-                    # not turn into a date cell under titles_from_data).
-                    tally = {"converted": 0, "warned": {}}
-                    for ri, cat in enumerate(categories):
-                        cval, kind = _coerce_cell_value(cat)
-                        kind = _set_coerced(
-                            ws.cell(row=data_start_row + 1 + ri, column=data_start_col),
-                            cval, kind, raw=cat,
-                        )
-                        if kind is not None:
-                            _tally_coercion(
-                                tally, kind, cat,
-                                f"{get_column_letter(data_start_col)}"
-                                f"{data_start_row + 1 + ri}",
-                            )
-                        for si, s in enumerate(series_list):
-                            vals = s.get("values", [])
-                            if ri < len(vals):
-                                vval, vkind = _coerce_cell_value(vals[ri])
-                                vkind = _set_coerced(
-                                    ws.cell(row=data_start_row + 1 + ri,
-                                            column=data_start_col + 1 + si),
-                                    vval, vkind, raw=vals[ri],
-                                )
-                                if vkind is not None:
-                                    _tally_coercion(
-                                        tally, vkind, vals[ri],
-                                        f"{get_column_letter(data_start_col + 1 + si)}"
-                                        f"{data_start_row + 1 + ri}",
-                                    )
-                    _flush_coercion(tally, idx, ot, ws.title, notes, errors)
-
-                    # Build references
-                    num_rows = len(categories)
-                    num_series = len(series_list)
-                    min_r = data_start_row
-                    max_r = data_start_row + num_rows
-                    min_c = data_start_col
-                    max_c = data_start_col + num_series
-
-                    if chart_type == "scatter":
-                        x_values = Reference(ws, min_col=min_c, min_row=min_r + 1, max_row=max_r)
-                        for col_idx in range(min_c + 1, max_c + 1):
-                            y_values = Reference(ws, min_col=col_idx, min_row=min_r + 1, max_row=max_r)
-                            s = Series(y_values, x_values)
-                            title_cell = ws.cell(row=min_r, column=col_idx)
-                            if title_cell.value:
-                                s.title = str(title_cell.value)
-                            chart.series.append(s)
-                    else:
-                        cats = Reference(ws, min_col=min_c, min_row=min_r + 1, max_row=max_r)
-                        for col_idx in range(min_c + 1, max_c + 1):
-                            vals = Reference(ws, min_col=col_idx, min_row=min_r, max_row=max_r)
-                            chart.add_data(vals, titles_from_data=True)
-                        chart.set_categories(cats)
-
-                else:
-                    # Mode 1: data_range — reference existing data
-                    dr = op.get("data_range", "")
-                    if not dr:
-                        errors.append(f"Op #{idx} add_chart: provide data_range OR categories+series")
-                        continue
-                    rng = re.match(r"([A-Z]+)(\d+):([A-Z]+)(\d+)", dr.upper())
-                    if not rng:
-                        errors.append(f"Op #{idx} add_chart: invalid data_range '{dr}'")
-                        continue
-                    min_c = column_index_from_string(rng.group(1))
-                    min_r = int(rng.group(2))
-                    max_c = column_index_from_string(rng.group(3))
-                    max_r = int(rng.group(4))
-
-                    if chart_type == "scatter":
-                        x_values = Reference(ws, min_col=min_c, min_row=min_r + 1, max_row=max_r)
-                        for col_idx in range(min_c + 1, max_c + 1):
-                            y_values = Reference(ws, min_col=col_idx, min_row=min_r + 1, max_row=max_r)
-                            s = Series(y_values, x_values)
-                            title_cell = ws.cell(row=min_r, column=col_idx)
-                            if title_cell.value:
-                                s.title = str(title_cell.value)
-                            chart.series.append(s)
-                    else:
-                        cats = Reference(ws, min_col=min_c, min_row=min_r + 1, max_row=max_r)
-                        for col_idx in range(min_c + 1, max_c + 1):
-                            vals = Reference(ws, min_col=col_idx, min_row=min_r, max_row=max_r)
-                            chart.add_data(vals, titles_from_data=True)
-                        chart.set_categories(cats)
-
-                ws.add_chart(chart, op.get("position", "E1"))
+                _add_chart(wb, ws, op, idx, _touch, notes, errors)
 
             # =============================================================
             # IMAGES
@@ -1560,7 +2542,7 @@ def _write_xlsx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
                 import tempfile
 
                 ws = _get_sheet(wb, op)
-                latex = op.get("latex") or op.get("equation") or ""
+                latex = op.get("latex") or ""
                 cell = op.get("cell", "A1")
                 height_px = int(op.get("height", 40))
                 col, row = _parse_cell_ref(cell)
@@ -1601,16 +2583,9 @@ def _write_xlsx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
                 ws.add_image(img, cell)
                 _touch(ws, row, col)
 
-            # =============================================================
-            # UNKNOWN
-            # =============================================================
-
-            else:
-                logger.warning(f"write_xlsx: unknown operation '{ot}', skipping")
-                errors.append(f"Op #{idx}: unknown operation '{ot}'")
-
         except Exception as exc:
-            errors.append(f"Op #{idx} {ot}: {exc}")
+            hint = _HELP_HINT % ot if isinstance(exc, (KeyError, TypeError, AttributeError)) else ""
+            errors.append(f"Op #{idx} {ot}: {_friendly_error(exc)}{hint}")
             logger.warning(f"write_xlsx op #{idx} '{ot}' failed: {exc}")
 
     # Typo guard: a list validation referencing a defined name that exists
@@ -1631,6 +2606,13 @@ def _write_xlsx_core(path: str, ops: list, dropped: int, create_new: bool) -> st
                     f"references '{ref}' but no defined name in the workbook "
                     f"matches it — the dropdown will be empty"
                 )
+
+    for chart_sheet, missing in _dangling_chart_refs(wb):
+        errors.append(
+            f"Warning: a chart on '{chart_sheet}' references sheet '{missing}', "
+            f"which was renamed or deleted after the chart was added — rename "
+            f"or delete sheets before adding charts"
+        )
 
     # Save even if some operations failed (partial success). Atomic: a
     # killed worker must never leave the user's workbook truncated.

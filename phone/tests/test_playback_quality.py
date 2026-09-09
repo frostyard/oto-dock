@@ -45,11 +45,12 @@ def test_ambience_suppressed_while_voice_segment_active(make_pipeline):
 
     async def run():
         task = asyncio.create_task(p._ambience_loop())
-        # Simulate a voice segment that stalls: sender active, but no voice
-        # frame stamped for way past the 30 ms idle threshold.
+        # Simulate a voice segment with a HICCUP: sender active, no voice
+        # frame for 50 ms (past the 30 ms idle threshold, well under the
+        # 250 ms starvation rule) — sampled for 100 ms.
         p._voice_senders = 1
-        p.state._last_voice_sent = time.monotonic() - 1.0
-        await asyncio.sleep(0.15)
+        p.state._last_voice_sent = time.monotonic() - 0.05
+        await asyncio.sleep(0.10)
         stalled_frames = p._ambience.frames
         # Segment ends → bed resumes on the same silence.
         p._voice_senders = 0
@@ -62,6 +63,123 @@ def test_ambience_suppressed_while_voice_segment_active(make_pipeline):
     stalled, resumed = asyncio.run(run())
     assert stalled == 0, "bed must not decorate a voice sender's stall"
     assert resumed > 0, "inter-turn bed behavior unchanged"
+
+
+class _CountingBed:
+    def __init__(self):
+        self.frames = 0
+
+    def next_frame(self):
+        self.frames += 1
+        return b"\x00" * 320
+
+    def mix_into(self, frame):
+        return frame
+
+
+def test_ambience_resumes_for_a_starved_sender_and_yields_again(make_pipeline):
+    """A sender silent for longer than _BED_RESUME_GAP_S is starved (a
+    synthesis gap, a barge-in pause, a provider's end-of-utterance wait —
+    live-hit 2026-09-07: 2 s of dead air after every sentence): the bed
+    returns even though the segment is still active, and stands down again
+    within a frame period once voice frames flow."""
+    p = make_pipeline(route=make_route(), llm=FakeLLM())
+    p.state._running = True
+    p._ambience = _CountingBed()
+
+    async def run():
+        task = asyncio.create_task(p._ambience_loop())
+        p._voice_senders = 1
+        p.state._last_voice_sent = time.monotonic() - 0.3
+        await asyncio.sleep(0.10)
+        starved_frames = p._ambience.frames
+        # Voice resumes (stamped every frame period) → the bed yields.
+        for _ in range(6):
+            p.state._last_voice_sent = time.monotonic()
+            await asyncio.sleep(0.02)
+        yielded_frames = p._ambience.frames - starved_frames
+        p.state._running = False
+        task.cancel()
+        return starved_frames, yielded_frames
+
+    starved, yielded = asyncio.run(run())
+    assert starved >= 3, "the bed must fill a starved sender's silence"
+    assert yielded <= 1, "at most one boundary frame once voice resumes"
+
+
+def test_ambience_loop_survives_a_send_error(make_pipeline, caplog):
+    """A transient send error is logged and the bed keeps going — it must
+    never die silently for the rest of the call."""
+    import logging
+
+    p = make_pipeline(route=make_route(), llm=FakeLLM())
+    p.state._running = True
+    p._ambience = _CountingBed()
+    calls = {"n": 0}
+    real_send = p.conn.send_audio
+
+    def flaky_send(pcm):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient")
+        real_send(pcm)
+
+    p.conn.send_audio = flaky_send
+
+    async def run():
+        with caplog.at_level(logging.WARNING, logger="pipeline"):
+            task = asyncio.create_task(p._ambience_loop())
+            p.state._last_voice_sent = time.monotonic() - 1.0
+            await asyncio.sleep(0.15)
+            p.state._running = False
+            task.cancel()
+
+    asyncio.run(run())
+    assert calls["n"] >= 3, "the loop kept emitting after the error"
+    assert any("Ambience bed send failed" in r.message for r in caplog.records)
+
+
+def test_done_line_reports_chunk_gaps_and_the_stream_tail(make_pipeline, caplog):
+    """Starvation the pacer cannot see: a >100 ms wait between chunks counts
+    as a gap and the wait from the last frame to the stream's natural end
+    is the tail — both on the done line."""
+    import logging
+    import re
+
+    p = _playing_pipeline(make_pipeline)
+
+    async def run():
+        with caplog.at_level(logging.INFO, logger="pipeline"):
+            await _start_playing(p)          # 40 ms of audio, plays at once
+            await asyncio.sleep(0.25)        # …then nothing for ~200 ms
+            p.tts.q.put_nowait(b"\x00" * 640)
+            await asyncio.sleep(0.15)        # second chunk plays (40 ms), then silence
+            p.tts.q.put_nowait(None)         # the stream ends on its own
+            await asyncio.wait_for(p.state._tts_task, timeout=5.0)
+
+    asyncio.run(run())
+    lines = [r.message for r in caplog.records if "TTS playback done" in r.message]
+    assert len(lines) == 1, lines
+    assert "gaps 1/" in lines[0], lines[0]
+    m = re.search(r"tail (\d+)ms", lines[0])
+    assert m and 50 <= int(m.group(1)) <= 400, lines[0]
+
+
+def test_cancelled_segment_logs_no_tail(make_pipeline, caplog):
+    import logging
+
+    p = _playing_pipeline(make_pipeline)
+
+    async def run():
+        with caplog.at_level(logging.INFO, logger="pipeline"):
+            await _start_playing(p)
+            p.state._tts_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await p.state._tts_task
+
+    asyncio.run(run())
+    lines = [r.message for r in caplog.records if "TTS playback done" in r.message]
+    assert len(lines) == 1 and "tail" not in lines[0], lines
 
 
 # ── TTS pre-buffer ──────────────────────────────────────────────────────

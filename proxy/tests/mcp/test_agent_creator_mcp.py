@@ -76,7 +76,8 @@ class TestManifestSanity:
         # terminal joined once its input became identity-gated
         # (InteractiveSession.may_drive): a shared PTY runs under the warmer's
         # platform role, which is exactly what this MCP's endpoint gates on.
-        assert set(manifest["exclude_from"]) == {"phone", "task", "meeting"}
+        # "external" (2026-09): never on a phone caller's session either.
+        assert set(manifest["exclude_from"]) == {"phone", "task", "meeting", "external"}
 
     def test_skill_is_on_demand(self):
         manifest = json.loads((_MCP_DIR / "manifest.json").read_text())

@@ -38,8 +38,22 @@ def build_oto_env(
     task_type: str = "",
     available_scopes: tuple[str, ...] = ("user", "agent"),
     force_config: bool = False,
+    external: bool = False,
+    external_home_mounted: bool = False,
+    external_channel: str = "",
+    external_id: str = "",
+    external_verified: bool = False,
 ) -> dict[str, str]:
     """Build the standard ``OTO_*`` env vars dict.
+
+    ``external`` = an EXTERNAL session (a phone caller who is not a platform
+    user — ``core/session/external_identity.py``): the shared memory is off,
+    and with ``external_home_mounted`` the caller's own tree at /caller is
+    the workspace / user root (else the agent-scope roots apply and there is
+    no caller memory either). ``external_channel`` / ``external_id`` ("" when
+    withheld) / ``external_verified`` (the daemon's PIN gate passed) are
+    exposed so first-party MCPs can scope their records to the caller; the
+    proxy API remains the boundary.
 
     Args:
         agent_name: agent slug.
@@ -79,23 +93,31 @@ def build_oto_env(
     # (service sessions AND shared-only human chats), so this derives the mount
     # scope correctly. The REAL attribution identity rides ``user_sub``.
     scope = "user" if username else "agent"
+    # An external caller's tree stands in for the user dir in the path roles
+    # (it is never a platform user, so ``scope`` stays "agent").
+    ext_tree = bool(external and external_home_mounted)
+    if external:
+        memory_agent_enabled = False
+        memory_user_enabled = bool(memory_user_enabled and ext_tree)
+        default_scope = "user" if ext_tree else "agent"
 
     # Resolve each role independently using the same path_roles logic that
     # drives manifest path_env injection. Lock-step by construction.
     workspace_dir = path_roles.resolve_role(
-        "workspace", username=username, user_role=user_role,
+        "workspace", username=username, user_role=user_role, external=ext_tree,
     )
     user_root = path_roles.resolve_role(
-        "user_root", username=username, user_role=user_role,
+        "user_root", username=username, user_role=user_role, external=ext_tree,
     )
     # ``force_config`` lets a Shared-only owner-tier human (agent-mount, so
     # ``username==""`` here) still resolve /config — kept in lock-step with the
     # bwrap mount via the resolver's ``config_visible``.
     config_dir = path_roles.resolve_role(
         "config", username=username, user_role=user_role, force_config=force_config,
+        external=ext_tree,
     )
     shared_workspace = path_roles.resolve_role(
-        "shared_workspace", username=username, user_role=user_role,
+        "shared_workspace", username=username, user_role=user_role, external=ext_tree,
     )
     # Knowledge dir resolves to ``/knowledge`` for EVERY session (user-scope
     # and agent-scope alike) — the role ignores ``user_role`` because the
@@ -139,6 +161,10 @@ def build_oto_env(
         "OTO_MEMORY_AGENT_ENABLED": "true" if memory_agent_enabled else "false",
         "OTO_DEFAULT_SCOPE": default_scope or "user",
         "OTO_TASK_TYPE": task_type or "",
+        # External routes: empty for every session that is not external.
+        "OTO_EXTERNAL_CHANNEL": external_channel or "",
+        "OTO_EXTERNAL_ID": external_id or "",
+        "OTO_EXTERNAL_VERIFIED": "true" if external_verified else "false",
     }
 
 

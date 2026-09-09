@@ -128,3 +128,26 @@ def test_missing_skill_file_is_skipped(temp_db, tmp_path):
     with patch.object(mcp_registry, "get_agent_mcps", return_value=[m]):
         skills = mcp_registry.get_skills_for_agent("pa", context="dashboard")
     assert [s[0] for s in skills] == ["ok-skill"]
+
+
+def test_skill_catalog_lists_on_demand_skills_with_the_same_filters(temp_db, tmp_path):
+    """The Direct-LLM ``# Skills`` catalog: on-demand skills only (always
+    skills are inlined), sorted by id, DB-disable and exclude_from applied
+    exactly like the inline path."""
+    m = _manifest_with_skills(tmp_path, "m3", [
+        {"id": "zeta-guide", "file": "skills/z.md", "content": "Z.",
+         "description": "Zeta parameters", "loading": "on_demand"},
+        {"id": "alpha-card", "file": "skills/a.md", "content": "A.",
+         "loading": "always"},
+        {"id": "beta-guide", "file": "skills/b.md", "content": "B.",
+         "description": "Beta guide", "loading": "on_demand",
+         "default_exclude_from": ["phone"]},
+        {"id": "gone-guide", "file": "skills/g.md", "content": "G.",
+         "loading": "on_demand"},
+    ])
+    mcp_store.set_agent_skill("pa", "gone-guide", enabled=False, exclude_from=[])
+    with patch.object(mcp_registry, "get_agent_mcps", return_value=[m]):
+        dash = mcp_registry.get_skill_catalog_for_agent("pa", context="dashboard")
+        phone = mcp_registry.get_skill_catalog_for_agent("pa", context="phone")
+    assert dash == [("beta-guide", "Beta guide"), ("zeta-guide", "Zeta parameters")]
+    assert phone == [("zeta-guide", "Zeta parameters")]

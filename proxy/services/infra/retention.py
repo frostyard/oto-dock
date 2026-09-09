@@ -47,6 +47,9 @@ from pathlib import Path
 from typing import Iterator
 
 import config
+from core.session import external_identity
+from core.session.external_identity import external_home_of
+from services.infra import external_retention
 from storage import database as task_store
 
 logger = logging.getLogger("claude-proxy")
@@ -104,6 +107,9 @@ class LiveSnapshot:
     pump_chat_ids: set = field(default_factory=set)
     codex_config_dirs: set = field(default_factory=set)   # resolved .codex paths
     busy_homes: set = field(default_factory=set)          # (agent, username)
+    # Resolved ``external_home`` paths of live external sessions (phone
+    # callers) — the caller-data pass never touches a tree in use.
+    busy_external_homes: set = field(default_factory=set)
 
 
 def _build_live_snapshot() -> LiveSnapshot:
@@ -122,10 +128,14 @@ def _build_live_snapshot() -> LiveSnapshot:
     snap = LiveSnapshot()
     from core.layers.cli.session import _persistent_sessions
     from core.layers.codex.session import _codex_sessions
+    from core.layers.direct.session import _direct_sessions
     from core.session.session_state import _session_security
     from core.events.stream_pump import _active_pumps
 
     snap.session_ids.update(_persistent_sessions.keys())
+    # Direct-LLM sessions have no files of their own, but an external caller
+    # on a Direct agent still has a live caller tree.
+    snap.session_ids.update(_direct_sessions.keys())
     for sid, sess in _codex_sessions.items():
         snap.session_ids.add(sid)
         tid = getattr(sess, "thread_id", None)
@@ -142,6 +152,12 @@ def _build_live_snapshot() -> LiveSnapshot:
         agent = getattr(ctx, "agent", "") or "" if ctx else ""
         if agent:
             snap.busy_homes.add((agent, getattr(ctx, "username", "") or ""))
+        home = external_home_of(ctx) if ctx else ""
+        if home:
+            try:
+                snap.busy_external_homes.add(str(Path(home).resolve()))
+            except OSError:
+                snap.busy_external_homes.add(home)
     snap.pump_chat_ids.update(_active_pumps.keys())
     return snap
 
@@ -153,9 +169,12 @@ def _build_live_snapshot() -> LiveSnapshot:
 def iter_local_homes() -> Iterator[tuple[str, str, Path]]:
     """Yield (agent, username, home) for every local agent home.
 
-    Bounded two-level iteration over the known shapes
-    ``AGENTS_DIR/<agent>/users/<username>`` and ``AGENTS_DIR/<agent>/workspace``
-    (agent-scope sessions: tasks/phone without a user) — never a tree walk.
+    Bounded iteration over the known shapes
+    ``AGENTS_DIR/<agent>/users/<username>``, ``AGENTS_DIR/<agent>/workspace``
+    (agent-scope sessions: tasks/phone without a user) and the external
+    callers' trees ``AGENTS_DIR/<agent>/externals/<channel>/<slug>`` (+ the
+    ``_ephemeral/<sid>`` ones; reported with username "" — the CLI state
+    under them is bounded like any other home) — never a tree walk.
     """
     agents_dir = Path(config.AGENTS_DIR)
     if not agents_dir.is_dir():
@@ -171,6 +190,20 @@ def iter_local_homes() -> Iterator[tuple[str, str, Path]]:
         ws = agent_dir / "workspace"
         if ws.is_dir():
             yield agent_dir.name, "", ws
+        ext = agent_dir / external_identity.EXTERNALS_DIRNAME
+        if ext.is_dir():
+            for channel_dir in sorted(ext.iterdir()):
+                if not channel_dir.is_dir():
+                    continue
+                for home in sorted(channel_dir.iterdir()):
+                    if not home.is_dir():
+                        continue
+                    if home.name == external_identity.EPHEMERAL_DIRNAME:
+                        for eph in sorted(home.iterdir()):
+                            if eph.is_dir():
+                                yield agent_dir.name, "", eph
+                    else:
+                        yield agent_dir.name, "", home
 
 
 def _home_for_chat(agent: str, user_sub: str) -> Path:
@@ -382,9 +415,24 @@ def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
         "partial_bytes": 0,
         "quota_projects_reclaimed": 0,
         "mcp_autoupdate_rows_deleted": 0,
+        # Caller data (external routes) — services/infra/external_retention.py
+        "callers_forgotten": 0,
+        "callers_busy_skipped": 0,
+        "ephemeral_reaped": 0,
+        "phone_chats_deleted": 0,
+        "call_log_rows_deleted": 0,
+        "caller_bytes_freed": 0,
         "errors": 0,
     }
-    passes = []
+    passes = [
+        # Caller data FIRST (its own toggle + window: external_retention_enabled
+        # / _days; the ephemeral reap inside always runs): an aged phone chat
+        # is deleted whole here — Pass A would otherwise NULL its session id
+        # (losing the file link) before this pass sees it.
+        ("caller-data", lambda: external_retention.run_pass(
+            live.busy_external_homes, live.session_ids, live.pump_chat_ids,
+            stats, dry_run)),
+    ]
     if enabled:
         passes.append(("aged-chats", lambda: _pass_aged_chats(days, live, stats, dry_run)))
     passes.extend([
@@ -403,7 +451,8 @@ def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
             logger.exception(f"retention: pass '{name}' failed")
     stats["duration_ms"] = int((time.monotonic() - started) * 1000)
     total = (stats["bytes_freed"] + stats["orphan_bytes"]
-             + stats["codex_junk_bytes"] + stats["tarball_bytes"])
+             + stats["codex_junk_bytes"] + stats["tarball_bytes"]
+             + stats["caller_bytes_freed"])
     logger.info(
         f"retention: sweep done in {stats['duration_ms']}ms "
         f"(dry_run={dry_run}, enabled={enabled}): "
@@ -411,6 +460,8 @@ def _run_sweep_sync(days: int, enabled: bool, live: LiveSnapshot,
         f"{stats['session_files_deleted']} session files, "
         f"{stats['orphans_deleted']} orphans, "
         f"{stats['codex_junk_files']} codex-junk files, "
+        f"{stats['callers_forgotten']} callers forgotten, "
+        f"{stats['phone_chats_deleted']} phone chats, "
         f"{total} bytes total"
     )
     return stats

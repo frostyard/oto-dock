@@ -22,7 +22,6 @@ export interface Subscription {
   contribute_platform: boolean  // feeds the platform/agent pool (admin-only to enable)
   is_mine?: boolean       // set on pool/list responses: owner_sub === caller.sub
   label: string
-  is_primary: number
   oauth_email: string
   active_sessions: number
   status: string          // 'active' | 'disabled' | 'expired'
@@ -85,16 +84,114 @@ export interface UserLayerInfo {
 // Admin hooks
 // ---------------------------------------------------------------------------
 
+// Every subscription / model / engine mutation refreshes all three readers:
+// the admin tab, the user's own engines, AND the public execution-layers
+// query the chat and agent-settings model pickers read. That last one is
+// cached for five minutes (useExecutionLayers), so a mutation that only
+// touched the admin key left a newly discovered model invisible until a
+// full reload.
+const ENGINE_QUERY_KEYS = ['admin-execution-layers', 'user-execution-layers', 'execution-layers'] as const
+
+function invalidateEngineQueries(qc: ReturnType<typeof useQueryClient>) {
+  for (const key of ENGINE_QUERY_KEYS) qc.invalidateQueries({ queryKey: [key] })
+}
+
+/** One self-hosted OpenAI-compatible endpoint, listed once across the engines
+ *  that can use it. `engines` holds the per-engine subscription row (absent =
+ *  not enabled for that engine). */
+export interface LocalEndpointGroup {
+  group: string
+  provider: string
+  endpoint_url: string
+  label: string
+  has_api_key: boolean
+  engines: Record<string, { id: string; status: string; active_sessions: number; is_mine: boolean }>
+}
+
+interface AdminEnginesPayload {
+  layers: ExecutionLayerInfo[]
+  local_endpoints: LocalEndpointGroup[]
+}
+
+const fetchAdminEngines = async (): Promise<AdminEnginesPayload> => {
+  const res = await apiFetch('/v1/admin/execution-layers')
+  if (!res.ok) throw new Error('Failed to fetch execution layers')
+  const data = await res.json()
+  return { layers: data.layers ?? [], local_endpoints: data.local_endpoints ?? [] }
+}
+
 export const useAdminExecutionLayers = () =>
   useQuery({
     queryKey: ['admin-execution-layers'],
-    queryFn: async (): Promise<ExecutionLayerInfo[]> => {
-      const res = await apiFetch('/v1/admin/execution-layers')
-      if (!res.ok) throw new Error('Failed to fetch execution layers')
-      const data = await res.json()
-      return data.layers ?? []
-    },
+    queryFn: fetchAdminEngines,
+    select: (d) => d.layers,
   })
+
+export const useAdminLocalEndpoints = () =>
+  useQuery({
+    queryKey: ['admin-execution-layers'],
+    queryFn: fetchAdminEngines,
+    select: (d) => d.local_endpoints,
+  })
+
+export function useAddLocalEndpoint() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async (body: {
+      provider: string
+      label?: string
+      endpoint_url: string
+      api_key?: string
+      layers: string[]
+    }) => {
+      const res = await apiFetch('/v1/admin/execution-layers/local-endpoints', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        throw new Error(err.detail || 'Failed to add local endpoint')
+      }
+      return res.json() as Promise<LocalEndpointGroup>
+    },
+    onSuccess: () => invalidateEngineQueries(qc),
+  })
+}
+
+export function useSetLocalEndpointEngine() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ group, layer, enabled }: { group: string; layer: string; enabled: boolean }) => {
+      const res = await apiFetch(`/v1/admin/execution-layers/local-endpoints/${encodeURIComponent(group)}`, {
+        method: 'PUT',
+        body: JSON.stringify({ layer, enabled }),
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        throw new Error(err.detail || 'Failed to update local endpoint')
+      }
+      return res.json() as Promise<LocalEndpointGroup>
+    },
+    onSuccess: () => invalidateEngineQueries(qc),
+  })
+}
+
+export function useDeleteLocalEndpoint() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ group }: { group: string }) => {
+      const res = await apiFetch(`/v1/admin/execution-layers/local-endpoints/${encodeURIComponent(group)}`, {
+        method: 'DELETE',
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        throw new Error(err.detail || 'Failed to remove local endpoint')
+      }
+      return res.json()
+    },
+    onSuccess: () => invalidateEngineQueries(qc),
+  })
+}
 
 export function useAddSubscription() {
   const qc = useQueryClient()
@@ -109,7 +206,6 @@ export function useAddSubscription() {
       label?: string
       api_key?: string
       endpoint_url?: string
-      is_primary?: boolean
       use_personal?: boolean
       contribute_platform?: boolean
     }) => {
@@ -123,7 +219,7 @@ export function useAddSubscription() {
       }
       return res.json()
     },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-execution-layers'] }),
+    onSuccess: () => invalidateEngineQueries(qc),
   })
 }
 
@@ -138,7 +234,6 @@ export function useUpdateSubscription() {
       layer: string
       id: string
       label?: string
-      is_primary?: boolean
       status?: string
       use_personal?: boolean
       contribute_platform?: boolean
@@ -170,10 +265,7 @@ export function useUpdateSubscription() {
     onError: (_e, _vars, ctx: any) => {
       if (ctx?.prev !== undefined) qc.setQueryData(['user-execution-layers'], ctx.prev)
     },
-    onSettled: () => {
-      qc.invalidateQueries({ queryKey: ['admin-execution-layers'] })
-      qc.invalidateQueries({ queryKey: ['user-execution-layers'] })
-    },
+    onSettled: () => invalidateEngineQueries(qc),
   })
 }
 
@@ -191,7 +283,6 @@ export function useUserUpdateSubscription() {
       layer: string
       id: string
       label?: string
-      is_primary?: boolean
       use_personal?: boolean
       contribute_platform?: boolean
     }) => {
@@ -220,10 +311,7 @@ export function useUserUpdateSubscription() {
     onError: (_e, _vars, ctx: any) => {
       if (ctx?.prev !== undefined) qc.setQueryData(['user-execution-layers'], ctx.prev)
     },
-    onSettled: () => {
-      qc.invalidateQueries({ queryKey: ['user-execution-layers'] })
-      qc.invalidateQueries({ queryKey: ['admin-execution-layers'] })
-    },
+    onSettled: () => invalidateEngineQueries(qc),
   })
 }
 
@@ -240,7 +328,7 @@ export function useDeleteSubscription() {
       }
       return res.json()
     },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-execution-layers'] }),
+    onSuccess: () => invalidateEngineQueries(qc),
   })
 }
 
@@ -277,7 +365,7 @@ export function useAddModel() {
       }
       return res.json()
     },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-execution-layers'] }),
+    onSuccess: () => invalidateEngineQueries(qc),
   })
 }
 
@@ -307,7 +395,7 @@ export function useUpdateModel() {
       if (!res.ok) throw new Error('Failed to update model')
       return res.json()
     },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-execution-layers'] }),
+    onSuccess: () => invalidateEngineQueries(qc),
   })
 }
 
@@ -324,7 +412,7 @@ export function useDeleteModel() {
       }
       return res.json()
     },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-execution-layers'] }),
+    onSuccess: () => invalidateEngineQueries(qc),
   })
 }
 
@@ -366,14 +454,16 @@ export function useBulkAddModels() {
       layer,
       models,
       provider,
+      layers,
     }: {
       layer: string
       models: { model_id: string; display_name: string }[]
       provider: string
+      layers?: string[]
     }) => {
       const res = await apiFetch(`/v1/admin/execution-layers/${layer}/models/bulk`, {
         method: 'POST',
-        body: JSON.stringify({ models, provider }),
+        body: JSON.stringify({ models, provider, ...(layers?.length ? { layers } : {}) }),
       })
       if (!res.ok) {
         const err = await res.json().catch(() => ({}))
@@ -381,7 +471,7 @@ export function useBulkAddModels() {
       }
       return res.json()
     },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['admin-execution-layers'] }),
+    onSuccess: () => invalidateEngineQueries(qc),
   })
 }
 
@@ -438,10 +528,7 @@ export function useExchangeClaudeOAuth() {
       }
       return res.json()
     },
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['admin-execution-layers'] })
-      qc.invalidateQueries({ queryKey: ['user-execution-layers'] })
-    },
+    onSuccess: () => invalidateEngineQueries(qc),
   })
 }
 
@@ -492,10 +579,7 @@ export function useFinishOpenAIOAuth() {
       }
       return res.json()
     },
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['admin-execution-layers'] })
-      qc.invalidateQueries({ queryKey: ['user-execution-layers'] })
-    },
+    onSuccess: () => invalidateEngineQueries(qc),
   })
 }
 
@@ -524,6 +608,6 @@ export function useUserDeleteSubscription() {
       if (!res.ok) throw new Error('Failed to delete subscription')
       return res.json()
     },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['user-execution-layers'] }),
+    onSuccess: () => invalidateEngineQueries(qc),
   })
 }

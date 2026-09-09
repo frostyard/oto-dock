@@ -21,6 +21,10 @@ from api.agents._router import router
 
 logger = logging.getLogger("claude-proxy.agents")
 
+# Self-hosted OpenAI-compatible providers — their models exist only while an
+# endpoint row is active on that layer (see list_execution_layers).
+_LOCAL_PROVIDERS = {"ollama", "openai_compatible"}
+
 
 def _get_mcp_info(name: str) -> tuple[int, list[str]]:
     """Return (count, names) of MCPs this agent is CONFIGURED with.
@@ -125,13 +129,22 @@ async def list_execution_layers(user: UserContext = Depends(get_current_user)):
                 merged = [x for x in merged if x["value"] != m["model_id"]]
 
         # Filter: only show models whose provider has an active subscription.
-        # "System Default" (value="") always passes. CLI layer models pass
-        # (provider filtering only applies to direct-llm).
-        if active_providers and path == "direct-llm":
+        # "System Default" (value="") always passes. direct-llm filters every
+        # provider; codex-cli filters only its LOCAL providers (a user on a
+        # personal ChatGPT account must keep seeing the OpenAI builtins even
+        # when the platform pool has no OpenAI row); Claude Code never filters.
+        if path == "direct-llm" and active_providers:
             merged = [
                 m for m in merged
                 if not m.get("value")  # "System Default"
                 or m.get("provider", "anthropic") in active_providers
+            ]
+        elif path == "codex-cli":
+            merged = [
+                m for m in merged
+                if not m.get("value")
+                or m.get("provider", "openai") not in _LOCAL_PROVIDERS
+                or m.get("provider") in active_providers
             ]
 
         layer["models"] = merged

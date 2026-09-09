@@ -95,6 +95,25 @@ def drop(agent_slug: str, rel_path: str) -> None:
         )
 
 
+def purge_prefix(agent_slug: str, rel_prefix: str) -> int:
+    """Drop every tombstone under a directory prefix (``"externals/phone/x/"``)
+    — the caller-data retention removes whole trees that never sync, so
+    their bookkeeping goes with them. Returns rows removed."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM file_tombstones WHERE agent_slug=%s "
+            "AND rel_path LIKE %s ESCAPE '\\'",
+            (agent_slug, _like_prefix(rel_prefix)),
+        )
+        conn.commit()
+        return cur.rowcount
+
+
+def _like_prefix(prefix: str) -> str:
+    """A LIKE pattern matching ``prefix*`` literally (``_`` / ``%`` escaped)."""
+    return (prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")) + "%"
+
+
 def delete_expired() -> int:
     """Drop tombstones past their TTL. Returns rows removed (for the reaper log)."""
     now_iso = _now().isoformat()

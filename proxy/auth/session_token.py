@@ -34,10 +34,25 @@ def swap_session_jwt_bearer(
     return f"Bearer {create_session_token(session_id, agent_name, user_sub)}"
 
 
+def _live_external_claim(session_id: str) -> str:
+    """The ``ext`` claim of the session's registered SecurityContext ("" when
+    the session is not external, or not registered yet)."""
+    if not session_id:
+        return ""
+    try:
+        from core.session.session_state import get_session_security
+    except ImportError:  # pragma: no cover — import-order safety only
+        return ""
+    ctx = get_session_security(session_id)
+    return getattr(ctx, "external_claim", "") or ""
+
+
 def create_session_token(
     session_id: str,
     agent_name: str,
     user_sub: str = "",
+    *,
+    external: str | None = None,
 ) -> str:
     """Generate a JWT scoped to one agent session.
 
@@ -53,8 +68,17 @@ def create_session_token(
             picks up the real identity instead of a synthetic
             ``session:<sid>`` string). Empty for agent-scope sessions
             with no real owner (phone service, triggers service, etc.).
+        external: the ``ext`` claim for a session on an EXTERNAL route
+            (``core/session/external_identity.py``). ``None`` (the default
+            at every mint site) derives it from the session's registered
+            SecurityContext — the layers register the context BEFORE the
+            spawn precisely so the tokens minted into the process env carry
+            it; "" mints a plain token. Tokens carrying ``ext`` are accepted
+            only while the session is live (``middleware.py``).
     """
     import config
+    if external is None:
+        external = _live_external_claim(session_id)
     payload = {
         "type": "session",
         "sid": session_id,
@@ -62,6 +86,8 @@ def create_session_token(
         "user_sub": user_sub,
         "exp": datetime.now(timezone.utc) + timedelta(hours=24),
     }
+    if external:
+        payload["ext"] = external
     return jwt.encode(payload, config.JWT_SECRET, algorithm="HS256")
 
 

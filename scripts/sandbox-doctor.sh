@@ -141,7 +141,12 @@ fi
 
 section "Reading"
 APPARMOR_ON="$(read_sysctl /proc/sys/kernel/apparmor_restrict_unprivileged_userns)"
-if [ "$P2" -ne 0 ]; then
+if [ "$P1" -ne 0 ]; then
+  say "  An unprivileged user+net namespace cannot be created here — the proxy"
+  say "  boot preflight fails on this host before any sandbox is tried"
+  say "  (Ubuntu 23.10+: apparmor_restrict_unprivileged_userns=$APPARMOR_ON,"
+  say "  see scripts/setup-apparmor-userns.sh; containers must allow user namespaces)."
+elif [ "$P2" -ne 0 ]; then
   say "  The SESSION sandbox itself cannot start here — the proxy boot"
   say "  preflight should already be failing loudly. Fix that first"
   say "  (see the preflight error; Ubuntu 24.04+: setup-apparmor-userns.sh)."

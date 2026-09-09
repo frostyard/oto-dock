@@ -19,11 +19,13 @@ import config as app_config
 
 @dataclass
 class ProviderUsage:
-    """Token usage from a single API call."""
+    """Token usage from a single API call (plus the provider-run web searches
+    the call made — they carry a per-call fee on top of the tokens)."""
     input_tokens: int = 0
     output_tokens: int = 0
     cache_write_tokens: int = 0
     cache_read_tokens: int = 0
+    web_search_requests: int = 0
 
 
 @dataclass
@@ -32,10 +34,19 @@ class ProviderStreamEvent:
 
     type values:
         text_delta      — streamed text fragment
+        thinking_delta  — streamed reasoning fragment (UI only — never part
+                          of the assistant content sent back to the provider)
         tool_start      — tool call began (name + id known)
         tool_input_delta — partial JSON for tool input
         tool_stop       — tool call content block finished
+        tool_result     — a SERVER-side tool (Anthropic web_search / web_fetch
+                          / code_execution, OpenAI web_search) returned its
+                          result inside the stream; the runner emits the
+                          dashboard's tool_end for it (text = a short result
+                          preview)
         usage           — token usage stats (emitted once per API call)
+        content         — the provider's final content for the history
+                          (``raw_content``; see serialize_assistant_content)
         stop            — API call finished, includes stop_reason
         error           — provider error
     """
@@ -174,11 +185,14 @@ class ProviderAdapter(ABC):
     # ---------------------------------------------------------------------------
 
     def calculate_cost(self, model: str, usage: ProviderUsage) -> float:
-        """Calculate USD cost from usage using centralized model pricing."""
+        """Calculate USD cost from usage using centralized model pricing (the
+        tokens at the model's rates plus the per-call fee of every provider-run
+        web search, ``config.WEB_SEARCH_USD_PER_REQUEST``)."""
         p_in, p_out, p_cw, p_cr = app_config.get_model_pricing(model, self.provider_name)
         return (
             usage.input_tokens * p_in / 1_000_000
             + usage.output_tokens * p_out / 1_000_000
             + usage.cache_write_tokens * p_cw / 1_000_000
             + usage.cache_read_tokens * p_cr / 1_000_000
+            + usage.web_search_requests * app_config.WEB_SEARCH_USD_PER_REQUEST
         )

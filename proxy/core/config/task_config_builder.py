@@ -289,6 +289,9 @@ async def build_task_agent_config(
     target_device_grants = await asyncio.to_thread(
         remote_store.get_target_device_grants, task_target_kind, task_target_value,
     )
+    target_browser = await asyncio.to_thread(
+        remote_store.get_target_browser_settings, task_target_kind, task_target_value,
+    )
     # Satellite path-policy fields for the SecurityContext — without them the
     # Pass-1 path gate treats every satellite-absolute path as outside the
     # synced tree and (with no home_dir and allow_full_fs=False) fail-closes
@@ -326,6 +329,7 @@ async def build_task_agent_config(
             target_has_display=target_has_display,
             target_device_grants=target_device_grants,
             target_admin_paired=(task_target_kind == "admin_remote"),
+            target_browser=target_browser,
         )
     )
 
@@ -495,6 +499,7 @@ async def build_task_agent_config(
         target_has_display=target_has_display,
         target_device_grants=target_device_grants,
         mount_shared=vis.mount_shared,
+        execution_path=execution_path or "",
     )
     agent_prompt = (agent_prompt or "") + build_permission_context(
         task_security,

@@ -612,6 +612,49 @@ def test_pin_reuses_existing_file_after_hard_unpin(agent_tree):
     assert row is not None and row["hidden"] is False
 
 
+def test_htmlless_pin_reads_the_file_through_from_the_satellite(agent_tree):
+    """2026-09-05: a slug-only re-pin from a REMOTE session pulls
+    apps/<slug>.html from the satellite first (its edit reaches the
+    platform tree only at the turn boundary), so the served bytes and the
+    file_updated refresh carry the current version. A pin WITH html never
+    pulls."""
+    from pathlib import Path
+    from unittest.mock import AsyncMock, MagicMock
+
+    from core.remote import remote_file_flow
+
+    _pin({"slug": "brief", "html": "<p>v1</p>"})
+    saved = agent_tree / "users/alice/workspace/apps/brief.html"
+    assert saved.read_text() == "<p>v1</p>"
+
+    class _Info:
+        machine_id = "m-1"
+        agent_name = AGENT
+
+    pulls: list[str] = []
+
+    async def _pull(machine_id, ref, dest_path, *, agent_slug="", timeout=180.0):
+        pulls.append(ref.value)
+        Path(dest_path).write_text("<p>v2 edited on the satellite</p>")
+        return True
+
+    cm = MagicMock()
+    cm.satellite_supports_file_stat.return_value = False
+    cm.pull_file_to_path = AsyncMock(side_effect=_pull)
+    cm.get_connected_machines.return_value = []
+    with patch.object(remote_file_flow, "_get_remote_session_info", return_value=_Info()), \
+            patch("core.remote.satellite_connection.get_connection_manager", return_value=cm):
+        r = _pin({"slug": "brief"})
+        assert r.status_code == 200, r.text
+        assert pulls == ["users/alice/workspace/apps/brief.html"]
+        assert saved.read_text() == "<p>v2 edited on the satellite</p>"
+        # html in the call is authoritative: no pull, the file is rewritten.
+        r = _pin({"slug": "brief", "html": "<p>v3</p>"})
+        assert r.status_code == 200, r.text
+        assert pulls == ["users/alice/workspace/apps/brief.html"]
+        assert saved.read_text() == "<p>v3</p>"
+
+
 def test_soft_unpin_frees_a_cap_slot_and_bounds_hidden_rows(agent_tree, monkeypatch):
     """The pin cap counts VISIBLE rows (its "unpin one first" advice must
     free a slot now that the X hides) and the parked hidden set has its own

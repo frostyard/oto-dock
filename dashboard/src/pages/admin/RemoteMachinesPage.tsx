@@ -14,6 +14,9 @@ import { hasAgentScope, modeOfAgent } from '../../lib/visibility'
 import { cliChipInfo } from '../../lib/cliChip'
 import RemoteBadge from '../../components/RemoteBadge'
 import PairInstallCommand from '../../components/PairInstallCommand'
+import {
+  BrowserModeSelect, BrowserTokenField, browserModeDesc, browserModeOf,
+} from '../../components/BrowserModeControls'
 
 // Per-satellite live stats from /v1/admin/concurrency-stats (5s poll), the same
 // shape PlatformPage consumes. Only the per-machine `satellites[]` slice is used
@@ -286,22 +289,33 @@ function MachineDeviceGrantsControls({ machine }: { machine: RemoteMachine }) {
         </p>
       )}
       <div className="flex flex-col gap-1">
-        {DEVICE_CAPABILITY_INFO.map(cap => (
-          <label
-            key={cap.key}
-            className="inline-flex items-center gap-1.5 text-xs text-p-text cursor-pointer"
-          >
-            <input
-              type="checkbox"
-              checked={granted.has(cap.key)}
-              disabled={setDeviceGrants.isPending}
-              onChange={e => toggle(cap.key, cap.label, e.target.checked)}
-              className="rounded-sm"
-            />
-            <span className="font-medium">{cap.label}</span>
-            <span className="text-p-text-light">— {cap.desc}</span>
-          </label>
-        ))}
+        {DEVICE_CAPABILITY_INFO.map(cap => {
+          const on = granted.has(cap.key)
+          const isBrowser = cap.key === 'browser'
+          // The Browser-control row carries its mode selector while granted,
+          // and its description follows the selected mode.
+          const desc = isBrowser && on ? browserModeDesc(browserModeOf(machine)) : cap.desc
+          return (
+            <div key={cap.key} className="flex flex-col">
+              <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-p-text">
+                <label className="inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap">
+                  <input
+                    type="checkbox"
+                    checked={on}
+                    disabled={setDeviceGrants.isPending}
+                    onChange={e => toggle(cap.key, cap.label, e.target.checked)}
+                    className="rounded-sm"
+                  />
+                  <span className="font-medium">{cap.label}</span>
+                </label>
+                {isBrowser && on && <BrowserModeSelect machine={machine} scope="admin" />}
+                <span className="text-p-text-light">— {desc}</span>
+              </div>
+              {/* Own mode's token block belongs to this row, not to the list. */}
+              {isBrowser && on && <BrowserTokenField machine={machine} scope="admin" />}
+            </div>
+          )
+        })}
       </div>
     </div>
   )

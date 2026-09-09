@@ -65,7 +65,14 @@ The `otodock-phone` service ships as a compose overlay
   SID + auth token, calls enter via the public dashboard URL, no extra ports; or
   **FreePBX/Asterisk**: one-time dialplan bootstrap, PBX must reach TCP 9092/9093),
   click **Verify**, then create **routes** (agent + language + number, optional
-  greeting, PIN access code, per-route call log via the clock icon).
+  greeting, PIN access code, per-route call log via the clock icon). Each route
+  sets a **Caller identity**: **Per caller** (default; every phone number gets its
+  own private files and memory; callers read the agent's shared folders as
+  viewers and change nothing; a **Remember callers** toggle; callers never get
+  platform tools or a shell) or **A platform user** (the call runs as that user's own
+  session, capped at manager; require a PIN on an inbound line). Caller files,
+  phone conversations and the call log age out together under **Setup → Phone →
+  Caller Data** (90 days by default; **Forget all caller data now** is permanent).
 - Wake word ("Hey OtoDock") is per-user opt-in: **User Settings → General → Wake word**,
   off by default, on-device detection.
 
@@ -84,8 +91,13 @@ the same dashboard. Pairing is outbound-only (no open ports) and needs
   Configuration, admin only).
 - **Access levels** (changeable live on the machine card): Home-only (default) vs full
   filesystem; plus three separate **Device control** grants, all off by default —
-  computer control (mouse/keyboard/screen), browser control (a persistent, logged-in
-  local browser), app connectors.
+  computer control (mouse/keyboard/screen), browser control, app connectors. Browser
+  control has a **Browser mode**: **Dedicated profile** (default; a persistent,
+  logged-in browser profile per agent) or **My own browser** (the agent works in a
+  tab group inside the Chrome/Edge/Brave the machine's user is signed into, through
+  the Playwright Extension; paste the extension's token on the card so unattended
+  sessions such as tasks connect without a click). Only the machine's owner can
+  switch a user-paired machine to its own browser.
 - Files sync **both ways** automatically; generated build directories are auto-skipped;
   conflicts and deletes land in the workspace **Recover bin** (7 days). Machine cards
   show live status, sessions/capacity, and the CLI versions the machine runs

@@ -4,7 +4,7 @@ import type { ThreadGoal } from './useDashboardWs.types'
 import { useChatStore } from '@/store/chatStore'
 import { getDeviceLocation } from '../lib/geolocation'
 import type { DisplayMessage, MessageBlock } from '../components/chat/types'
-import { dbMessagesToDisplay, eventToBlock } from '../lib/messageBlocks'
+import { dbMessagesToDisplay, eventToBlock, costBilledOf, latestCostBilled } from '../lib/messageBlocks'
 import type { ActiveAgent } from '../components/chat/ChatStatusBar'
 import type { WorkflowLive } from '../components/chat/plan/WorkflowPanel'
 import type { SessionPlan } from '../components/chat/plan/PlanPanel'
@@ -69,7 +69,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     messages, setMessages, currentMsgRef,
     rawRowsRef, oldestLoadedIdRef, loadingOlderRef,
     hasMoreOlder, loadingOlder, setHasMoreOlder, setLoadingOlder,
-    appendBlock, seedDbHistory, loadOlder, removeMediaProcessing,
+    appendBlock, seedDbHistory: seedDbRows, loadOlder, removeMediaProcessing,
     appendToLastTextBlock, updateToolBlock, updateToolBlockByName,
     resolvePermission, updateSubagentActive, updateCommandActive,
     ensureAssistantMsg, removePreviewBlocks,
@@ -142,6 +142,22 @@ export function useChatStream(options: UseChatStreamOptions) {
   const messagesRef = useRef<DisplayMessage[]>([])
   useEffect(() => { messagesRef.current = messages }, [messages])
   const [totalCost, setTotalCost] = useState(0)
+  // Whether the cost gauge shows: the newest turn's credential kind (an API
+  // key / the relay bill real money; a subscription or a local model only
+  // estimates activity). totalCost keeps accumulating either way.
+  const [costBilled, setCostBilled] = useState(true)
+  // A per-tool MCP fee (image/video generation) is money whatever the LLM
+  // runs on: once one lands in this view the gauge stays visible for the
+  // rest of it, even across later subscription turns. Not persisted per
+  // turn, so a reload falls back to the newest turn's flag (Usage keeps it).
+  const toolFeeRef = useRef(false)
+  // Every DB history seed (the interactive rich-view toggle, the persisted-
+  // rows nudge) re-derives the flag from the newest row, like onChatHistory.
+  const seedDbHistory = useCallback((rows: any[], hasMore: boolean) => {
+    seedDbRows(rows, hasMore)
+    toolFeeRef.current = false
+    setCostBilled(latestCostBilled(rows))
+  }, [seedDbRows])
   const [contextUsed, setContextUsed] = useState(0)
   const [contextMax, setContextMax] = useState(0)
   const [cacheStats, setCacheStats] = useState({ cacheRead: 0, cacheWrite: 0, inputTokens: 0, outputTokens: 0 })
@@ -407,8 +423,11 @@ export function useChatStream(options: UseChatStreamOptions) {
         })
         return fresh.length > 0 ? [...displayMsgs, ...fresh] : displayMsgs
       })
-      // Restore total cost from DB
+      // Restore total cost from DB; the gauge follows the newest turn's flag
+      // (reset on every load — a chat switch must not inherit the last one's)
       if (data.total_cost) setTotalCost(data.total_cost)
+      toolFeeRef.current = false
+      setCostBilled(latestCostBilled(dbMessages))
       if (data.context_used) setContextUsed(data.context_used)
       if (data.context_max) setContextMax(data.context_max)
       if (data.cache_write) setCacheStats({
@@ -1076,7 +1095,14 @@ export function useChatStream(options: UseChatStreamOptions) {
     onMcpCost: (data) => {
       if (discardingRef.current) return
       const cost = data.cost_usd ?? 0
-      if (cost > 0) setTotalCost(prev => prev + cost)
+      if (cost > 0) {
+        setTotalCost(prev => prev + cost)
+        // Real money (the frame says cost_billed: true) — show the gauge.
+        if (data.cost_billed !== false) {
+          toolFeeRef.current = true
+          setCostBilled(true)
+        }
+      }
     },
     onImageGenFailed: () => {
       if (discardingRef.current) return
@@ -1189,8 +1215,10 @@ export function useChatStream(options: UseChatStreamOptions) {
       if (discardingRef.current) return
       ensureAssistantMsg()
       const cost = data.cost_usd ?? 0
-      appendBlock({ type: 'metadata', costUsd: cost, durationMs: data.duration_ms ?? data.duration_api_ms ?? 0 })
+      const billed = costBilledOf(data)
+      appendBlock({ type: 'metadata', costUsd: cost, durationMs: data.duration_ms ?? data.duration_api_ms ?? 0, costBilled: billed })
       if (cost > 0) setTotalCost((prev) => prev + cost)
+      setCostBilled(billed !== false || toolFeeRef.current)
       if (data.context_used && data.context_max) {
         setContextUsed(data.context_used)
         setContextMax(data.context_max)
@@ -2150,6 +2178,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     compressingActive, setCompressingActive,
     activeAgents,
     totalCost, setTotalCost,
+    costBilled,
     contextUsed, setContextUsed,
     contextMax, setContextMax,
     cacheStats,

@@ -8,6 +8,7 @@ still lands. Route deletion NULLs the FK but keeps the name snapshot.
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -164,9 +165,67 @@ class TestReadApi:
         assert "pin" not in {k for k in row if k != "pin_attempts"}
 
 
+class TestAuditTrail:
+    """The daemon names the warmed session; the proxy joins the identity label
+    stamped at warmup and the distinct tools the session's chat ran."""
+
+    @staticmethod
+    def _phone_chat(agent="personal-assistant", *, source_type="phone",
+                    tools=("mcp__memory-mcp__memory", "Read", "mcp__memory-mcp__memory")):
+        from storage import database as task_store
+        chat_id, sid = str(uuid.uuid4()), str(uuid.uuid4())
+        task_store.create_chat(chat_id, "phone", agent, "auto", source_type=source_type)
+        task_store.update_chat(chat_id, session_id=sid)
+        for name in tools:
+            task_store.add_chat_message(
+                chat_id, "event", "", event_type="tool",
+                event_data=json.dumps({"type": "tool", "name": name, "tool_input": {}}),
+            )
+        task_store.add_chat_message(chat_id, "assistant", "spoken reply")
+        return sid
+
+    def test_identity_and_tools_join_on_the_session(self, client):
+        from services.phone.phone_identity import remember_call_identity
+        route = _make_route("inbound")
+        sid = self._phone_chat()
+        remember_call_identity(sid, "caller-pin:+302101234567")
+        _report(client, route_id=route["id"], session_id=sid)
+        row = client.get("/v1/admin/phone/call-log",
+                         params={"route_id": route["id"]}).json()["calls"][0]
+        assert row["session_id"] == sid
+        assert row["identity"] == "caller-pin:+302101234567"
+        assert row["tools_run"] == ["mcp__memory-mcp__memory", "Read"]   # distinct, in order
+        # Consumed once — a duplicate report carries no identity.
+        _report(client, route_id=route["id"], session_id=sid)
+        rows = client.get("/v1/admin/phone/call-log",
+                          params={"route_id": route["id"]}).json()["calls"]
+        assert sorted(r["identity"] for r in rows) == ["", "caller-pin:+302101234567"]
+
+    def test_only_a_phone_chat_of_the_agent_yields_tools(self, client):
+        route = _make_route("inbound")            # agent personal-assistant
+        dashboard = self._phone_chat(source_type="dashboard")
+        other_agent = self._phone_chat(agent="someone-else")
+        for sid in (dashboard, other_agent):
+            _report(client, route_id=route["id"], session_id=sid)
+        rows = client.get("/v1/admin/phone/call-log",
+                          params={"route_id": route["id"]}).json()["calls"]
+        assert {r["session_id"] for r in rows} == {dashboard, other_agent}
+        assert all(r["tools_run"] == [] for r in rows)
+
+    def test_junk_or_missing_session_id(self, client):
+        _report(client, session_id="not-a-uuid")
+        _report(client)
+        rows = client.get("/v1/admin/phone/call-log").json()["calls"]
+        assert all(r["session_id"] == "" and r["identity"] == "" and r["tools_run"] == []
+                   for r in rows)
+
+
 class TestRetentionAndCascade:
     def test_old_rows_pruned_on_insert(self, client, temp_db):
-        old = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
+        """The ingest prunes under the caller-data window (default 90 days);
+        a disabled window keeps everything."""
+        from storage import database as task_store
+        old = (datetime.now(timezone.utc) - timedelta(days=100)).isoformat()
         phone_call_log_store.insert_call({
             "direction": "inbound", "outcome": "completed", "started_at": old,
         })
@@ -174,6 +233,12 @@ class TestRetentionAndCascade:
         body = client.get("/v1/admin/phone/call-log").json()
         assert body["total"] == 1
         assert body["calls"][0]["started_at"] > old
+        task_store.set_platform_setting("external_retention_enabled", "0")
+        phone_call_log_store.insert_call({
+            "direction": "inbound", "outcome": "completed", "started_at": old,
+        })
+        _report(client)
+        assert client.get("/v1/admin/phone/call-log").json()["total"] == 3
 
     def test_route_delete_nulls_fk_keeps_name(self, client, temp_db):
         route = _make_route("inbound", name="Ephemeral")

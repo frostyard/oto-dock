@@ -149,11 +149,15 @@ _DISALLOWED_BUILTIN_TOOLS = [
 ]
 
 
-def _build_sandbox_cli_settings(sandbox_claude_dir: str) -> dict:
+def _build_sandbox_cli_settings(
+    sandbox_claude_dir: str, *, extra_deny: tuple[str, ...] = (),
+) -> dict:
     """Build settings.json with sandbox-internal paths.
 
     sandbox_claude_dir is the sandbox-internal .claude/ path,
-    e.g. /users/alice/.claude or /workspace/.claude.
+    e.g. /users/alice/.claude, /caller/.claude or /workspace/.claude.
+    ``extra_deny`` adds session-specific tool denials (the no-shell rule of
+    external sessions) to the platform-wide list.
 
     The "sandbox" block disables Claude Code's own bwrap layer:
     the platform already wraps the CLI in a bwrap of its own (see
@@ -200,7 +204,7 @@ def _build_sandbox_cli_settings(sandbox_claude_dir: str) -> dict:
         # skills index (pre-impl checklist item 1, plan §checklist).
         "enabledPlugins": {},
         "permissions": {
-            "deny": list(_DISALLOWED_BUILTIN_TOOLS),
+            "deny": list(_DISALLOWED_BUILTIN_TOOLS) + list(extra_deny),
         },
         "hooks": {
             "PreToolUse": [{
@@ -244,24 +248,50 @@ def _build_sandbox_cli_settings(sandbox_claude_dir: str) -> dict:
     }
 
 
+def _verified_external_dir(agent_name: str, external_home, sub: str) -> Path:
+    """``<external_home>/<sub>`` for an external caller's tree, refusing
+    symlinked components (the same invariant as ``_verified_session_dir``)
+    and any home that is not a plain directory under this agent's tree."""
+    root_real = Path(os.path.realpath(app_config.get_agent_dir(agent_name)))
+    home = Path(external_home)
+    if os.path.realpath(home) != str(home) or not home.is_relative_to(root_real):
+        raise RuntimeError(
+            f"Refusing external session dir under {home}: not a plain "
+            "directory under the agent tree (possible tampering)"
+        )
+    return _verified_session_dir(agent_name, *home.relative_to(root_real).parts, sub)
+
+
 def ensure_persistent_claude_dir(
     agent_name: str,
     *,
     username: str = "",
     scope: str = "user",
+    external_home=None,
+    no_shell: bool = False,
 ) -> Path:
     """Create/update the persistent .claude/ dir for a session.
 
     Determines host path based on scope:
     - User session: agents/{agent}/users/{username}/.claude/
     - Agent-scoped task: agents/{agent}/workspace/.claude/
+    - External caller with a private tree (``external_home``):
+      agents/{agent}/externals/<channel>/<caller>/.claude/ (mounted at
+      /caller/.claude)
+
+    ``no_shell`` adds the external-session tool denials (Bash / Monitor /
+    PowerShell — ``auth/path_policy.EXTERNAL_DENIED_CLI_TOOLS``) to the
+    settings.json deny list — one of the three layers of that rule (the
+    permission hook floors it and the CLI argv disallows it too).
 
     Writes/overwrites settings.json and hook scripts. Plans and session
     data that Claude CLI creates are left untouched (persistent).
 
     Returns the host path to the .claude/ directory.
     """
-    if username and scope == "user":
+    if external_home:
+        claude_dir = _verified_external_dir(agent_name, external_home, ".claude")
+    elif username and scope == "user":
         claude_dir = _verified_session_dir(
             agent_name, "users", username, ".claude")
     else:
@@ -288,11 +318,18 @@ def ensure_persistent_claude_dir(
                 shutil.rmtree(mem_dir, ignore_errors=True)
 
     # Write settings.json (hooks config) — always sandbox-internal paths
-    if username and scope == "user":
+    if external_home:
+        from core.session.external_identity import SANDBOX_HOME
+        sandbox_claude_dir = f"{SANDBOX_HOME}/.claude"
+    elif username and scope == "user":
         sandbox_claude_dir = f"/users/{username}/.claude"
     else:
         sandbox_claude_dir = "/workspace/.claude"
-    settings = _build_sandbox_cli_settings(sandbox_claude_dir)
+    extra_deny: tuple[str, ...] = ()
+    if no_shell:
+        from auth.path_policy import EXTERNAL_DENIED_CLI_TOOLS
+        extra_deny = EXTERNAL_DENIED_CLI_TOOLS
+    settings = _build_sandbox_cli_settings(sandbox_claude_dir, extra_deny=extra_deny)
 
     _write_no_follow(claude_dir / "settings.json",
                      (json.dumps(settings, indent=2) + "\n").encode())
@@ -333,22 +370,29 @@ def ensure_persistent_codex_dir(
     *,
     username: str = "",
     scope: str = "user",
+    external_home=None,
 ) -> Path:
     """Create/update the persistent .codex/ dir for a Codex CLI session.
 
-    Same scoping as ensure_persistent_claude_dir but writes Codex-format
-    hooks.json instead of Claude-format settings.json.
+    Same scoping as ensure_persistent_claude_dir (incl. the external
+    caller's tree) but writes Codex-format hooks.json instead of
+    Claude-format settings.json.
 
     Returns the host path to the .codex/ directory.
     """
-    if username and scope == "user":
+    if external_home:
+        codex_dir = _verified_external_dir(agent_name, external_home, ".codex")
+    elif username and scope == "user":
         codex_dir = _verified_session_dir(
             agent_name, "users", username, ".codex")
     else:
         codex_dir = _verified_session_dir(agent_name, "workspace", ".codex")
 
     # Write hooks.json (Codex hook format) — always sandbox-internal paths
-    if username and scope == "user":
+    if external_home:
+        from core.session.external_identity import SANDBOX_HOME
+        sandbox_codex_dir = f"{SANDBOX_HOME}/.codex"
+    elif username and scope == "user":
         sandbox_codex_dir = f"/users/{username}/.codex"
     else:
         sandbox_codex_dir = "/workspace/.codex"
@@ -390,6 +434,8 @@ def ensure_persistent_agent_dir(
     execution_path: str,
     username: str = "",
     scope: str = "user",
+    external_home=None,
+    no_shell: bool = False,
 ) -> Path:
     """The persistent CLI config dir for a session, by execution layer:
     ``.codex/`` for Codex, ``.claude/`` for Claude CLI (and the harmless default
@@ -402,9 +448,16 @@ def ensure_persistent_agent_dir(
     against a missing ``.codex`` config and hung / crashed at init (an
     interactive-task bug — a builder that forgot the codex branch).
     """
+    # The external kwargs are forwarded only when set — the per-layer
+    # helpers keep their historical signature for every ordinary session.
+    extra: dict = {}
+    if external_home:
+        extra["external_home"] = external_home
     if execution_path == "codex-cli":
-        return ensure_persistent_codex_dir(agent_name, username=username, scope=scope)
-    return ensure_persistent_claude_dir(agent_name, username=username, scope=scope)
+        return ensure_persistent_codex_dir(agent_name, username=username, scope=scope, **extra)
+    if no_shell:
+        extra["no_shell"] = True
+    return ensure_persistent_claude_dir(agent_name, username=username, scope=scope, **extra)
 
 
 def _build_codex_hooks(config_dir: str) -> dict:
@@ -418,9 +471,11 @@ def _build_codex_hooks(config_dir: str) -> dict:
     ``tool_input``) and accepts the SAME ``hookSpecificOutput`` deny output, so
     the provider-agnostic ``permission_gate.py`` / ``tool_result_forwarder.py``
     scripts run unchanged — one ``decide_tool_permission`` authority for every
-    surface. Effective only for INTERACTIVE Codex sessions, which set
-    ``[features] hooks = true`` + spawn with ``--dangerously-bypass-hook-trust``;
-    the app-server leaves the feature off and gates via its JSON-RPC approval
+    surface. Runs for INTERACTIVE Codex sessions (``[features] hooks = true``
+    + ``--dangerously-bypass-hook-trust``) and for UNATTENDED app-server
+    sessions (task / phone / meeting / trigger — trusted per thread via
+    ``thread/start.config``; ``core/layers/codex/session.py``); dashboard
+    app-server chats leave it dormant and gate via the JSON-RPC approval
     bridge (enabling both would double-gate). Empty matcher = all tools.
     """
     gate = f"{config_dir}/permission_gate.py"

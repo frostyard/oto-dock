@@ -57,7 +57,10 @@ async def test_usage_phase_updates_gauge_and_chat_row_without_a_chip(temp_db):
         # Gauge state, not history: no turn block for the usage phase.
         assert pump._turn_blocks == []
         assert pump._context_used == 8123 and pump._context_max == 258400
-        # Persisted immediately — a reopened chat shows the compacted size.
+        # Persisted (off-loop, in turn order) — a reopened chat shows the
+        # compacted size.
+        from core.events import chat_writer
+        assert await chat_writer.drain("cg1", timeout=5)
         assert task_store.get_chat("cg1")["context_used"] == 8123
     finally:
         pump.producer.cancel()

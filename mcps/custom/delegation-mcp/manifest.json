@@ -2,7 +2,7 @@
   "name": "delegation-mcp",
   "label": "Delegation",
   "description": "Delegate work to parallel agent sessions and monitor them",
-  "version": "1.2.2",
+  "version": "1.2.4",
   "category": "core",
 
   "server": {
@@ -55,7 +55,7 @@
     "PROXY_TASK_SCOPE": "${session.task_scope}"
   },
 
-  "exclude_from": [],
+  "exclude_from": ["external"],
 
   "skills": [
     {
@@ -63,6 +63,13 @@
       "loading": "always",
       "file": "skills/delegation.md",
       "description": "Delegating work to parallel sessions, choosing chat vs task surface, monitoring lanes, project orchestration",
+      "default_exclude_from": []
+    },
+    {
+      "id": "delegation-guide",
+      "loading": "on_demand",
+      "file": "skills/delegation-guide/SKILL.md",
+      "description": "Reference for the delegation tools — the delegate signature and surfaces, callbacks, monitoring with list_sessions/peek_session, project mode with the board file and staged flow, send_files, reading other agents' sessions. Use before delegating work or running a multi-lane project.",
       "default_exclude_from": []
     }
   ],

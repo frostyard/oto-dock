@@ -98,6 +98,24 @@ function browserCandidates() {
   ];
 }
 
+// System Firefox candidates — only a SIGNAL that the user's browser is
+// Firefox: the dedicated mode then drives Playwright's own Firefox build
+// (downloaded on first use), never the system Firefox itself.
+function firefoxCandidates() {
+  const plat = process.platform;
+  if (plat === "win32") {
+    const pf = process.env["ProgramFiles"] || "C:\\Program Files";
+    const pf86 = process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)";
+    return [`${pf}\\Mozilla Firefox\\firefox.exe`, `${pf86}\\Mozilla Firefox\\firefox.exe`];
+  }
+  if (plat === "darwin") return ["/Applications/Firefox.app/Contents/MacOS/firefox"];
+  return ["/usr/bin/firefox", "/usr/bin/firefox-esr", "/snap/bin/firefox", "/usr/lib/firefox/firefox"];
+}
+
+function detectSystemFirefox() {
+  return firefoxCandidates().find((p) => p && fs.existsSync(p)) || null;
+}
+
 // Auto-detect an installed, drivable browser on THIS machine (a fleet may have
 // Chrome on one box, Edge or Brave on another — so the choice belongs per-machine,
 // not in a single admin config). Returns the Playwright channel for system
@@ -382,19 +400,13 @@ function seedProfileDisplayName(profileDir, agentSlug) {
   }
 }
 
-// Launch the browser daemon with its parent chain BROKEN: the session teardown
+// Launch a browser with its parent chain BROKEN: the session teardown
 // snapshots the MCP's live descendant tree and kills it, so a plain detached
 // child (still ppid-linked to this wrapper) would die with the session. An
 // intermediary shell that exits immediately leaves the browser unreachable
-// from any session's process tree.
-function launchDetachedBrowser(exePath, profileDir) {
-  const args = [
-    `--user-data-dir=${profileDir}`,
-    "--remote-debugging-port=0",
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--restore-last-session",
-  ];
+// from any session's process tree. Used for the dedicated-profile daemon and,
+// in own-browser mode, to start the user's browser when it is not running.
+function launchDetachedBrowser(exePath, args) {
   if (process.platform === "win32") {
     // `start ""` detaches; cmd exits at once. Quote args for cmd.
     const quoted = args.map((a) => `"${a}"`).join(" ");
@@ -425,7 +437,13 @@ async function ensureBrowserDaemon(profileDir, exePath, agentSlug) {
   reapOrphanedBrowser(profileDir);
   if (profileLooksLocked(profileDir)) return null;
   seedProfileDisplayName(profileDir, agentSlug);
-  launchDetachedBrowser(exePath, profileDir);
+  launchDetachedBrowser(exePath, [
+    `--user-data-dir=${profileDir}`,
+    "--remote-debugging-port=0",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--restore-last-session",
+  ]);
   for (let i = 0; i < 60; i++) {
     await new Promise((f) => setTimeout(f, 250));
     endpoint = await liveCdpEndpoint(profileDir);
@@ -558,7 +576,10 @@ function buildToolTextResponse(id, text) {
 // found by path is driven via the chromium engine + executablePath (@playwright/mcp
 // accepts `chromium`; executablePath overrides the binary, so no download).
 // `executablePath` (when known) is what lets the CDP daemon launch the browser.
-function resolveBrowserConfig(explicit, detected, channelExe) {
+// No Chromium browser but a system Firefox → Playwright's Firefox build
+// (`firefoxFallback`, downloaded on the first browser call); nothing at all
+// keeps the "install Chrome or Edge" hint rather than a silent download.
+function resolveBrowserConfig(explicit, detected, channelExe, systemFirefox) {
   const e = String(explicit || "").trim().toLowerCase();
   if (e && e !== "auto") {
     // honor an explicit channel/engine; resolve its exe for the daemon when we can
@@ -569,6 +590,7 @@ function resolveBrowserConfig(explicit, detected, channelExe) {
     return { browser: detected.channel, executablePath: detected.executablePath };
   if (detected && detected.executablePath)
     return { browser: "chromium", executablePath: detected.executablePath };
+  if (systemFirefox) return { browser: "firefox", firefoxFallback: true };
   return { browser: "chrome" }; // last resort; the stderr hint fires if it's absent
 }
 
@@ -578,6 +600,139 @@ function isChromiumFamily(browser) {
   return ["chrome", "msedge", "chromium"].includes(String(browser || ""));
 }
 
+// --- Own-browser mode (Playwright Extension attach) ------------------------
+//
+// OTO_BROWSER_MODE=own — set by the proxy from the machine's per-machine
+// opt-in, never from MCP config — attaches to the browser the OS user is
+// signed into instead of the dedicated profile. @playwright/mcp's --extension
+// mode starts a loopback CDP relay on the first browser tool and opens
+// chrome-extension://<id>/connect.html in the user's RUNNING Chrome/Edge/Brave
+// (the executable is spawned with that URL; the process singleton hands it to
+// the default-profile instance), where the "Playwright Extension" gives the
+// session its own tab group. PLAYWRIGHT_MCP_EXTENSION_TOKEN (broker-delivered)
+// skips the Allow click. No profile dir, no daemon, no orphan sweep here.
+
+const EXTENSION_ID = "mmlmfjhmonkocbjadbfplnigmagldckm";
+const EXTENSION_INSTALL_URL =
+  `https://chromewebstore.google.com/detail/playwright-extension/${EXTENSION_ID}`;
+
+// Upstream adds --no-sandbox to the connect-page spawn for channel "chromium"
+// on Linux, so every Chromium-by-path browser (Brave, Vivaldi, Chromium) is
+// passed as "chrome" + its executable. The executable path also makes upstream
+// skip its default-profile extension pre-check (extensionLooksInstalled
+// replaces it as a hint). Null = own mode impossible on this machine.
+function extensionBrowserEnv(cfg) {
+  if (!cfg || !cfg.executablePath) return null;
+  if (cfg.browser === "msedge")
+    return { PLAYWRIGHT_MCP_BROWSER: "msedge", PLAYWRIGHT_MCP_EXECUTABLE_PATH: cfg.executablePath };
+  if (cfg.browser === "chrome" || cfg.browser === "chromium")
+    return { PLAYWRIGHT_MCP_BROWSER: "chrome", PLAYWRIGHT_MCP_EXECUTABLE_PATH: cfg.executablePath };
+  return null;
+}
+
+// The browser's DEFAULT user-data-dir: where its process singleton lives and
+// where it opens links — so where the extension must be installed and whose
+// lock says "the user's browser is running".
+function defaultUserDataDir(exePath, home, plat = process.platform, localAppData = process.env["LOCALAPPDATA"]) {
+  const exe = String(exePath || "").toLowerCase();
+  const kind = exe.includes("edge") ? "msedge"
+    : exe.includes("brave") ? "brave"
+    : exe.includes("vivaldi") ? "vivaldi"
+    : exe.includes("chromium") ? "chromium"
+    : "chrome";
+  const la = localAppData || path.join(home, "AppData", "Local");
+  const table = {
+    chrome: { linux: [".config", "google-chrome"], darwin: ["Library", "Application Support", "Google", "Chrome"], win32: [la, "Google", "Chrome", "User Data"] },
+    msedge: { linux: [".config", "microsoft-edge"], darwin: ["Library", "Application Support", "Microsoft Edge"], win32: [la, "Microsoft", "Edge", "User Data"] },
+    brave: { linux: [".config", "BraveSoftware", "Brave-Browser"], darwin: ["Library", "Application Support", "BraveSoftware", "Brave-Browser"], win32: [la, "BraveSoftware", "Brave-Browser", "User Data"] },
+    vivaldi: { linux: [".config", "vivaldi"], darwin: ["Library", "Application Support", "Vivaldi"], win32: [la, "Vivaldi", "User Data"] },
+    chromium: { linux: [".config", "chromium"], darwin: ["Library", "Application Support", "Chromium"], win32: [la, "Chromium", "User Data"] },
+  };
+  const parts = table[kind][plat] || table[kind].linux;
+  return plat === "win32" ? path.join(...parts) : path.join(home, ...parts);
+}
+
+// Mirror of upstream's isPlaywrightExtensionInstalled: the extension's dir or
+// its id in a profile's Preferences, across "Default" + "Profile N". A hint
+// only — Chrome opens links in its last-used profile, which may live elsewhere.
+function extensionLooksInstalled(userDataDir) {
+  let entries;
+  try {
+    entries = fs.readdirSync(userDataDir);
+  } catch (_) {
+    return false;
+  }
+  for (const entry of entries) {
+    if (entry !== "Default" && !entry.startsWith("Profile ")) continue;
+    const profile = path.join(userDataDir, entry);
+    if (fs.existsSync(path.join(profile, "Extensions", EXTENSION_ID))) return true;
+    try {
+      if (fs.readFileSync(path.join(profile, "Preferences"), "utf8").includes(`"${EXTENSION_ID}"`))
+        return true;
+    } catch (_) {
+      /* no preferences yet */
+    }
+  }
+  return false;
+}
+
+// The extension titles the session's tab group after the MCP client's name;
+// the CLI reports "claude-code"/"codex", so the copy forwarded to the inner
+// MCP carries the agent's display name instead.
+function rewriteClientName(initLine, name) {
+  try {
+    const msg = JSON.parse(initLine);
+    if (msg && msg.params && typeof msg.params === "object") {
+      msg.params.clientInfo = { ...(msg.params.clientInfo || {}), name };
+      return JSON.stringify(msg);
+    }
+  } catch (_) {
+    /* forward verbatim */
+  }
+  return initLine;
+}
+
+// A tool RESPONSE carrying an error: the text (result.isError content or a
+// JSON-RPC error message), else null.
+function toolErrorText(line) {
+  try {
+    const msg = JSON.parse(line);
+    if (msg && msg.result && msg.result.isError)
+      return (msg.result.content || []).map((c) => c.text || "").join("\n");
+    if (msg && msg.error) return String(msg.error.message || "error");
+  } catch (_) {
+    /* not a response */
+  }
+  return null;
+}
+
+// Upstream never recreates its browser after an out-of-band disconnect (the
+// user hit Disconnect on the extension page, closed every group tab, the
+// service worker restarted): every later tool fails with one of these until
+// the inner MCP restarts.
+const CLOSED_BROWSER_RE =
+  /Target page, context or browser has been closed|browser has been closed|Browser closed|Target closed|Extension not connected|Extension disconnected|WebSocket closed/i;
+function isClosedBrowserError(text) {
+  return CLOSED_BROWSER_RE.test(String(text || ""));
+}
+
+// With a token the extension connects unattended within a second or two; the
+// slack covers a cold browser start. Without one a human has to click Allow.
+function connectTimeoutMs(hasToken) {
+  return hasToken ? 45000 : 90000;
+}
+
+// Playwright's own Firefox build (the dedicated mode's browser when no
+// Chromium browser is installed): absent until `cli.js install-browser
+// firefox` has run once on this machine.
+function playwrightFirefoxPath() {
+  try {
+    return require("playwright-core").firefox.executablePath();
+  } catch (_) {
+    return null;
+  }
+}
+
 async function main() {
   const home = os.homedir();
   if (!home) {
@@ -585,6 +740,51 @@ async function main() {
       "[browser-control] Cannot determine the home directory; refusing to start.\n"
     );
     process.exit(1);
+  }
+
+  // Which installed browser to drive. OTO_BROWSER_CHANNEL (admin/user config,
+  // default "auto") is an explicit override; "auto" detects what's on THIS
+  // machine. A Chromium-family browser found by path is driven via executablePath.
+  const cfg = resolveBrowserConfig(
+    process.env.PLAYWRIGHT_MCP_BROWSER || process.env.OTO_BROWSER_CHANNEL,
+    detectBrowser(),
+    channelExecutable,
+    detectSystemFirefox()
+  );
+
+  const cli = resolveCliPath(__dirname);
+  if (!cli) {
+    process.stderr.write(
+      "[browser-control] @playwright/mcp is not installed " +
+        "(node_modules/@playwright/mcp/cli.js is missing). The platform installs it " +
+        "automatically; if you see this, the MCP install/sync did not finish.\n"
+    );
+    process.exit(1);
+  }
+
+  // Own-browser mode: the machine opted into the user's signed-in browser.
+  // Chrome/Edge/Brave only — anything else falls back to the dedicated
+  // profile with a note, so the session still has a browser.
+  if (process.env.OTO_BROWSER_MODE === "own") {
+    const extEnv = extensionBrowserEnv(cfg);
+    if (extEnv) {
+      process.env.PLAYWRIGHT_MCP_EXTENSION = "1";
+      process.env.PLAYWRIGHT_MCP_BROWSER = extEnv.PLAYWRIGHT_MCP_BROWSER;
+      process.env.PLAYWRIGHT_MCP_EXECUTABLE_PATH = extEnv.PLAYWRIGHT_MCP_EXECUTABLE_PATH;
+      delete process.env.PLAYWRIGHT_MCP_USER_DATA_DIR;
+      runExtensionSupervisor(cli, cfg, {
+        home,
+        hasToken: Boolean(process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN),
+        tokenExpected: process.env.OTO_BROWSER_TOKEN_EXPECTED === "1",
+        unattended: process.env.OTO_BROWSER_UNATTENDED === "1",
+        agentSlug: process.env.OTO_AGENT_NAME,
+      });
+      return;
+    }
+    process.stderr.write(
+      "[browser-control] Own-browser mode needs Google Chrome, Microsoft Edge or " +
+        "Brave on this machine; using the dedicated browser profile instead.\n"
+    );
   }
 
   const profileDir = computeProfileDir(home, process.env.OTO_AGENT_NAME);
@@ -597,14 +797,6 @@ async function main() {
     process.exit(1);
   }
 
-  // Which installed browser to drive. OTO_BROWSER_CHANNEL (admin/user config,
-  // default "auto") is an explicit override; "auto" detects what's on THIS
-  // machine. A Chromium-family browser found by path is driven via executablePath.
-  const cfg = resolveBrowserConfig(
-    process.env.PLAYWRIGHT_MCP_BROWSER || process.env.OTO_BROWSER_CHANNEL,
-    detectBrowser(),
-    channelExecutable
-  );
   if (!process.env.PLAYWRIGHT_MCP_BROWSER) {
     process.env.PLAYWRIGHT_MCP_BROWSER = cfg.browser;
     if (cfg.executablePath && !process.env.PLAYWRIGHT_MCP_EXECUTABLE_PATH) {
@@ -638,16 +830,6 @@ async function main() {
     process.env.PLAYWRIGHT_MCP_USER_DATA_DIR = profileDir;
   }
 
-  const cli = resolveCliPath(__dirname);
-  if (!cli) {
-    process.stderr.write(
-      "[browser-control] @playwright/mcp is not installed " +
-        "(node_modules/@playwright/mcp/cli.js is missing). The platform installs it " +
-        "automatically; if you see this, the MCP install/sync did not finish.\n"
-    );
-    process.exit(1);
-  }
-
   if (cdpMode) {
     runCdpSupervisor(cli, profileDir, cfg, cdpEndpoint);
     return;
@@ -662,6 +844,47 @@ async function main() {
     env: process.env,
   });
   wireStderrHints(child, profileDir);
+
+  // Firefox fallback: Playwright's build is fetched on the FIRST browser call
+  // (never at init — every session spawn would pay the download probe), the
+  // call answers with "retry in a minute", and calls during the download get
+  // the same answer. cli.js launches the browser lazily, so once the
+  // executable exists the next call simply forwards — no restart needed.
+  const firefox = { install: null, error: null };
+  const firefoxReady = () => {
+    const p = playwrightFirefoxPath();
+    return Boolean(p && fs.existsSync(p));
+  };
+  const firefoxGate = (line) => {
+    if (!cfg.firefoxFallback || firefoxReady()) return null;
+    const { id, method, isRequest } = peekRpc(line);
+    if (method !== "tools/call") return null;
+    if (firefox.error)
+      return isRequest ? buildErrorResponse(id,
+        `Playwright's Firefox could not be installed on this machine (${firefox.error}). ` +
+        "Install Google Chrome, Microsoft Edge or Brave, or set the Browser channel config."
+      ) : "";
+    if (!firefox.install) {
+      process.stderr.write(
+        "[browser-control] No Chrome/Edge/Brave on this machine — installing Playwright's " +
+          "Firefox build (one-time download).\n"
+      );
+      const inst = spawn(process.execPath, [cli, "install-browser", "firefox"], {
+        stdio: ["ignore", "ignore", "pipe"],
+        env: process.env,
+      });
+      inst.stderr.on("data", (c) => process.stderr.write(c));
+      inst.on("error", (e) => { firefox.error = e.message; });
+      inst.on("exit", (code) => {
+        if (code !== 0 && !firefoxReady()) firefox.error = `installer exit ${code}`;
+      });
+      firefox.install = inst;
+    }
+    return isRequest ? buildErrorResponse(id,
+      "Installing Playwright's Firefox build on this machine (one-time download, no " +
+      "Chrome/Edge/Brave installed) — retry the action in a minute."
+    ) : "";
+  };
 
   const listIds = new Set();
   const outLines = new LineSplitter();
@@ -690,6 +913,11 @@ async function main() {
         continue;
       }
       if (route.kind === "tools-list") listIds.add(route.id);
+      const gated = firefoxGate(route.line ?? line);
+      if (gated !== null) {
+        if (gated) process.stdout.write(gated + "\n");
+        continue;
+      }
       try {
         child.stdin.write((route.line ?? line) + "\n");
       } catch (_) {
@@ -1015,6 +1243,294 @@ function runCdpSupervisor(cli, profileDir, cfg, initialEndpoint) {
   else ensureIdleChild();
 }
 
+// --- Own-browser (extension) supervisor -------------------------------------
+//
+// One inner cli.js per session, spawned at init (upstream creates its backend
+// — relay + connect page — lazily on the first browser tool, so the handshake
+// never opens anything in the user's browser). What the supervisor adds:
+//   * the user's browser is never a CHILD of this session: when its default
+//     profile is not locked (no instance running) it is started through the
+//     intermediary shell before the first browser call, otherwise upstream's
+//     connect-page spawn would launch it under cli.js and the satellite's
+//     teardown tree-kill would take the user's browser down;
+//   * fast failures for the cases a wait cannot fix (no token in an
+//     unattended session; a token that was stored but not delivered);
+//   * a connect watchdog — upstream waits forever for the extension — that
+//     fails pending requests with the actual cause and resets the child;
+//   * restart-on-next-call after an out-of-band disconnect (dead backend);
+//   * one browser_close at session end so the agent's tab and group go away.
+function runExtensionSupervisor(cli, cfg, opts) {
+  const userDataDir = defaultUserDataDir(cfg.executablePath, opts.home);
+  const clientName = agentDisplayName(opts.agentSlug);
+  const browserName = path.basename(cfg.executablePath || "the browser");
+  const state = {
+    child: null,
+    initLine: null, // client's verbatim initialize request
+    initializedLine: null, // client's verbatim notifications/initialized
+    pending: new Set(), // request ids awaiting a child response
+    toolIds: new Set(), // pending ids that are browser tools/call
+    listIds: new Set(), // tools/list ids whose responses get studio tools appended
+    swallowReinit: false,
+    connected: false, // a browser tool succeeded since the child (re)spawned
+    needsRestart: false, // the child's browser is gone — respawn on the next call
+    watchdog: null,
+    watchdogId: void 0,
+    chain: Promise.resolve(),
+    shuttingDown: false,
+  };
+
+  function clearWatchdog() {
+    if (state.watchdog) clearTimeout(state.watchdog);
+    state.watchdog = null;
+    state.watchdogId = void 0;
+  }
+
+  function failPending(message) {
+    for (const id of state.pending) process.stdout.write(buildErrorResponse(id, message) + "\n");
+    state.pending.clear();
+    state.toolIds.clear();
+  }
+
+  function spawnChild() {
+    const child = spawn(process.execPath, [cli, "--extension"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: process.env,
+    });
+    const out = new LineSplitter();
+    child.stdout.on("data", (chunk) => {
+      if (state.child !== child) return; // a retired child's late output
+      for (let line of out.feed(chunk)) {
+        const { id } = peekRpc(line);
+        if (state.swallowReinit && id === REINIT_ID) {
+          state.swallowReinit = false;
+          continue;
+        }
+        if (id !== void 0) {
+          state.pending.delete(id);
+          if (id === state.watchdogId) clearWatchdog();
+          const err = toolErrorText(line);
+          if (state.toolIds.has(id)) {
+            state.toolIds.delete(id);
+            if (err === null) state.connected = true;
+            else if (isClosedBrowserError(err)) state.needsRestart = true;
+          }
+          if (state.listIds.has(id)) {
+            state.listIds.delete(id);
+            try {
+              line = JSON.stringify(studio.mergeToolsResult(JSON.parse(line), studio.toolDefinitions()));
+            } catch (_) {
+              /* pass the child's line through untouched */
+            }
+          }
+        }
+        process.stdout.write(line + "\n");
+      }
+    });
+    child.stderr.on("data", (chunk) => process.stderr.write(chunk));
+    const gone = () => {
+      if (state.child !== child) return;
+      state.child = null;
+      clearWatchdog();
+      failPending("The browser session ended — retry the action.");
+    };
+    child.on("exit", gone);
+    child.on("error", gone);
+    state.child = child;
+    state.connected = false;
+    state.needsRestart = false;
+    if (state.initLine) {
+      state.swallowReinit = true;
+      child.stdin.write(rewriteInitId(rewriteClientName(state.initLine, clientName)) + "\n");
+      if (state.initializedLine) child.stdin.write(state.initializedLine + "\n");
+    }
+    return child;
+  }
+
+  function restart(message) {
+    const old = state.child;
+    state.child = null;
+    if (old) {
+      try {
+        old.kill();
+      } catch (_) {
+        /* already gone */
+      }
+    }
+    clearWatchdog();
+    failPending(message);
+  }
+
+  // Reasons no browser call can succeed in this session — answered at once,
+  // never forwarded (forwarding would open a connect page nobody can approve).
+  function permanentFailure() {
+    if (opts.tokenExpected && !opts.hasToken)
+      return (
+        "The saved browser extension token could not be fetched for this session — " +
+        "start a new chat (or re-run the task); if it persists, clear and re-save the " +
+        "token in the machine's settings."
+      );
+    if (opts.unattended && !opts.hasToken)
+      return (
+        "This unattended session (task, call or meeting) cannot click Allow in the " +
+        "user's browser. Save the Playwright Extension token in the machine's settings " +
+        "(Remote machines → Use my own browser) so sessions connect without asking."
+      );
+    return null;
+  }
+
+  function installHint() {
+    return extensionLooksInstalled(userDataDir)
+      ? ""
+      : ` The extension does not look installed in ${userDataDir} — install it from ${EXTENSION_INSTALL_URL}.`;
+  }
+
+  function connectTimeoutMessage() {
+    if (opts.hasToken)
+      return (
+        `The Playwright Extension did not connect within ${connectTimeoutMs(true) / 1000} s. ` +
+        `Make sure it is installed in ${browserName} on this machine and that the token saved ` +
+        "in the machine's settings is current (regenerate it on the extension's page — its " +
+        "toolbar icon — and save it again)." + installHint()
+      );
+    return (
+      `Nobody approved the connection in the browser within ${connectTimeoutMs(false) / 1000} s. ` +
+      'The user must click "Allow" on the Playwright Extension page that opened in their ' +
+      "browser — or save the extension token in the machine's settings so sessions " +
+      "connect without asking." + installHint()
+    );
+  }
+
+  function armWatchdog(id) {
+    if (state.connected || state.watchdog) return;
+    state.watchdogId = id;
+    state.watchdog = setTimeout(() => {
+      state.watchdog = null;
+      restart(connectTimeoutMessage());
+    }, connectTimeoutMs(opts.hasToken));
+  }
+
+  // The user's browser must already be running before upstream spawns the
+  // connect page, or that spawn becomes the browser itself (a child of this
+  // session). Start it detached when its default profile is unlocked.
+  async function ensureUserBrowser() {
+    if (profileLooksLocked(userDataDir)) return;
+    process.stderr.write(
+      `[browser-control] ${browserName} is not running — starting it for the user.\n`
+    );
+    launchDetachedBrowser(cfg.executablePath, []);
+    for (let i = 0; i < 60 && !profileLooksLocked(userDataDir); i++)
+      await new Promise((f) => setTimeout(f, 250));
+  }
+
+  async function handleClientLine(line) {
+    if (state.shuttingDown) return;
+    const { id, method, toolName, isRequest } = peekRpc(line);
+    if (method === "initialize") {
+      state.initLine = line;
+      line = rewriteClientName(line, clientName);
+    } else if (method === "notifications/initialized") state.initializedLine = line;
+    if (method === "tools/call") {
+      const blocked = permanentFailure();
+      if (blocked) {
+        if (isRequest) process.stdout.write(buildErrorResponse(id, blocked) + "\n");
+        return;
+      }
+      // Closing an unconnected session would open the connect page just to
+      // close it — answer it here (mirrors the dedicated mode).
+      if (toolName === "browser_close" && !state.connected) {
+        if (isRequest)
+          process.stdout.write(
+            buildToolTextResponse(id, "Browser was not connected — nothing to close.") + "\n"
+          );
+        return;
+      }
+      if (!state.child || state.needsRestart)
+        restart("The browser connection was reset — retry the action.");
+      if (!state.child) spawnChild();
+      if (!state.connected) {
+        await ensureUserBrowser();
+        if (state.shuttingDown || !state.child) return;
+        if (isRequest) armWatchdog(id);
+      }
+      if (isRequest) state.toolIds.add(id);
+    } else if (!state.child) {
+      spawnChild();
+    }
+    if (isRequest) state.pending.add(id);
+    try {
+      state.child.stdin.write(line + "\n");
+    } catch (_) {
+      state.child = null; // EPIPE — recovered by the next request
+      if (isRequest) {
+        state.pending.delete(id);
+        state.toolIds.delete(id);
+        process.stdout.write(
+          buildErrorResponse(id, "The browser session restarted — retry the action.") + "\n"
+        );
+      }
+    }
+  }
+
+  // Session end: close the agent's tab + group cleanly (bounded), then exit.
+  const BYE_ID = "__otodock_browser_bye__";
+  function shutdown(signal) {
+    if (state.shuttingDown) return;
+    state.shuttingDown = true;
+    clearWatchdog();
+    const child = state.child;
+    const finish = () => {
+      if (child) {
+        try {
+          child.kill(signal);
+        } catch (_) {
+          /* already gone */
+        }
+      }
+      process.exit(0);
+    };
+    if (!child || !state.connected) return finish();
+    const timer = setTimeout(finish, 2000);
+    child.stdout.on("data", (chunk) => {
+      if (chunk.toString("utf8").includes(BYE_ID)) {
+        clearTimeout(timer);
+        finish();
+      }
+    });
+    child.on("exit", () => {
+      clearTimeout(timer);
+      finish();
+    });
+    try {
+      child.stdin.write(
+        JSON.stringify({ jsonrpc: "2.0", id: BYE_ID, method: "tools/call",
+          params: { name: "browser_close", arguments: {} } }) + "\n"
+      );
+    } catch (_) {
+      finish();
+    }
+  }
+
+  const stdinLines = new LineSplitter();
+  process.stdin.on("data", (chunk) => {
+    for (const line of stdinLines.feed(chunk)) {
+      const route = classifyClientLine(line, studio.ownsTool);
+      if (route.kind === "studio") {
+        studio.dispatch(route.id, route.params).then((resp) => {
+          process.stdout.write(JSON.stringify(resp) + "\n");
+        });
+        continue;
+      }
+      if (route.kind === "tools-list") state.listIds.add(route.id);
+      const fwd = route.line ?? line;
+      state.chain = state.chain.then(() => handleClientLine(fwd)).catch(() => {});
+    }
+  });
+  process.stdin.on("end", () => shutdown());
+  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => shutdown(sig));
+
+  spawnChild();
+}
+
 if (require.main === module) {
   main().catch((e) => {
     process.stderr.write(`[browser-control] Startup failed: ${e.message}\n`);
@@ -1029,5 +1545,9 @@ if (require.main === module) {
     LineSplitter, peekRpc, rewriteInitId, buildErrorResponse,
     buildToolTextResponse, REINIT_ID,
     classifyClientLine,
+    firefoxCandidates, detectSystemFirefox, playwrightFirefoxPath,
+    EXTENSION_ID, EXTENSION_INSTALL_URL, extensionBrowserEnv, defaultUserDataDir,
+    extensionLooksInstalled, rewriteClientName, toolErrorText,
+    isClosedBrowserError, connectTimeoutMs,
   };
 }

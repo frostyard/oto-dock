@@ -7,9 +7,13 @@ import { pushEscHandler } from '../../lib/escStack'
 
 interface Props {
   run: Run
+  /** The chat's gauge rule (see ChatStatusBar): false = the run's chat runs on
+   * a subscription or a local model, so its cost is an activity estimate and
+   * the Cost block is hidden like the gauge. Undefined = shown. */
+  costBilled?: boolean
 }
 
-export default function TaskMetadata({ run }: Props) {
+export default function TaskMetadata({ run, costBilled }: Props) {
   const [open, setOpen] = useState(false)
   const panelRef = useRef<HTMLDivElement>(null)
 
@@ -116,8 +120,9 @@ export default function TaskMetadata({ run }: Props) {
               </div>
             </div>
 
-            {/* Cost */}
-            {(run.cost_usd > 0 || (run.session_cost_usd && run.session_cost_usd > 0)) && (
+            {/* Cost — the same number as the gauge (chats.total_cost), so it
+                follows the same credential-kind rule. */}
+            {costBilled !== false && (run.cost_usd > 0 || (run.session_cost_usd && run.session_cost_usd > 0)) && (
               <div>
                 <p className="text-xs text-p-text-light uppercase">Cost</p>
                 {run.session_cost_usd && run.session_turn_count && run.session_turn_count > 1 ? (

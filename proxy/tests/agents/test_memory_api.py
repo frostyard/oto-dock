@@ -497,3 +497,30 @@ def test_clear_agent_memory_wipes_shared_scope_only(client):
 def test_clear_agent_memory_unknown_agent_404(client):
     r = client.post("/v1/internal/memory/clear-agent-memory/ghost", headers=_admin_cookie())
     assert r.status_code == 404
+
+
+def test_git_revert_path_cannot_leave_the_repo(client):
+    """Admin-only revert: a ``..`` path resolves outside the scope's repo and
+    is refused before git sees it."""
+    _seed_agent("acme")
+    r = client.post(
+        "/v1/internal/git/revert",
+        json={"agent": "acme", "scope": "knowledge", "commit": "deadbeef",
+              "path": "../config/agent.md"},
+        headers=_admin_cookie(),
+    )
+    assert r.status_code == 400
+    assert "escapes" in r.json()["detail"]
+
+
+def test_clear_all_unknown_or_traversal_agent_404(client):
+    """The optional ``agent`` filter is validated like every other agent
+    argument — a name that is not an agent (or would leave the agents tree)
+    never reaches the wipe."""
+    for agent in ("ghost", "../ghost"):
+        r = client.post(
+            "/v1/internal/memory/clear-all",
+            json={"scope": "agent", "agent": agent},
+            headers=_admin_cookie(),
+        )
+        assert r.status_code == 404, agent

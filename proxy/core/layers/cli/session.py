@@ -96,8 +96,12 @@ class PersistentSession:
         sandbox_builder=None,      # SandboxBuilder | None
         agent_name: str = "",      # needed for non-sandboxed per-agent CWD
         interactive: bool = False,  # run the native TUI (no -p)
+        disallowed_tools: list[str] | None = None,  # --disallowedTools (external sessions)
     ):
         self.session_id = session_id
+        # Built-in tools this session must never see (external routes: no
+        # shell — auth/path_policy.EXTERNAL_DENIED_CLI_TOOLS).
+        self.disallowed_tools = list(disallowed_tools or [])
         self.agent_prompt = agent_prompt
         self.mcp_config_path = mcp_config_path
         self.permission_mode = permission_mode
@@ -228,8 +232,8 @@ class PersistentSession:
         # unchanged to Anthropic.
         wire_effort = self.effort
         if wire_effort == "ultra":
-            # Platform "ultra" is Codex-only (gpt-5.6 Sol/Terra multi-agent
-            # orchestration). The `claude` CLI's --effort rejects it — clamp
+            # Platform "ultra" is Codex-only (gpt-5.6 Sol/Terra and GPT-6 Astra
+            # multi-agent orchestration). The `claude` CLI's --effort rejects it — clamp
             # to the ceiling. (Claude's own orchestration mode, "ultracode",
             # is a session setting, not an effort level — see config.py.)
             wire_effort = "max"
@@ -300,6 +304,9 @@ class PersistentSession:
                 # branches: there a real prompt could route to stdio, which
                 # the stream translator does not answer.
                 cmd.extend(["--permission-prompt-tool", "stdio"])
+
+        if self.disallowed_tools:
+            cmd.extend(["--disallowedTools", ",".join(self.disallowed_tools)])
 
         if self.mcp_config_path:
             if self.sandbox_builder:
@@ -1152,6 +1159,7 @@ async def get_or_create_persistent_session(
     credential_env: dict[str, str] | None = None,
     sandbox_builder=None,
     agent_name: str = "",
+    disallowed_tools: list[str] | None = None,
 ) -> PersistentSession:
     """Get an existing persistent session or create a new one.
 
@@ -1199,6 +1207,7 @@ async def get_or_create_persistent_session(
                     credential_env=credential_env,
                     sandbox_builder=sandbox_builder,
                     agent_name=agent_name,
+                    disallowed_tools=disallowed_tools,
                 )
                 _persistent_sessions[session_id] = session
             else:
@@ -1221,6 +1230,7 @@ async def get_or_create_persistent_session(
                 credential_env=credential_env,
                 sandbox_builder=sandbox_builder,
                 agent_name=agent_name,
+                disallowed_tools=disallowed_tools,
             )
             _persistent_sessions[session_id] = session
 

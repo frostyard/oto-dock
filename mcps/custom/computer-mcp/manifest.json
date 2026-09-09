@@ -3,7 +3,7 @@
   "server_name": "computer",
   "label": "Computer Control",
   "description": "Control this machine's screen, mouse, and keyboard (Anthropic computer-use action set). Each action returns a fresh screenshot so the agent can see the result.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "category": "custom",
 
   "server": {
@@ -25,7 +25,7 @@
   "placement": "satellite_only",
   "requires_display": true,
   "device_capability": "computer",
-  "exclude_from": [],
+  "exclude_from": ["external"],
 
   "system_requirements": {
     "debian": ["scrot", "xclip"],

@@ -20,6 +20,74 @@ logger = logging.getLogger("pipeline")
 class OutboundMixin:
     """Outbound opening/warmup, finalization, and the [QUESTION:] hold/answer cycle."""
 
+    async def _adopt_prewarmed_backend(self):
+        """Take over the connection that pre-warmed this call's session during
+        ringing — WAITING for the opening it may still be generating.
+
+        Returns the client to use as ``self.llm`` (None → create a fresh
+        backend). The pre-generation runs on the SAME proxy session the live
+        call continues on; sending the opening prompt again while it is still
+        in flight queues a duplicate prompt behind it (live-hit 2026-09-07: a
+        local model needed ~20 s for the first turn, the old 15 s wait fell
+        back, the model saw the task twice and hung up on its second answer).
+        So the wait is bounded only by ``opening_pregen_timeout_s`` and a
+        timeout CANCELS the pre-generation (its client closes; the fallback
+        turn then runs on a fresh session) instead of racing it. The line
+        stays SILENT while waiting — no thinking filler, no other
+        pre-recorded audio: the first thing the callee hears is the agent's
+        own opening (operator decision 2026-09-07 after a call that played
+        four fillers in a row).
+        """
+        call = self._call_manager.get_call(self._outbound_call_id) if self._call_manager else None
+        if call is None:
+            return None
+        if not call._opening_ready.is_set():
+            timeout = self.cfg.opening_pregen_timeout_s
+            t0 = time.monotonic()
+            if await self._wait_for_opening(call._opening_ready, timeout):
+                logger.info(
+                    f"[{self.conn.peer_addr}] Opening pre-gen finished after "
+                    f"{time.monotonic() - t0:.1f}s of waiting"
+                )
+            else:
+                logger.warning(
+                    f"[{self.conn.peer_addr}] Opening pre-gen still running after "
+                    f"{timeout:.0f}s — cancelling it, falling back to live LLM"
+                )
+                task = getattr(call, "pregen_task", None)
+                if task is not None and not task.done():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
+                call.opening_text = None
+                call.warmup_client = None
+                call._opening_ready.set()
+        pw_client = getattr(call, "warmup_client", None)
+        if pw_client is None:
+            return None
+        call.warmup_client = None  # pipeline takes ownership
+        if (getattr(pw_client, "_ws_connected", False)
+                and getattr(pw_client, "llm_mode", "proxy") == self.route.llm_mode):
+            logger.info(
+                f"[{self.conn.peer_addr}] Reusing pre-warmed connection "
+                f"(session={pw_client.session_id})"
+            )
+            return pw_client
+        with contextlib.suppress(Exception):
+            await pw_client.close()
+        return None
+
+    @staticmethod
+    async def _wait_for_opening(event: asyncio.Event, timeout: float) -> bool:
+        """Wait for ``event`` up to ``timeout`` seconds, silently (the callee
+        hears nothing before the agent's own opening). Returns True when the
+        event fired."""
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
     async def _send_outbound_opening(self) -> None:
         """Speak the opening line for an outbound call.
 
@@ -32,7 +100,9 @@ class OutboundMixin:
             logger.error(f"[{self.conn.peer_addr}] Outbound call not found: {self._outbound_call_id}")
             return
 
-        # Wait for pre-generation to finish (may still be running)
+        # The pre-generation was awaited (or cancelled) when the backend was
+        # adopted (_adopt_prewarmed_backend); this is only a guard for a
+        # caller that skipped that step.
         try:
             await asyncio.wait_for(call._opening_ready.wait(), timeout=15.0)
         except asyncio.TimeoutError:

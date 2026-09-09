@@ -31,6 +31,7 @@ from core.session.session_state import (
     _sessions, _save_sessions,
     get_permission_queue, get_subagent_registry, set_meeting_session_info,
     cleanup_meeting_session_info, cleanup_session_permission_state,
+    clear_meeting_turn_routed, note_meeting_turn_text,
 )
 # Config + per-turn prompt builders live in services.meetings.meeting_context; imported
 # here so existing call sites and tests (meeting_orchestrator.build_meeting_agent_config
@@ -109,6 +110,111 @@ def _tool_resets_tail(name: str) -> bool:
     ToolSearch only loads schemas (models legitimately run it between the
     report text and direct_to) — neither invalidates text written before it."""
     return "meetings-mcp__" not in name and name != "ToolSearch"
+
+
+class _TurnTracker:
+    """Per-turn bookkeeping shared by both turn runners.
+
+    Collects the relayable text, thinking and tool names, the routing signal
+    (``direct_to`` targets, ``end_meeting`` & co), the METADATA cost, and
+    decides which events reach the pump:
+
+    - METADATA and PLAN_MODE never do (cost is tracked per turn here; plan
+      mode is disabled in meetings).
+    - TEXT after a meeting tool's close event is dropped — the transcript
+      echo guard — EXCEPT after the MODERATOR's ``end_meeting`` when fewer
+      than ``_THIN_TURN_MAX_CHARS`` were written before it: that text IS the
+      summary (observed live 2026-09-09: a summary written after the call
+      was discarded and the meeting concluded with a one-line opener). The
+      close event of a tool is emitted at the next content block, so the
+      salvage decision lands right before the summary's first delta.
+    - The text length is mirrored into the meeting session info
+      (``note_meeting_turn_text``) so the hook's turn-end backstop
+      (api/hooks) can word its end_meeting reason from the same number.
+    """
+
+    def __init__(self, agent_slug: str, session_id: str, is_moderator: bool):
+        self.agent = agent_slug
+        self.session_id = session_id
+        self.is_moderator = is_moderator
+        self.text: list[str] = []
+        self.thinking: list[str] = []
+        self.tools: list[dict] = []
+        self.cost = 0.0
+        self.cost_is_delta = False
+        self.directed_to: list[str] | None = None
+        self.tools_called: set[str] = set()
+        self.tail_text = 0
+        self.chars = 0
+        self.meeting_tool_done = False
+        self.salvage = False
+
+    def observe(self, event: CommonEvent) -> bool:
+        """Account for one stream event; True when it should be forwarded."""
+        if event.type == METADATA:
+            # Cost only — meeting costs are tracked separately via
+            # meeting_turns, never forwarded to the pump.
+            cost = event.data.get("cost_usd", 0)
+            if cost > 0:
+                self.cost = cost
+                self.cost_is_delta = bool(event.data.get("cost_is_delta"))
+            return False
+        if event.type == PLAN_MODE:
+            return False
+        if event.type == TEXT:
+            if self.meeting_tool_done and not self.salvage:
+                return False
+            content = event.data.get("content", "")
+            self.text.append(content)
+            self.tail_text += len(content)
+            self.chars += len(content)
+            note_meeting_turn_text(self.session_id, self.chars)
+        elif event.type == THINKING:
+            txt = event.data.get("text", "") or event.data.get("content", "")
+            if txt:
+                self.thinking.append(txt)
+        elif event.type == TOOL_USE:
+            self.tools.append({"name": event.data.get("name", "")})
+        elif event.type == TOOL_INPUT:
+            tool_name = event.data.get("name", "")
+            if "meetings-mcp__direct_to" in tool_name:
+                ti = event.data.get("tool_input", {})
+                parsed = _parse_directed_agents(ti.get("agents"))
+                if parsed is not None:
+                    self.directed_to = parsed  # last usable direct_to wins
+            elif "meetings-mcp__end_meeting" in tool_name:
+                self.tools_called.add("end_meeting")
+            elif "meetings-mcp__propose_conclude" in tool_name:
+                self.tools_called.add("propose_conclude")
+            elif "meetings-mcp__leave_meeting" in tool_name:
+                self.tools_called.add("leave_meeting")
+        elif event.type == TOOL_RESULT:
+            # name FIRST: the stream's tool_id is a UUID, so matching it
+            # first left the suppression permanently off (transcript-echo
+            # junk after direct_to was displayed AND relayed).
+            name = event.data.get("name", "") or event.data.get("tool_id", "")
+            if "meetings-mcp__" in name:
+                if (self.is_moderator and name.endswith("end_meeting")
+                        and self.chars < _THIN_TURN_MAX_CHARS):
+                    self.salvage = True
+                self.meeting_tool_done = True
+            elif _tool_resets_tail(name):
+                self.tail_text = 0
+        return True
+
+    def result(self) -> TurnResult:
+        return TurnResult(
+            agent=self.agent,
+            events=[],  # already forwarded live
+            content="".join(self.text),
+            thinking="".join(self.thinking),
+            tools=self.tools,
+            cost=self.cost,
+            cost_is_delta=self.cost_is_delta,
+            directed_to=self.directed_to,
+            tools_called=self.tools_called,
+            tail_text=self.tail_text,
+        )
 
 
 # Per-meeting-session execution layer, captured at session-create so every
@@ -208,69 +314,21 @@ async def _run_live_turn(
     # Stream events live to pump — reuse the layer the session was started on.
     session_id = agent_sessions[agent_slug]
     layer = _meeting_session_layers.get(session_id) or get_execution_layer(agent_slug)
-    turn_text: list[str] = []
-    turn_thinking: list[str] = []
-    turn_tools: list[dict] = []
-    turn_cost = 0.0
-    turn_cost_is_delta = False
-    directed_to: list[str] | None = None
-    tools_called: set[str] = set()
-    tail_text = 0
+    tracker = _TurnTracker(agent_slug, session_id,
+                           agent_slug == meeting["moderator"])
 
     try:
-        meeting_tool_done = False
+        # The hook backstop's per-turn state spans exactly this send: cleared
+        # before (a restate may run tools again) and after (a flag left set
+        # would deny the between-turn hooks of tolerated background work).
+        clear_meeting_turn_routed(session_id)
         async with layer.session_lock(session_id):
             async for event in layer.send_message(session_id, prompt):
-                if meeting_tool_done and event.type == TEXT:
-                    continue
-                # Collect METADATA cost but don't forward to pump —
-                # meeting costs are tracked separately via meeting_turns.
-                if event.type == METADATA:
-                    cost = event.data.get("cost_usd", 0)
-                    if cost > 0:
-                        turn_cost = cost
-                        turn_cost_is_delta = bool(event.data.get("cost_is_delta"))
-                    continue
-                # Meetings don't support plan mode transitions
-                if event.type == PLAN_MODE:
+                if not tracker.observe(event):
                     continue
                 # Tag with meeting agent and forward LIVE to pump
                 event.data["_meeting_agent"] = agent_slug
                 await event_queue.put(event)
-
-                # Collect for transcript
-                if event.type == TEXT:
-                    content = event.data.get("content", "")
-                    turn_text.append(content)
-                    tail_text += len(content)
-                elif event.type == THINKING:
-                    txt = event.data.get("text", "") or event.data.get("content", "")
-                    if txt:
-                        turn_thinking.append(txt)
-                elif event.type == TOOL_USE:
-                    turn_tools.append({"name": event.data.get("name", "")})
-                elif event.type == TOOL_INPUT:
-                    tool_name = event.data.get("name", "")
-                    if "meetings-mcp__direct_to" in tool_name:
-                        ti = event.data.get("tool_input", {})
-                        parsed = _parse_directed_agents(ti.get("agents"))
-                        if parsed is not None:
-                            directed_to = parsed  # last usable direct_to wins
-                    elif "meetings-mcp__end_meeting" in tool_name:
-                        tools_called.add("end_meeting")
-                    elif "meetings-mcp__propose_conclude" in tool_name:
-                        tools_called.add("propose_conclude")
-                    elif "meetings-mcp__leave_meeting" in tool_name:
-                        tools_called.add("leave_meeting")
-                elif event.type == TOOL_RESULT:
-                    # name FIRST: the stream's tool_id is a UUID, so matching it
-                    # first left the suppression permanently off (transcript-echo
-                    # junk after direct_to was displayed AND relayed).
-                    name = event.data.get("name", "") or event.data.get("tool_id", "")
-                    if "meetings-mcp__" in name:
-                        meeting_tool_done = True
-                    elif _tool_resets_tail(name):
-                        tail_text = 0
 
     except Exception as e:
         logger.error(f"Meeting {meeting_id}: agent {agent_slug} failed: {e}")
@@ -280,6 +338,8 @@ async def _run_live_turn(
             "error": str(e)[:200],
         }))
         return TurnResult(agent=agent_slug, events=[], tools_called={"_failed"})
+    finally:
+        clear_meeting_turn_routed(session_id)
 
     # Background work the agent left running keeps resolving after its turn.
     _start_participant_bg_monitors(agent_slug, session_id, meeting["parent_chat_id"])
@@ -292,18 +352,7 @@ async def _run_live_turn(
         "cost_usd": 0,  # placeholder — meeting_produce emits actual cost as metadata
     }))
 
-    return TurnResult(
-        agent=agent_slug,
-        events=[],  # already forwarded live
-        content="".join(turn_text),
-        thinking="".join(turn_thinking),
-        tools=turn_tools,
-        cost=turn_cost,
-        cost_is_delta=turn_cost_is_delta,
-        directed_to=directed_to,
-        tools_called=tools_called,
-        tail_text=tail_text,
-    )
+    return tracker.result()
 
 
 # ---------------------------------------------------------------------------
@@ -354,84 +403,27 @@ async def _run_parallel_batch(
         q = agent_queues[agent_slug]
         sid = agent_sessions[agent_slug]
         layer = _meeting_session_layers.get(sid) or get_execution_layer(agent_slug)
-        turn_text: list[str] = []
-        turn_thinking: list[str] = []
-        turn_tools: list[dict] = []
-        turn_cost = 0.0
-        turn_cost_is_delta = False
-        directed_to: list[str] | None = None
-        tools_called: set[str] = set()
-        tail_text = 0
+        tracker = _TurnTracker(agent_slug, sid, agent_slug == meeting["moderator"])
 
         try:
-            meeting_tool_done = False
+            clear_meeting_turn_routed(sid)
             async with layer.session_lock(sid):
                 async for event in layer.send_message(sid, prompts[agent_slug]):
-                    if meeting_tool_done and event.type == TEXT:
+                    if not tracker.observe(event):
                         continue
-                    # Collect METADATA cost but don't forward to pump —
-                    # meeting costs are tracked separately via meeting_turns.
-                    if event.type == METADATA:
-                        cost = event.data.get("cost_usd", 0)
-                        if cost > 0:
-                            turn_cost = cost
-                            turn_cost_is_delta = bool(event.data.get("cost_is_delta"))
-                        continue
-                    if event.type == PLAN_MODE:
-                        continue
-                    await q.put(event)
-                    if event.type == TEXT:
-                        content = event.data.get("content", "")
-                        turn_text.append(content)
-                        tail_text += len(content)
-                    elif event.type == THINKING:
-                        txt = event.data.get("text", "") or event.data.get("content", "")
-                        if txt:
-                            turn_thinking.append(txt)
-                    elif event.type == TOOL_USE:
-                        turn_tools.append({"name": event.data.get("name", "")})
-                    elif event.type == TOOL_INPUT:
-                        tool_name = event.data.get("name", "")
-                        if "meetings-mcp__direct_to" in tool_name:
-                            ti = event.data.get("tool_input", {})
-                            parsed = _parse_directed_agents(ti.get("agents"))
-                            if parsed is not None:
-                                directed_to = parsed  # last usable direct_to wins
-                        elif "meetings-mcp__end_meeting" in tool_name:
-                            tools_called.add("end_meeting")
-                        elif "meetings-mcp__propose_conclude" in tool_name:
-                            tools_called.add("propose_conclude")
-                        elif "meetings-mcp__leave_meeting" in tool_name:
-                            tools_called.add("leave_meeting")
-                    elif event.type == TOOL_RESULT:
-                        # name FIRST: the stream's tool_id is a UUID, so matching
-                        # it first left the suppression permanently off.
-                        name = event.data.get("name", "") or event.data.get("tool_id", "")
-                        if "meetings-mcp__" in name:
-                            meeting_tool_done = True
-                        elif _tool_resets_tail(name):
-                            tail_text = 0
+                        await q.put(event)
         except Exception as e:
             logger.error(f"Meeting {meeting_id}: agent {agent_slug} failed: {e}")
-            tools_called.add("_failed")
+            tracker.tools_called.add("_failed")
+        finally:
+            clear_meeting_turn_routed(sid)
 
-        if "_failed" not in tools_called:
+        if "_failed" not in tracker.tools_called:
             # Background work the agent left running keeps resolving after its turn.
             _start_participant_bg_monitors(agent_slug, sid, meeting["parent_chat_id"])
 
         await q.put(None)  # done sentinel
-        agent_results[agent_slug] = TurnResult(
-            agent=agent_slug,
-            events=[],
-            content="".join(turn_text),
-            thinking="".join(turn_thinking),
-            tools=turn_tools,
-            cost=turn_cost,
-            cost_is_delta=turn_cost_is_delta,
-            directed_to=directed_to,
-            tools_called=tools_called,
-            tail_text=tail_text,
-        )
+        agent_results[agent_slug] = tracker.result()
 
     # Start all agents simultaneously
     tasks = [asyncio.create_task(_run_agent(a)) for a in ready_agents]
@@ -651,6 +643,9 @@ async def meeting_produce(
                     await event_queue.put(CommonEvent(type=METADATA, data={
                         "cost_usd": turn_delta,
                         "_meeting_cost": True,  # flag so pump knows this is meeting cost
+                        # The speaker's session: the pump resolves cost_billed
+                        # (show/hide) per participant account, not the host's.
+                        "session_id": agent_sessions.get(result.agent, ""),
                     }))
 
                 # Add to transcript
@@ -672,8 +667,11 @@ async def meeting_produce(
                     turn_delta,
                 )
 
-                # Check end_meeting
-                if "end_meeting" in result.tools_called:
+                # Check end_meeting — the MODERATOR's only. The signal is
+                # recorded at TOOL_INPUT, before the API refuses a
+                # participant's call (403), so without this guard any
+                # participant could end the meeting by calling it.
+                if "end_meeting" in result.tools_called and result.agent == moderator:
                     meeting_active = False
                     break
 
@@ -1075,9 +1073,11 @@ async def start_meeting(meeting_id: str) -> None:
                 "meeting_id": meeting_id,
             })
             # Register for the hook route resolver: permission-mode inheritance
-            # plus out-of-band event rebinding to the pump queue + parent chat.
+            # plus out-of-band event rebinding to the pump queue + parent chat
+            # (is_moderator: only the moderator's end_meeting ends a turn).
             set_meeting_session_info(sid, parent_session_id, pump_session_id,
-                                     agent_slug, parent_chat_id)
+                                     agent_slug, parent_chat_id,
+                                     is_moderator=(agent_slug == meeting["moderator"]))
             # Bind background-work tracking to the parent chat from the start
             # (re-stamped after every turn — the CLI layer resets per turn).
             get_subagent_registry(sid).chat_id = parent_chat_id

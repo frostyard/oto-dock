@@ -22,7 +22,8 @@ function makeRoute(over: Record<string, unknown> = {}) {
     thinking_filler_mode: 'on', background_sound: 'off', enabled: true,
     audiosocket_uuid: null, did: '+16083191947', ami_caller_id: '',
     ami_outbound_context: '', dial_prefix: '', trigger_slug: null,
-    pin_configured: false, created_at: '', updated_at: '', ...over,
+    identity_mode: 'caller', identity_user_sub: null, role: 'viewer', remember_callers: true,
+    pin_configured: false, warnings: [], created_at: '', updated_at: '', ...over,
   }
 }
 

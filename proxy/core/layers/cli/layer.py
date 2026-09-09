@@ -30,9 +30,12 @@ from core.layers.cli.session import (
     interrupt_persistent_session, _persistent_sessions,
 )
 import config as app_config
+from auth.path_policy import EXTERNAL_DENIED_CLI_TOOLS
+from core.session.external_identity import external_home_of, is_external_ctx
 from core.session.session_state import (
     _record_session_use,
-    set_session_security, set_session_mode,
+    cleanup_session_permission_state, register_session_state,
+    set_session_mode,
     _sessions,
     resolve_permission,
     resolve_session_permissions,
@@ -247,7 +250,24 @@ class CLIExecutionLayer(ExecutionLayer):
     async def start_session(
         self, session_id: str, config: AgentConfig,
     ) -> None:
-        """Create or resume a persistent CLI session."""
+        """Create or resume a persistent CLI session.
+
+        The permission mode + security context are registered BEFORE the
+        spawn: the session JWT minted into the process env derives its
+        external claim from the live context. A failed spawn drops the
+        registration again, so a replayed token never finds a live context
+        for a session that never ran.
+        """
+        register_session_state(session_id, config.permission_mode, config.security_context)
+        try:
+            await self._start_session_impl(session_id, config)
+        except BaseException:
+            cleanup_session_permission_state(session_id)
+            raise
+
+    async def _start_session_impl(
+        self, session_id: str, config: AgentConfig,
+    ) -> None:
         # Fail CLOSED: a local agent MUST run sandboxed + network-isolated. An
         # empty sandbox dir means the config builder omitted it — refuse rather
         # than launch un-sandboxed (the local CLI layer is never remote).
@@ -304,8 +324,16 @@ class CLIExecutionLayer(ExecutionLayer):
             # The PRE-sandbox build file (sessions/) still carries host
             # mcps/ paths — scanned for the per-MCP dir binds.
             mcp_config_path=config.mcp_config_path,
+            # External caller (not a platform user): shared memory masked,
+            # their own tree at /caller when the route gave them one.
+            external=is_external_ctx(ctx),
+            external_home=external_home_of(ctx),
         )
         sandbox_builder = SandboxBuilder(sandbox_cfg)
+        # External sessions never get a shell — the CLI argv is one of the
+        # three layers (hook floor + settings deny are the others;
+        # auth/path_policy.EXTERNAL_DENIED_CLI_TOOLS).
+        disallowed_tools = list(EXTERNAL_DENIED_CLI_TOOLS) if is_external_ctx(ctx) else None
 
         # Get the sandbox-internal .claude/ path from env overrides
         sandbox_claude_dir = sandbox_builder.get_env_overrides().get(
@@ -340,10 +368,13 @@ class CLIExecutionLayer(ExecutionLayer):
         # `ssh -i "$OTO_SSH_KEY_DIR/…"` lines work from bash. Independent
         # of mcp_path — ssh-hosts emits no mcpServers entry, so it may be
         # the session's ONLY MCP with no config file at all.
+        # Never for an EXTERNAL session (a phone caller who is not a platform
+        # user): ssh-hosts is not attached there, and key material must not
+        # be materialised into a tree a caller's session can reach.
         from core.sandbox.session_config_dir import (
             materialize_ssh_keys_for_sandbox,
         )
-        if materialize_ssh_keys_for_sandbox(
+        if not is_external_ctx(ctx) and materialize_ssh_keys_for_sandbox(
             config.agent_name, config.sandbox_host_claude_dir,
         ):
             extra_env["OTO_SSH_KEY_DIR"] = f"{sandbox_claude_dir}/ssh"
@@ -384,6 +415,7 @@ class CLIExecutionLayer(ExecutionLayer):
                 sandbox_builder=sandbox_builder,
                 agent_name=config.agent_name,
                 interactive=True,
+                disallowed_tools=disallowed_tools,
             )
             argv, proc_env, cwd = _builder.build_spawn_command()
             # Seed the CLI config so the TUI launches past the first-run wizard
@@ -428,11 +460,10 @@ class CLIExecutionLayer(ExecutionLayer):
                 credential_env=config.credential_env or None,
                 sandbox_builder=sandbox_builder,
                 agent_name=config.agent_name,
+                disallowed_tools=disallowed_tools,
             )
 
-        set_session_mode(session_id, config.permission_mode)
-        if config.security_context is not None:
-            set_session_security(session_id, config.security_context)
+        # (permission mode + security context were registered before the spawn)
 
         # Store host .claude/ dir for plan API and session resume
         if config.sandbox_host_claude_dir:
@@ -541,6 +572,10 @@ class CLIExecutionLayer(ExecutionLayer):
         await _writeback_credential_dirs(session_id)
 
         await close_persistent_session(session_id)
+        # Permission mode + security context: a closed session must not keep
+        # a live context (the hook fails closed without one, and a session
+        # token that outlives its session is dead only once this is gone).
+        cleanup_session_permission_state(session_id)
         # Credential broker: drop this session's secrets (a cap token replayed
         # after close then finds nothing).
         from core.credentials import mcp_broker
@@ -659,6 +694,7 @@ class CLIExecutionLayer(ExecutionLayer):
 
     async def can_resume_session(
         self, session_id: str, *, agent_name: str = "", username: str = "",
+        external_home: str = "",
     ) -> bool:
         """Check if session file has conversation data for --resume.
 
@@ -667,19 +703,21 @@ class CLIExecutionLayer(ExecutionLayer):
 
         Checks the session's persistent .claude/ dir first.  After a proxy
         restart the in-memory mapping is lost, so *agent_name* + *username*
-        are used to derive the .claude/ path (same logic as
-        ``ensure_persistent_claude_dir``).  Falls back to ~/.claude/ for
-        legacy pre-sandbox sessions.
+        (or an external caller's *external_home*) are used to derive the
+        .claude/ path (same logic as ``ensure_persistent_claude_dir``).
+        Falls back to ~/.claude/ for legacy pre-sandbox sessions.
         """
         from core.session.session_state import get_session_claude_dir
 
         # 1. In-memory mapping (works when proxy hasn't restarted)
         claude_dir = get_session_claude_dir(session_id)
 
-        # 2. Restart fallback: derive from agent + username
+        # 2. Restart fallback: derive from agent + username / caller tree
         if not claude_dir and agent_name:
             agent_dir = app_config.get_agent_dir(agent_name)
-            if username:
+            if external_home:
+                candidate = Path(external_home) / ".claude"
+            elif username:
                 candidate = agent_dir / "users" / username / ".claude"
             else:
                 candidate = agent_dir / "workspace" / ".claude"

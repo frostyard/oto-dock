@@ -31,7 +31,6 @@ class AddSubscriptionRequest(BaseModel):
     label: str = ""
     api_key: str | None = None
     endpoint_url: str | None = None
-    is_primary: bool = False
     # Scope flags. None = "use the endpoint default" (admin add → both TRUE;
     # user add → use_personal TRUE, contribute_platform forced FALSE unless admin).
     use_personal: bool | None = None
@@ -40,7 +39,6 @@ class AddSubscriptionRequest(BaseModel):
 
 class UpdateSubscriptionRequest(BaseModel):
     label: str | None = None
-    is_primary: bool | None = None
     status: str | None = None
     use_personal: bool | None = None
     contribute_platform: bool | None = None
@@ -62,10 +60,26 @@ class AddModelRequest(BaseModel):
 class BulkAddModelsRequest(BaseModel):
     models: list[dict]     # [{"model_id": str, "display_name": str}]
     provider: str
+    # Engines to add the rows to (a shared local endpoint adds its discovered
+    # models to every engine it is enabled for). Default: the URL's layer.
+    layers: list[str] | None = None
 
 
 class DiscoverModelsRequest(BaseModel):
     subscription_id: str
+
+
+class AddLocalEndpointRequest(BaseModel):
+    provider: str             # 'ollama' | 'openai_compatible'
+    endpoint_url: str
+    label: str = ""
+    api_key: str | None = None
+    layers: list[str]         # engines the endpoint is enabled for
+
+
+class SetLocalEndpointEngineRequest(BaseModel):
+    layer: str
+    enabled: bool
 
 
 class UpdateModelRequest(BaseModel):
@@ -100,6 +114,12 @@ _VALID_AUTH_TYPES = {"api_key", "local_endpoint", "oauth", "relay"}
 # Local providers reach the operator's own network — unavailable on hosted
 # OtoDock (no operator LAN). Rejected at add time when OTODOCK_CLOUD.
 _LOCAL_PROVIDERS = {"ollama", "openai_compatible"}
+# Engines a local endpoint can serve (both dial OpenAI-compatible servers).
+_LOCAL_ENDPOINT_LAYERS = ("direct-llm", "codex-cli")
+_CLOUD_LOCAL_MSG = (
+    "Local model endpoints are unavailable on hosted OtoDock — "
+    "they would need access to your own network."
+)
 # Hosted Direct-LLM (auth_type='relay') is available for the relay-backed LLM
 # vendors only (the local providers are self-hosted).
 _RELAY_PROVIDERS = {"anthropic", "openai", "groq"}
@@ -121,8 +141,12 @@ async def admin_list_layers(user: UserContext = Depends(get_current_user)):
         # The admin tab manages the platform pool + owner-less infra (relay / migrated
         # shared keys). list_admin_managed keeps owner-less subs visible even with
         # 'Agent pool' off, so toggling it can't make them vanish. is_mine drives which
-        # rows show edit controls (the caller's own accounts).
-        platform_subs = subscription_store.list_admin_managed(layer=path)
+        # rows show edit controls (the caller's own accounts). Local endpoints are
+        # listed ONCE across the engines in ``local_endpoints`` below, not per layer.
+        platform_subs = [
+            s for s in subscription_store.list_admin_managed(layer=path)
+            if s.get("auth_type") != "local_endpoint"
+        ]
         for s in platform_subs:
             s["is_mine"] = bool(s.get("owner_sub")) and s.get("owner_sub") == user.sub
         # Count personal accounts (without exposing details)
@@ -147,7 +171,11 @@ async def admin_list_layers(user: UserContext = Depends(get_current_user)):
             "pool_stats": pool,
         })
 
-    return {"layers": layers}
+    local_endpoints = [
+        _annotate_local_group(g, user)
+        for g in subscription_store.list_local_endpoint_groups()
+    ]
+    return {"layers": layers, "local_endpoints": local_endpoints}
 
 
 # ---------------------------------------------------------------------------
@@ -182,9 +210,7 @@ async def admin_add_subscription(
     if req.auth_type not in _VALID_AUTH_TYPES:
         raise HTTPException(400, f"Invalid auth_type: {req.auth_type}")
     if config.OTODOCK_CLOUD and req.provider in _LOCAL_PROVIDERS:
-        raise HTTPException(
-            400, "Local model endpoints are unavailable on hosted OtoDock — "
-            "they would need access to your own network.")
+        raise HTTPException(400, _CLOUD_LOCAL_MSG)
 
     # Hosted Direct-LLM: a credential-less platform sub that routes this provider's
     # LLM calls through the OtoDock relay (credit-metered; the token is minted per
@@ -218,6 +244,10 @@ async def admin_add_subscription(
         if not req.endpoint_url:
             raise HTTPException(400, "endpoint_url required for local_endpoint auth type")
         cred_data["endpoint_url"] = req.endpoint_url
+        # Optional bearer for a key-protected local server (llama.cpp
+        # --api-key, a LiteLLM master key, …). Blank = keyless.
+        if req.api_key:
+            cred_data["api_key"] = req.api_key
 
     sub = subscription_store.add_subscription(
         layer=layer,
@@ -229,7 +259,6 @@ async def admin_add_subscription(
         contribute_platform=True if req.contribute_platform is None else req.contribute_platform,
         label=req.label,
         credential_data=cred_data,
-        is_primary=req.is_primary,
     )
     subscription_pool.schedule_rebind("admin subscription add")
     # The phone's Groq turn classifier reuses the Direct LLM Groq key — push the
@@ -257,7 +286,6 @@ async def admin_update_subscription(
     result = subscription_store.update_subscription(
         sub_id,
         label=req.label,
-        is_primary=req.is_primary,
         status=req.status,
         use_personal=req.use_personal,
         contribute_platform=req.contribute_platform,
@@ -298,6 +326,139 @@ async def admin_delete_subscription(
     subscription_pool.schedule_rebind("admin subscription delete")
     if layer == "direct-llm":
         await notify_phone_config_changed()
+    return {"deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Admin: Local endpoints (one server, listed once across the engines)
+# ---------------------------------------------------------------------------
+
+def _local_group(group: str) -> dict:
+    for g in subscription_store.list_local_endpoint_groups():
+        if g["group"] == group:
+            return g
+    raise HTTPException(404, "Local endpoint not found")
+
+
+def _require_group_owner(g: dict, user: UserContext) -> None:
+    # Owner-or-infra, like every subscription mutation: sibling rows carry
+    # the connecting admin's sub (an admin never edits another admin's).
+    for eng in g["engines"].values():
+        if eng.get("owner_sub") not in ("", user.sub):
+            raise HTTPException(403, "Not your endpoint")
+
+
+def _annotate_local_group(g: dict, user: UserContext) -> dict:
+    out = dict(g)
+    out["engines"] = {
+        layer: {
+            "id": eng["id"], "status": eng["status"],
+            "active_sessions": eng.get("active_sessions", 0),
+            "is_mine": eng.get("owner_sub") in ("", user.sub),
+        }
+        for layer, eng in g["engines"].items()
+    }
+    return out
+
+
+async def _local_endpoint_changed(layers) -> None:
+    subscription_pool.schedule_rebind("local endpoint change")
+    if "direct-llm" in layers:
+        await notify_phone_config_changed()
+
+
+@router.post("/v1/admin/execution-layers/local-endpoints")
+async def admin_add_local_endpoint(
+    req: AddLocalEndpointRequest,
+    user: UserContext = Depends(get_current_user),
+):
+    """Connect a self-hosted OpenAI-compatible server to one or both engines:
+    one ``local_endpoint`` subscription row per engine, same credential."""
+    _require_admin(user)
+    if req.provider not in _LOCAL_PROVIDERS:
+        raise HTTPException(400, f"Invalid local provider: {req.provider}")
+    if config.OTODOCK_CLOUD:
+        raise HTTPException(400, _CLOUD_LOCAL_MSG)
+    layers = [layer for layer in dict.fromkeys(req.layers) if layer]
+    if not layers:
+        raise HTTPException(400, "Pick at least one engine for the endpoint")
+    bad = [layer for layer in layers if layer not in _LOCAL_ENDPOINT_LAYERS]
+    if bad:
+        raise HTTPException(400, f"Local endpoints cannot serve: {', '.join(bad)}")
+    url = subscription_store.normalize_endpoint_url(req.endpoint_url)
+    if not url:
+        raise HTTPException(400, "endpoint_url required")
+    if req.provider == "ollama" and not url.lower().endswith("/v1"):
+        # The chat adapter and Codex's provider need Ollama's OpenAI-compatible
+        # base; the server root answers only the native API (Discover strips
+        # the suffix again to reach /api/tags).
+        url += "/v1"
+    key = subscription_store.local_endpoint_group_key(req.provider, url)
+    if any(g["group"] == key for g in subscription_store.list_local_endpoint_groups()):
+        raise HTTPException(409, "This endpoint is already connected — use its engine checkboxes")
+    cred_data: dict = {"endpoint_url": url}
+    if req.api_key:
+        cred_data["api_key"] = req.api_key
+    for layer in layers:
+        subscription_store.add_subscription(
+            layer=layer, provider=req.provider, auth_type="local_endpoint",
+            owner_sub=user.sub, use_personal=True, contribute_platform=True,
+            label=req.label, credential_data=cred_data,
+        )
+    await _local_endpoint_changed(layers)
+    return _annotate_local_group(_local_group(key), user)
+
+
+@router.put("/v1/admin/execution-layers/local-endpoints/{group}")
+async def admin_set_local_endpoint_engine(
+    group: str,
+    req: SetLocalEndpointEngineRequest,
+    user: UserContext = Depends(get_current_user),
+):
+    """Enable or disable the endpoint for one engine. Enabling creates the
+    missing sibling row (copying the credential) or re-activates a disabled
+    one; disabling sets that engine's row ``disabled`` — its models stay,
+    hidden from the pickers while no active row serves their provider."""
+    _require_admin(user)
+    if req.layer not in _LOCAL_ENDPOINT_LAYERS:
+        raise HTTPException(400, f"Local endpoints cannot serve: {req.layer}")
+    g = _local_group(group)
+    _require_group_owner(g, user)
+    eng = g["engines"].get(req.layer)
+    if req.enabled:
+        if eng is None:
+            sibling = next(iter(g["engines"].values()))
+            cred_data = subscription_store.get_credential_data(sibling["id"])
+            subscription_store.add_subscription(
+                layer=req.layer, provider=g["provider"], auth_type="local_endpoint",
+                owner_sub=user.sub, use_personal=True, contribute_platform=True,
+                label=g["label"], credential_data=cred_data,
+            )
+        elif eng["status"] != "active":
+            subscription_store.update_subscription(eng["id"], status="active")
+    elif eng is not None and eng["status"] == "active":
+        subscription_store.update_subscription(eng["id"], status="disabled")
+    await _local_endpoint_changed([req.layer])
+    return _annotate_local_group(_local_group(group), user)
+
+
+@router.delete("/v1/admin/execution-layers/local-endpoints/{group}")
+async def admin_delete_local_endpoint(
+    group: str,
+    user: UserContext = Depends(get_current_user),
+):
+    _require_admin(user)
+    g = _local_group(group)
+    _require_group_owner(g, user)
+    busy = [layer for layer, e in g["engines"].items() if e.get("active_sessions", 0) > 0]
+    if busy:
+        raise HTTPException(
+            409, f"Endpoint has active sessions on {', '.join(busy)}. "
+            "Wait for them to close or restart the service.",
+        )
+    for e in g["engines"].values():
+        subscription_store.delete_subscription(e["id"])
+    await _local_endpoint_changed(list(g["engines"]))
     return {"deleted": True}
 
 
@@ -393,17 +554,22 @@ async def admin_bulk_add_models(
     _require_admin(user)
     if layer not in _VALID_LAYERS:
         raise HTTPException(400, f"Invalid layer: {layer}")
+    targets = [t for t in dict.fromkeys(req.layers or [layer]) if t]
+    bad = [t for t in targets if t not in _VALID_LAYERS]
+    if bad:
+        raise HTTPException(400, f"Invalid layer: {', '.join(bad)}")
 
     added = []
-    for m in req.models:
-        model = subscription_store.add_model(
-            layer=layer,
-            model_id=m["model_id"],
-            display_name=m["display_name"],
-            provider=req.provider,
-            is_builtin=False,
-        )
-        added.append(model)
+    for target in targets:
+        for m in req.models:
+            model = subscription_store.add_model(
+                layer=target,
+                model_id=m["model_id"],
+                display_name=m["display_name"],
+                provider=req.provider,
+                is_builtin=False,
+            )
+            added.append(model)
 
     return {"models": added, "count": len(added)}
 
@@ -533,6 +699,8 @@ async def user_add_subscription(
         cred_data["api_key"] = req.api_key
     elif req.auth_type == "local_endpoint" and req.endpoint_url:
         cred_data["endpoint_url"] = req.endpoint_url
+        if req.api_key:
+            cred_data["api_key"] = req.api_key
 
     sub = subscription_store.add_subscription(
         layer=layer,
@@ -548,7 +716,6 @@ async def user_add_subscription(
         ),
         label=req.label,
         credential_data=cred_data,
-        is_primary=req.is_primary,
     )
     subscription_pool.schedule_rebind("user subscription add")
     return sub
@@ -563,7 +730,7 @@ async def user_update_subscription(
 ):
     """Owner-scoped subscription update — every role, own rows only.
 
-    Any owner may rename, re-prioritize (is_primary) and toggle
+    Any owner may rename and toggle
     ``use_personal`` — the per-account "bench this subscription from my own
     sessions for a while" switch (multi-account owners flip between plans
     without disconnecting). ``contribute_platform`` stays ADMIN-only: the
@@ -579,7 +746,6 @@ async def user_update_subscription(
     updated = subscription_store.update_subscription(
         sub_id,
         label=req.label,
-        is_primary=req.is_primary,
         use_personal=req.use_personal,
         contribute_platform=req.contribute_platform,
     )

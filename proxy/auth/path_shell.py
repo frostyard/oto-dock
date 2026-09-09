@@ -21,6 +21,7 @@ from auth.path_policy import (
     _check_path_arg,
     _check_remote_bash_path,
 )
+from core.session.external_identity import is_external_ctx
 
 # Hostnames always treated as private (no DNS resolution needed)
 _PRIVATE_HOSTNAMES = {"localhost"}
@@ -176,13 +177,19 @@ _DANGEROUS_PATTERNS: list[tuple[re.Pattern, str]] = [
     # Kernel module operations
     (re.compile(r"\b(insmod|modprobe|rmmod)\b"), "Kernel module operations blocked"),
 
-    # Bash network pseudo-devices
-    (re.compile(r"/dev/tcp/"), "Bash /dev/tcp access blocked"),
-    (re.compile(r"/dev/udp/"), "Bash /dev/udp access blocked"),
-
     # Sensitive file reads
     (re.compile(r"\bcat\b.*\b/etc/shadow\b"), "Reading /etc/shadow blocked"),
 ]
+
+# Bash's network pseudo-devices are sockets, not files: they are governed by
+# the sandbox network namespace locally (the LAN is blackholed there, exactly
+# as for curl) and by the operator's pairing decision on a satellite — never
+# by the path gate, and they are not a catastrophe-floor matter.
+_NETWORK_PSEUDO_PREFIXES = ("/dev/tcp/", "/dev/udp/")
+
+
+def _is_network_pseudo_path(rp: str) -> bool:
+    return rp.startswith(_NETWORK_PSEUDO_PREFIXES)
 
 # ---------------------------------------------------------------------------
 # Path extraction categories for Bash commands
@@ -328,7 +335,31 @@ _SHELL_STRUCTURAL: set[str] = {
     ":", "cd", "export", "set", "unset", "shift", "return", "local", "declare",
     "typeset", "readonly", "pushd", "popd", "dirs", "alias", "unalias", "wait",
     "trap", "exit", "break", "continue", "let",
+    # stdin-to-variable builtins: ``while read -r line`` must stay quiet once
+    # the leading ``while`` is peeled off (below) and ``read`` is what's left.
+    "read", "mapfile", "readarray", "getopts",
 }
+
+# Keywords that take a COMMAND on the same line — ``do rm x``, ``then cat f``,
+# ``if grep …``, ``! test …``, ``{ rm x``. They are structural themselves,
+# but the command after them must be classified: returning "read" at the
+# keyword hid ``do rm -rf …`` from the destructive flag and ``then cat
+# /users/bob/…`` from the cross-user path check (2026-09-05).
+# _strip_shell_structure peels them (and subshell parens / case labels) off
+# before classification; ``for``/``case``/``function``/… are NOT here because
+# what follows them is a word list, not a command.
+_LEADING_KEYWORDS: set[str] = {
+    "do", "then", "else", "elif", "if", "while", "until", "!", "{",
+}
+
+# A ``case`` pattern label opening a segment: ``a) cat f``, ``*) …``,
+# ``x|y) …`` — peeled off like a leading keyword.
+_CASE_LABEL_RE = re.compile(r"^[^\s(]+\)$")
+
+# ``command <cmd>`` / ``builtin <cmd>`` run <cmd> (bypassing functions and
+# aliases) — prefix wrappers, so ``command rm x`` classifies as ``rm``. The
+# introspective ``command -v/-V <name>`` runs nothing and stays read tier.
+_COMMAND_WRAPPERS: set[str] = {"command", "builtin"}
 
 # Destructive commands — prompt EVEN in acceptEdits (PathDecision.destructive,
 # a separate boolean, NOT a tier). Catastrophic forms (``rm -rf /``,
@@ -951,7 +982,97 @@ def _unwrap_segment(segment: str) -> tuple[str, str]:
         if j >= len(rest):
             return ("none", segment)  # bare wrapper → classify the wrapper token
         return ("segment", _drop_leading_tokens(segment, idx + 1 + j))
+
+    if cmd in _COMMAND_WRAPPERS:
+        # `command [-pvV] <cmd> …`: the flags come first; `-v`/`-V` (also in a
+        # bundle like `-pv`) only DESCRIBE <cmd> → not a wrapper, read tier.
+        j = 0
+        while j < len(rest) and rest[j].startswith("-"):
+            if "v" in rest[j][1:] or "V" in rest[j][1:]:
+                return ("none", segment)
+            j += 1
+        if j >= len(rest):
+            return ("none", segment)
+        return ("segment", _drop_leading_tokens(segment, idx + 1 + j))
     return ("none", segment)
+
+
+def _unquoted_trailing_paren(s: str) -> bool:
+    """``s`` ends with a ``)`` that is outside quotes and not backslash-escaped
+    (``make )`` yes; ``echo ")"`` / ``echo \\)`` no)."""
+    in_s = in_d = False
+    last_unquoted = False
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\" and not in_s and i + 1 < n:
+            i += 2
+            last_unquoted = False
+            continue
+        if c == "'" and not in_d:
+            in_s = not in_s
+        elif c == '"' and not in_s:
+            in_d = not in_d
+        last_unquoted = c == ")" and not in_s and not in_d
+        i += 1
+    return last_unquoted
+
+
+def _strip_shell_structure(segment: str) -> str:
+    """Peel the shell STRUCTURE off a segment so the command it wraps is what
+    gets classified: subshell parens (``( cd a``, ``make )``, ``(cd a``),
+    leading keywords that take a command (``do rm x``, ``then cat f``,
+    ``if ! grep …`` — repeated until stable) and ``case`` labels (``a) cat
+    f``). Returns "" when the segment was nothing but structure (``do``,
+    ``then``, ``(``). ``((…))`` arithmetic is returned whole (structural,
+    nothing runs; the caller handles it). ``$(…)`` never reaches here — a
+    substitution makes the caller return "ask" before this runs."""
+    s = segment.strip()
+    while s:
+        if s.startswith("(("):
+            return s
+        if s.startswith("("):
+            s = s[1:].lstrip()
+            continue
+        if s.endswith(")") and _unquoted_trailing_paren(s):
+            s = s[:-1].rstrip()
+            continue
+        try:
+            tokens = shlex.split(s)
+        except ValueError:
+            return s
+        if not tokens:
+            return ""
+        first = tokens[0]
+        if first in _LEADING_KEYWORDS or _CASE_LABEL_RE.match(first):
+            s = _drop_leading_tokens(s, 1)
+            continue
+        # One-line ``case $x in a) cmd ;; …``: the first label and its
+        # command share the ``case`` segment — peel ``case WORD in LABEL)``.
+        if (first == "case" and len(tokens) >= 4 and tokens[2] == "in"
+                and _CASE_LABEL_RE.match(tokens[3])):
+            s = _drop_leading_tokens(s, 4)
+            continue
+        break
+    return s
+
+
+def _is_command_less(segment: str) -> bool:
+    """The segment runs NO command word: only ``KEY=value`` assignments and/or
+    redirects (``F=/x``, ``x=1 y=2``, ``F=x > out``, ``> out``). Such a segment
+    is shell structure like ``export F=/x`` — not an unparseable command."""
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    for t in _filter_redirect_tokens(tokens):
+        if "=" not in t or t.startswith("-"):
+            return False
+        if not t[:t.index("=")].isidentifier():
+            return False
+    return True
 
 
 def _find_has_delete(segment: str) -> bool:
@@ -1067,7 +1188,52 @@ def _classify_segment(
             tier = sub_tier
         return PathDecision(allowed=True, permission_tier=tier, destructive=sub_destructive)
 
-    # 2. Wrappers — recurse on the inner command string, or re-classify the
+    def _structural_decision(seg: str) -> PathDecision:
+        """Read-tier decision for a segment that runs no command — but the
+        shell still performs its REDIRECTS (``F=x > f`` creates f, ``done <
+        f`` reads f, ``: > f`` truncates), so those are checked like a
+        command's. ``[[ … ]]`` and ``(( … ))`` are exempt: there ``<``/``>``
+        are comparison operators, not redirects."""
+        if dangerous_only:
+            return PathDecision(allowed=True, permission_tier="read")
+        head = seg.lstrip()
+        if head.startswith("[[") or head.startswith("(("):
+            return PathDecision(allowed=True, permission_tier="read")
+        tier = "read"
+        for rp in _extract_redirect_targets(seg):
+            if rp == "/dev/null" or _is_network_pseudo_path(rp):
+                continue
+            d = _bash_path_decision(rp, writing=True)
+            if not d.allowed:
+                return PathDecision(False, f"Bash denied: redirect target '{rp}' — {d.reason}")
+            tier = "edit"
+        for rp in _extract_input_redirects(seg):
+            if _is_network_pseudo_path(rp):
+                continue
+            d = _bash_path_decision(rp, writing=False)
+            if not d.allowed:
+                return PathDecision(False, f"Bash denied: input redirect '{rp}' — {d.reason}")
+        return PathDecision(allowed=True, permission_tier=tier)
+
+    # 2. Shell structure — subshell parens, leading keywords (``do``/``then``/
+    #    ``if``/``!``/``{``) and case labels are peeled off so the command
+    #    they wrap is what gets classified (``do rm -rf x`` is destructive,
+    #    ``then cat /users/bob/x`` is a cross-user read — both used to hide
+    #    behind the keyword's read tier). A segment that was nothing but
+    #    structure (``do``, ``then``, ``(``) is read tier.
+    body = _strip_shell_structure(segment)
+    if not body:
+        return _structural_decision(segment)
+    if body != segment.strip():
+        # Re-run the catastrophe floor on the peeled body, as every unwrap
+        # level does: ``( rm -rf / )`` hides the bare root behind the closing
+        # paren's boundary in the raw scan.
+        for pattern, reason in _DANGEROUS_PATTERNS:
+            if pattern.search(body):
+                return PathDecision(False, f"Bash denied: {reason}")
+    segment = body
+
+    # 3. Wrappers — recurse on the inner command string, or re-classify the
     #    wrapper-stripped remainder.
     kind, inner = _unwrap_segment(segment)
     if kind == "string":
@@ -1077,18 +1243,24 @@ def _classify_segment(
         return _classify_segment(inner, ctx, is_remote=is_remote, depth=depth + 1,
                                  dangerous_only=dangerous_only)
 
-    # 3. Plain command.
+    # 4. Plain command. A segment with no command word (``F=/x``, ``x=1 y=2``,
+    #    ``> out``) is structure — exactly like ``export F=/x`` — not a parse
+    #    failure; ``((…))`` arithmetic runs nothing either.
+    if segment.startswith("((") or _is_command_less(segment):
+        return _structural_decision(segment)
     cmd_name = _extract_command_name(segment)
     if cmd_name is None:
-        # Unparseable ≠ dangerous; the floor pass lets it through (admin is
-        # unrestricted), else keep the existing hard parse-deny for non-admin.
+        # Genuinely unparseable (a dangling backslash, …) ≠ dangerous; the
+        # floor pass lets it through (admin is unrestricted), else keep the
+        # hard parse-deny for non-admin.
         if dangerous_only:
             return PathDecision(allowed=True, permission_tier="read")
         return PathDecision(False, "Bash denied: could not parse command")
 
-    # Shell control-flow keywords / no-op builtins → structural, read tier.
+    # Shell control-flow keywords / no-op builtins → structural, read tier
+    # (their redirects still checked).
     if cmd_name in _SHELL_STRUCTURAL:
-        return PathDecision(allowed=True, permission_tier="read")
+        return _structural_decision(segment)
 
     # find -exec <cmd> — recurse the inner (carries the dangerous scan to it, in
     # BOTH modes) so `find . -exec rm -rf / \;` is dangerous-denied; capture the
@@ -1150,7 +1322,7 @@ def _classify_segment(
             tier = "edit"
 
     for rp in _extract_redirect_targets(segment):
-        if rp == "/dev/null":
+        if rp == "/dev/null" or _is_network_pseudo_path(rp):
             continue
         d = _bash_path_decision(rp, writing=True)
         if not d.allowed:
@@ -1158,6 +1330,8 @@ def _classify_segment(
         if _TIER_ORDER.get(tier, 0) < _TIER_ORDER["edit"]:
             tier = "edit"
     for rp in _extract_input_redirects(segment):
+        if _is_network_pseudo_path(rp):
+            continue
         d = _bash_path_decision(rp, writing=False)
         if not d.allowed:
             return PathDecision(False, f"Bash denied: input redirect '{rp}' — {d.reason}")
@@ -1892,9 +2066,20 @@ def _check_powershell(command: str, ctx: SecurityContext) -> PathDecision:
 
 
 def _check_webfetch(url: str, ctx: SecurityContext) -> PathDecision:
-    """Block WebFetch to private/internal IPs for non-admin agents."""
+    """Block WebFetch to private/internal IPs for non-admin agents.
+
+    An external session (a phone caller who is not a platform user) may
+    fetch the public web from a local sandbox, where the netns blackholes
+    every private range regardless of what a hostname resolves to. On a
+    remote target there is no netns and this gate sees only literal
+    addresses, so external sessions get no WebFetch there at all.
+    """
     if ctx.is_admin_agent and ctx.role == "admin":
         return _ALLOW
+    if is_external_ctx(ctx) and ctx.target_kind != "local":
+        return PathDecision(
+            False, "WebFetch is not available on external routes on a remote machine",
+        )
 
     try:
         parsed = urllib.parse.urlparse(url)

@@ -93,6 +93,11 @@ async def test_pump_titled_chat_never_arms(temp_db):
     temp_db.update_chat("tp3", title_generated=True)
     pump = _mk_pump("tp3")
     try:
+        # Armed by default; the turn-start job (an off-loop chat-lane read)
+        # disarms it for an already-titled chat before any threshold fires.
+        from core.events import chat_writer
+        pump._submit_turn_start()
+        assert await chat_writer.drain("tp3", timeout=5)
         assert pump._title_armed is False
         for i in range(_TITLE_TOOL_THRESHOLD + 1):
             await pump._process_event(_tool_event(i=i))

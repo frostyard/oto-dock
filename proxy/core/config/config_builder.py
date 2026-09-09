@@ -66,8 +66,21 @@ async def build_agent_config(
     work_cwd: str = "",
     is_otodock: bool = False,
     term: str = "",
+    phone_mode: bool = False,
+    trigger_payload: dict | None = None,
+    subscription_pool_fallback: bool = False,
+    external_claim: str = "",
 ) -> AgentConfig:
     """Build an AgentConfig from agent DB + user context.
+
+    The phone ``user`` identity mode (a route tied to a platform user —
+    ``services/phone/phone_identity.py``) reuses this builder so the call is
+    that user's own session: ``phone_mode`` applies the call-only MCP
+    exclusions, ``trigger_payload`` feeds the ``${trigger.*}`` context
+    blocks, ``subscription_pool_fallback`` lets a user without a subscription
+    ride the platform pool (today's phone behaviour), and ``external_claim``
+    rides the session token so it dies at hangup and the call log can name
+    the caller — the SecurityContext stays a USER principal.
 
     Centralizes prompt building, MCP config, credential resolution,
     security context, and model/effort resolution.
@@ -173,7 +186,22 @@ async def build_agent_config(
     # a satellite, so every one of those builders needs to know whether this
     # session is remote and whether that machine has an interactive display.
     # (target_kind/target_label also feed the SecurityContext + AgentConfig.)
-    if pinned_target:
+    if execution_path == "direct-llm":
+        # The Direct LLM engine never runs on a satellite (session_manager
+        # routes it local, remote_execution refuses it): neither a pin nor a
+        # default machine may shape the placement prompt, the device-MCP set
+        # or the security context. The resolver already answers local for a
+        # direct-llm AGENT; this covers a chat whose execution_path override
+        # picked the engine on an agent that defaults to another layer, and a
+        # chat row that stored a machine pin before the fix (re-pinned local
+        # on this warmup).
+        if pinned_target and pinned_target != "local":
+            logger.info(
+                "build_agent_config: %s pinned to %s runs on the Direct LLM "
+                "engine — placed local", agent_name, pinned_target[:8],
+            )
+        resolved_target = ("local", None)
+    elif pinned_target:
         # RESUME pins to the chat/run's ORIGIN target — never
         # re-resolve. Re-resolving would silently fall back to local when the
         # bound machine is offline, losing the on-disk session/context. 'local'
@@ -255,6 +283,11 @@ async def build_agent_config(
             target_user_dirs = {}
             target_has_display = None
             target_device_grants = set()
+    # Browser-control mode + extension token: a targeted read (the token
+    # column never rides the machine row), dedicated/no-token when local.
+    target_browser = await asyncio.to_thread(
+        remote_store.get_target_browser_settings, target_kind, target_value,
+    ) if is_remote and target_value else None
 
     # Resolve per-user MCP credentials + config.
     # For TOML (Codex), credential env is injected into the TOML env sections
@@ -276,10 +309,12 @@ async def build_agent_config(
             # landed where the MCP never looked.
             task_scope=vis.mount_scope,
             interactive_local=is_otodock,
+            phone_mode=phone_mode,
             is_remote=is_remote,
             target_has_display=target_has_display,
             target_device_grants=target_device_grants,
             target_admin_paired=(target_kind == "admin_remote"),
+            target_browser=target_browser,
         )
     )
 
@@ -353,6 +388,7 @@ async def build_agent_config(
     from auth.session_token import create_session_token
     credential_env["PROXY_API_KEY"] = create_session_token(
         session_id or "", agent_name, creds_sub or "",
+        external=external_claim or "",
     )
     multi_value_envs.update(oto_env.OTO_MULTI_VALUE_ENVS)
 
@@ -371,13 +407,19 @@ async def build_agent_config(
     # Async — builder blocks invoke remote MCP tools.
     # Chat sessions never carry a trigger_payload; ``${trigger.*}`` tokens
     # resolve empty and any trigger-gated blocks skip naturally.
-    assigned_mcp_names = [m.name for m in (mcp_registry.get_agent_mcps(
-        agent_name, is_remote=is_remote, target_has_display=target_has_display,
-        target_device_grants=target_device_grants,
-    ) or [])]
+    assigned_mcp_names = [
+        m.name for m in (mcp_registry.get_agent_mcps(
+            agent_name, is_remote=is_remote, target_has_display=target_has_display,
+            target_device_grants=target_device_grants,
+        ) or [])
+        # Only the MCPs that actually attach describe themselves (the phone
+        # exclusions drop e.g. display-mcp on a call).
+        if m.name not in (excluded_mcps or {})
+    ]
     dynamic_contexts = await dynamic_context.get_dynamic_contexts(
         agent_name, assigned_mcp_names,
         user_sub=creds_sub or "", user_role=user_role,
+        trigger_payload=trigger_payload,
         delegation_targets=resolved_targets,
         # Pre-resolved off-loop: the delegation + meetings providers are no-I/O.
         delegation_roster=await asyncio.to_thread(
@@ -408,6 +450,10 @@ async def build_agent_config(
         target_has_display=target_has_display,
         target_device_grants=target_device_grants,
         mount_shared=vis.mount_shared,
+        execution_path=execution_path or "",
+        # A phone Direct-LLM session never connects the sidecar HTTP MCPs
+        # (core/layers/direct/layer.py::direct_mcp_policy).
+        skip_http_mcps=bool(phone_mode and execution_path == "direct-llm"),
     )
 
     # Append client-specific context (dashboard adapter injects file display
@@ -484,6 +530,9 @@ async def build_agent_config(
         # fire). Human chat sessions stay on the bool(username)+role path.
         knowledge_rw=(task_identity.knowledge_rw
                       if task_identity is not None else False),
+        # A phone route tied to this user: the claim rides the session token
+        # (liveness + call-log audit); the principal stays the user.
+        external_claim=external_claim or "",
     )
     perm_ctx = build_permission_context(
         security_ctx,
@@ -534,9 +583,29 @@ async def build_agent_config(
         if execution_path == "direct-llm":
             extra_env["_USER_SUB"] = creds_sub or ""
     except subscription_pool.NoSubscriptionError:
-        raise
+        if not subscription_pool_fallback:
+            raise
     except Exception as e:
         logger.warning(f"Subscription pool error for {agent_name}: {e}")
+    # A phone route tied to a user without a subscription of their own rides
+    # the platform pool (today's phone behaviour) instead of failing the call.
+    if creds_sub and not subscription_id and subscription_pool_fallback:
+        try:
+            subscription_id, sub_env = await asyncio.to_thread(
+                subscription_pool.resolve_subscription_env,
+                execution_path, None, model=resolved_model, agent_info=agent_info,
+                sticky_scope=subscription_pool.credential_scope_key(
+                    target_value, str(host_claude_dir)),
+            )
+            extra_env.update(sub_env)
+            if execution_path == "direct-llm":
+                extra_env["_USER_SUB"] = ""
+            logger.info(
+                f"Phone route user session for {agent_name}: no subscription for "
+                f"the tied user — using the platform pool"
+            )
+        except Exception as e:
+            logger.warning(f"Subscription pool fallback error for {agent_name}: {e}")
     # User-scoped work with no resolved credentials → surface a clean, actionable
     # block (the warmup handler turns this into a dashboard message) instead of
     # letting the layer start with an empty key and fail cryptically mid-turn.
@@ -545,6 +614,16 @@ async def build_agent_config(
         raise subscription_pool.NoSubscriptionError(
             subscription_pool.user_scope_block_reason(execution_path, creds_sub)
         )
+
+    # Prompt-size line (≈ tokens = chars / 4): the always-loaded skill text
+    # is the bulk of it — this is the number the skills card/guide split
+    # (Plan B) is measured against, on every engine.
+    _prompt_chars = len(agent_prompt or "")
+    logger.info(
+        f"Prompt built for {agent_name}: client={client_type or '-'} "
+        f"layer={execution_path or '-'} ≈{_prompt_chars // 4} tokens "
+        f"({_prompt_chars} chars)"
+    )
 
     return AgentConfig(
         agent_name=agent_name,

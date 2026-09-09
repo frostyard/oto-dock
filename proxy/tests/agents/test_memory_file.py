@@ -396,3 +396,18 @@ def test_git_repo_root_never_resolves_to_user_dir_root(tmp_path):
     assert git_repo_root(agent_dir, "agent") == agent_dir / "knowledge"
     assert git_repo_root(agent_dir, "user", "alice") == \
         agent_dir / "users" / "alice" / "context"
+
+
+def test_scope_roots_refuse_a_username_that_leaves_the_agent(tmp_path):
+    from services.memory.memory_file import git_repo_root, scope_root
+    agent_dir = tmp_path / "agents" / "pa"
+    assert scope_root(agent_dir, "agent") == agent_dir / "knowledge" / "memory"
+    assert scope_root(agent_dir, "user", "alice") == (
+        agent_dir / "users" / "alice" / "context" / "memory")
+    # ``users/../context`` stays below the agent dir (a wrong place, not an
+    # escape); these two would leave it.
+    for bad in ("../../other", "/etc"):
+        with pytest.raises(ValueError):
+            scope_root(agent_dir, "user", bad)
+        with pytest.raises(ValueError):
+            git_repo_root(agent_dir, "user", bad)

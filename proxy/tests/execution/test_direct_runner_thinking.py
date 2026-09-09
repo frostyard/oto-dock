@@ -1,0 +1,146 @@
+"""run_direct_stream thinking bracket — the start/delta/end phase contract the
+Codex layer's translator emits, reproduced by the direct path from the
+adapters' ``thinking_delta`` events.
+
+Verifies:
+- reasoning fragments open one ``start``, stream as ``delta``, and the first
+  non-reasoning event closes with ``end`` — before the text that follows;
+- a reasoning-only API call still closes its block (on ``stop``);
+- a provider error after reasoning closes the block before the error event;
+- thinking text never lands in the assistant message history.
+"""
+
+from typing import AsyncIterator
+
+import pytest
+
+from core.layers.providers.base import (
+    ProviderAdapter, ProviderError, ProviderStreamEvent, ProviderUsage,
+)
+from core.layers.providers.registry import register_adapter
+
+
+_STUB_PROVIDER = "stub-thinking-test"
+
+
+class _StubAdapter(ProviderAdapter):
+    """Replays a scripted event list; ``script`` is set per test."""
+
+    script: list = []
+
+    @property
+    def provider_name(self) -> str:
+        return _STUB_PROVIDER
+
+    async def stream_response(self, **kwargs) -> AsyncIterator[ProviderStreamEvent]:
+        for ev in self.script:
+            if isinstance(ev, Exception):
+                raise ev
+            yield ev
+
+    def format_tool_results(self, results):
+        return []
+
+    def serialize_assistant_content(self, raw_content):
+        return raw_content if isinstance(raw_content, str) else ""
+
+
+_ADAPTER = _StubAdapter()
+register_adapter(_ADAPTER)
+
+
+@pytest.fixture
+def direct_session(monkeypatch):
+    from core.layers.direct.session import DirectSession
+    monkeypatch.setattr(
+        "core.layers.direct.session.config.get_agent_model", lambda agent: "",
+    )
+    session = DirectSession(
+        session_id="thinking-session", agent_name="test-agent",
+        system_prompt="You are a test agent.", provider=_STUB_PROVIDER,
+    )
+    session.model = "test-model"
+    session.api_key = "stub-test-key"
+    return session
+
+
+async def _collect(session, prompt="hi"):
+    from core.layers.direct.session import run_direct_stream
+    out = []
+    async for ev in run_direct_stream(session, prompt):
+        out.append(ev)
+    return out
+
+
+def _shape(events):
+    shaped = []
+    for ev in events:
+        if ev["type"] == "thinking":
+            shaped.append(("thinking", ev["data"]["phase"], ev["data"].get("text", "")))
+        elif ev["type"] == "text":
+            shaped.append(("text", ev["data"]["content"]))
+        else:
+            shaped.append((ev["type"],))
+    return shaped
+
+
+@pytest.mark.asyncio
+async def test_thinking_bracket_precedes_text(direct_session):
+    _ADAPTER.script = [
+        ProviderStreamEvent(type="thinking_delta", text="a"),
+        ProviderStreamEvent(type="thinking_delta", text="b"),
+        ProviderStreamEvent(type="text_delta", text="x"),
+        ProviderStreamEvent(type="usage", usage=ProviderUsage(input_tokens=5, output_tokens=2)),
+        ProviderStreamEvent(type="content", raw_content="x"),
+        ProviderStreamEvent(type="stop", stop_reason="end_turn"),
+    ]
+    events = await _collect(direct_session)
+    assert _shape(events)[:6] == [
+        ("session",),
+        ("thinking", "start", ""), ("thinking", "delta", "a"),
+        ("thinking", "delta", "b"), ("thinking", "end", ""),
+        ("text", "x"),
+    ]
+    assert [e["type"] for e in events][-2:] == ["metadata", "done"]
+    assert direct_session.messages[-1] == {"role": "assistant", "content": "x"}
+
+
+@pytest.mark.asyncio
+async def test_reasoning_only_call_still_closes(direct_session):
+    _ADAPTER.script = [
+        ProviderStreamEvent(type="thinking_delta", text="only"),
+        ProviderStreamEvent(type="stop", stop_reason="end_turn"),
+    ]
+    events = await _collect(direct_session)
+    phases = [e["data"]["phase"] for e in events if e["type"] == "thinking"]
+    assert phases == ["start", "delta", "end"]
+    assert not any(e["type"] == "text" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_provider_error_closes_thinking_first(direct_session):
+    _ADAPTER.script = [
+        ProviderStreamEvent(type="thinking_delta", text="…"),
+        ProviderError("boom", status_code=500),
+    ]
+    shaped = _shape(await _collect(direct_session))
+    assert shaped[-2:] == [("thinking", "end", ""), ("error",)]
+
+
+def test_thinking_translates_to_common_event():
+    from core.events.common_events import THINKING
+    from core.layers.direct.layer import direct_event_to_common
+    ev = direct_event_to_common({"type": "thinking", "data": {"phase": "delta", "text": "t"}})
+    assert ev is not None and ev.type == THINKING
+    assert ev.data == {"phase": "delta", "text": "t"}
+
+
+@pytest.mark.asyncio
+async def test_no_thinking_no_bracket(direct_session):
+    _ADAPTER.script = [
+        ProviderStreamEvent(type="text_delta", text="plain"),
+        ProviderStreamEvent(type="content", raw_content="plain"),
+        ProviderStreamEvent(type="stop", stop_reason="end_turn"),
+    ]
+    events = await _collect(direct_session)
+    assert not any(e["type"] == "thinking" for e in events)

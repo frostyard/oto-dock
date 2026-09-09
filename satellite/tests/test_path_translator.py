@@ -649,3 +649,32 @@ def test_sat_to_virtual_empty_inputs():
     assert path_translator.translate_satellite_to_virtual_in_text(
         "", agents_dir=agents_dir,
     ) == ""
+
+
+def test_sat_to_virtual_linear_on_long_unbroken_runs():
+    """A long run with no break character is one match, never a rescan per
+    ``/`` — the lazy-body + lookahead shape the scanner flagged as
+    quadratic is gone, and the output is untouched."""
+    import time
+    agents_dir = Path("/home/alice/.oto-dock/agents")
+    body = "/" + "/!" * 50_000
+    t0 = time.perf_counter()
+    out = path_translator.translate_satellite_to_virtual_in_text(
+        body, agents_dir=agents_dir,
+    )
+    assert out == body
+    assert time.perf_counter() - t0 < 2.0
+
+
+@pytest.mark.parametrize("tail", [
+    "", " next", ",", ";", ":", "'", '"', "`", ")", "(", "{", "}", "[", "]", "\n",
+])
+def test_sat_to_virtual_stops_at_every_break_char(tail):
+    """The greedy body stops exactly where the lookahead used to: at each
+    break character and at the end of input."""
+    agents_dir = Path("/home/alice/.oto-dock/agents")
+    body = f"/home/alice/.oto-dock/agents/pa/workspace/a.txt{tail}"
+    out = path_translator.translate_satellite_to_virtual_in_text(
+        body, agents_dir=agents_dir,
+    )
+    assert out == f"/workspace/a.txt{tail}"

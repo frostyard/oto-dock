@@ -217,11 +217,14 @@ def translate_satellite_to_virtual_in_text(
     # known sandbox subdirs. Slug can contain hyphens, underscores,
     # alnum. The trailing capture ends at whitespace / quoting chars.
     # We match both `/` and `\\` (escaped backslash from JSON) as path seps.
+    # The body class is the exact complement of the break set, so a greedy
+    # run ends precisely at the next break char or the end of input — the
+    # lazy body + lookahead that used to say the same thing is the shape
+    # static analysis flags as polynomial backtracking.
     pattern = re.compile(
         r"(?<![\w./\\-])"   # not in the middle of another token
         r"([A-Za-z]:[\\/]|/)"  # drive prefix `C:\` or `C:/` OR root `/`
-        r"([^\s,;:'\"`)({}\[\]]+?)"  # body up to next break
-        r"(?=[\s,;:'\"`)({}\[\]]|$)"
+        r"([^\s,;:'\"`)({}\[\]]+)"  # body up to next break
     )
 
     def _sub(match: re.Match) -> str:

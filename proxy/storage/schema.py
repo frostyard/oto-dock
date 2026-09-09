@@ -1013,6 +1013,21 @@ def init_audio_telephony(conn) -> None:
             dial_prefix TEXT NOT NULL DEFAULT '',
             adapter_data JSONB NOT NULL DEFAULT '{}',
             trigger_slug TEXT,
+            -- Who the caller IS on this route and what the session may touch
+            -- (external routes, 2026-09-06). 'caller' = every caller gets a
+            -- private space and is an EXTERNAL principal; 'shared' = the
+            -- agent's shared space, still external; 'user' = the call runs as
+            -- identity_user_sub's own session (capped at manager). ``role``
+            -- applies to the two external modes. remember_callers = FALSE makes
+            -- every caller ephemeral (no private tree, no memory) — for public
+            -- numbers where caller-ID cannot be trusted. Existing installs get
+            -- the same defaults via run_migrations (no migration-only state).
+            identity_mode TEXT NOT NULL DEFAULT 'caller'
+                CHECK (identity_mode IN ('caller', 'shared', 'user')),
+            identity_user_sub TEXT REFERENCES users(sub) ON DELETE SET NULL,
+            role TEXT NOT NULL DEFAULT 'viewer'
+                CHECK (role IN ('viewer', 'editor', 'manager')),
+            remember_callers BOOLEAN NOT NULL DEFAULT TRUE,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
@@ -1050,7 +1065,10 @@ def init_phone_call_log(conn) -> None:
     that never warmed a session (PIN-refused, capacity-rejected). The
     ``route_name`` snapshot survives route deletion (FK goes NULL).
     Only attempt COUNTS are stored for PIN outcomes — never digits.
-    New table (no ALTER — see the phone_routes migration note above).
+    ``session_id`` / ``identity`` / ``tools_run`` (2026-09-06) are the audit
+    trail of the warmed session: the daemon reports the session id, the
+    proxy fills the caller identity label and the distinct tools the call
+    ran. Pre-existing installs get them via run_migrations.
     """
     conn.execute("""
         CREATE TABLE IF NOT EXISTS phone_call_log (
@@ -1069,6 +1087,9 @@ def init_phone_call_log(conn) -> None:
             started_at TEXT NOT NULL,
             ended_at TEXT,
             duration_s INTEGER,
+            session_id TEXT NOT NULL DEFAULT '',
+            identity TEXT NOT NULL DEFAULT '',
+            tools_run JSONB NOT NULL DEFAULT '[]',
             created_at TEXT NOT NULL
         )
     """)
@@ -1127,6 +1148,16 @@ def init_remote_machines(conn) -> None:
             -- defaults closed for BOTH admin- and user-paired machines and is
             -- granted only by an explicit per-capability toggle.
             device_grants TEXT NOT NULL DEFAULT '[]',
+            -- Which browser the browser-control MCP drives on this machine:
+            -- 'dedicated' (the per-agent profile, default) or 'own' (the OS
+            -- user's signed-in Chrome/Edge/Brave through the Playwright
+            -- Extension). Meaningful only while 'browser' is granted —
+            -- revoking that grant resets it.
+            browser_mode TEXT NOT NULL DEFAULT 'dedicated',
+            -- Playwright Extension token for 'own' mode (Fernet, credential-
+            -- store key). NULL = every session asks the user to click Allow.
+            -- Never leaves the store: listed in remote_store._SECRET_COLUMNS.
+            browser_extension_token_enc TEXT,
             -- Whether admins currently hold an outstanding "offline" alert
             -- for this machine. Set TRUE when the sustained-outage evaluator
             -- (core/remote/satellite_connection.py) fires the offline notification;
@@ -1245,6 +1276,11 @@ def init_execution_layers(conn) -> None:
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_els_layer ON execution_layer_subscriptions(layer)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_els_contribute ON execution_layer_subscriptions(contribute_platform, owner_sub)")
+    # ``is_primary`` is retired (it was only a stable-sort tie-break behind the
+    # consumption routing and read as a "primary provider" it never was). The
+    # column stays for released installs; rows are zeroed so an older client
+    # bundle that still renders the badge shows nothing.
+    conn.execute("UPDATE execution_layer_subscriptions SET is_primary = FALSE WHERE is_primary")
 
     # --- Session → subscription bindings (persisted mirror of the pool's
     # in-memory map). Survives proxy restarts so usage attribution
@@ -2026,6 +2062,16 @@ def run_migrations(conn) -> None:
         "ALTER TABLE remote_machines ADD COLUMN IF NOT EXISTS "
         "update_rollback_target TEXT"
     )
+    # 2026-09-04: browser-control own-browser mode — per-machine opt-in plus
+    # the encrypted Playwright Extension token.
+    conn.execute(
+        "ALTER TABLE remote_machines ADD COLUMN IF NOT EXISTS "
+        "browser_mode TEXT NOT NULL DEFAULT 'dedicated'"
+    )
+    conn.execute(
+        "ALTER TABLE remote_machines ADD COLUMN IF NOT EXISTS "
+        "browser_extension_token_enc TEXT"
+    )
     # 2026-07-11: chat/project-scoped pins (the Dock). The one-per-scope
     # partial unique indexes live HERE, not in init_pinned_apps: on a
     # pre-existing install the CREATE-IF-NOT-EXISTS no-ops before these
@@ -2096,6 +2142,38 @@ def run_migrations(conn) -> None:
     conn.execute(
         "ALTER TABLE dynamic_tasks "
         "ADD COLUMN IF NOT EXISTS override_execution_path TEXT DEFAULT ''"
+    )
+    # 2026-09-06: external routes — route identity / role / remember-callers
+    # and the call-log audit columns. The defaults match the CREATE (every
+    # pre-existing route becomes a per-caller external route, exactly like a
+    # new one); the CHECKs stay in-CREATE only per the convention above.
+    conn.execute(
+        "ALTER TABLE phone_routes "
+        "ADD COLUMN IF NOT EXISTS identity_mode TEXT NOT NULL DEFAULT 'caller'"
+    )
+    conn.execute(
+        "ALTER TABLE phone_routes ADD COLUMN IF NOT EXISTS identity_user_sub "
+        "TEXT REFERENCES users(sub) ON DELETE SET NULL"
+    )
+    conn.execute(
+        "ALTER TABLE phone_routes "
+        "ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'viewer'"
+    )
+    conn.execute(
+        "ALTER TABLE phone_routes "
+        "ADD COLUMN IF NOT EXISTS remember_callers BOOLEAN NOT NULL DEFAULT TRUE"
+    )
+    conn.execute(
+        "ALTER TABLE phone_call_log "
+        "ADD COLUMN IF NOT EXISTS session_id TEXT NOT NULL DEFAULT ''"
+    )
+    conn.execute(
+        "ALTER TABLE phone_call_log "
+        "ADD COLUMN IF NOT EXISTS identity TEXT NOT NULL DEFAULT ''"
+    )
+    conn.execute(
+        "ALTER TABLE phone_call_log "
+        "ADD COLUMN IF NOT EXISTS tools_run JSONB NOT NULL DEFAULT '[]'"
     )
     # 2026-07-13: cron day-of-week convention fix. Stored 5-field schedules
     # used to reach APScheduler verbatim, whose numeric day-of-week is

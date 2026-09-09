@@ -22,6 +22,21 @@ import config as app_config
 logger = logging.getLogger("claude-proxy.sandbox")
 
 
+#: Where an external caller's own tree appears inside the session
+#: (``core/session/external_identity.py`` owns the on-disk layout).
+EXTERNAL_SANDBOX_HOME = "/caller"
+
+
+def empty_mount_dir() -> Path:
+    """A platform-owned, always-empty directory used as an RO bind SOURCE to
+    mask a subtree out of a session (the shared memory on external
+    sessions). Lives under the sessions dir, never under an agent tree, so
+    no session can populate it."""
+    p = app_config.SESSIONS_DIR / ".empty"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def _verified_literal_path(root_real: Path, *parts: str) -> Path | None:
     """Resolve ``root_real/parts...`` and demand it IS that literal path.
 
@@ -173,6 +188,99 @@ _nested_sandbox_ok: bool | None = None
 def nested_sandbox_ok() -> bool | None:
     """Boot probe result: can a bwrap nest inside the sandbox stack?"""
     return _nested_sandbox_ok
+
+
+def claude_runtime_root() -> str:
+    """The Claude Code CLI's per-user runtime root INSIDE a local sandbox.
+
+    The CLI derives it as ``os.tmpdir()/claude-<uid>`` and keeps its
+    scratchpad + background-task outputs under ``<root>/<cwd-slug>/<session
+    id>/``. In our sandbox that is a proxy-host constant: ``HOME`` is
+    ``/tmp`` on the per-sandbox ``--tmpfs /tmp`` (``get_env_overrides`` /
+    ``_system_mounts``), no ``TMPDIR`` reaches the agent env (env_builder's
+    allowlist), and the in-sandbox uid is the proxy uid on every topology
+    (plain bwrap keeps it; the netns launcher maps it back). The path policy
+    admits the session's own subtree with this root — keep the three facts
+    above in step with it.
+    """
+    return f"/tmp/claude-{os.getuid()}"
+
+
+# Boot probe: does this bubblewrap accept ``--size`` (tmpfs size cap)? None =
+# not probed (yet); the mount builder probes lazily if the preflight never ran.
+_bwrap_has_size: bool | None = None
+
+
+def _probe_bwrap_size() -> bool:
+    bwrap = shutil.which("bwrap")
+    if not bwrap:
+        return False
+    try:
+        out = subprocess.run(
+            [bwrap, "--help"], capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "--size" in (out.stdout or "") + (out.stderr or "")
+
+
+def _mem_total_mb() -> int:
+    """Host RAM in MB from /proc/meminfo (0 when unreadable). In a container
+    this is the HOST's figure, not the cgroup limit — the cap is a bound."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def tmpfs_cap_mb() -> int:
+    """Effective per-sandbox ``/tmp`` cap in MB, or 0 for "no --size".
+
+    ``SANDBOX_TMP_SIZE_MB`` (default 4096; 0 disables) bounded by half the
+    host's RAM — the kernel's own tmpfs default — so the cap can never
+    LOOSEN what an uncapped mount would get on a small box. Every local
+    sandbox has its own RAM-backed ``/tmp`` (``HOME``: uv/pip/npm caches,
+    model downloads, any runaway write), so without a cap N sandboxes can
+    commit N × RAM/2; with it a runaway becomes ENOSPC inside one sandbox
+    instead of host memory pressure. Requires a bubblewrap with ``--size``
+    (0.8 in the proxy image has it; 0.6.1 on Ubuntu 22.04 does not).
+    """
+    global _bwrap_has_size
+    mb = int(app_config.SANDBOX_TMP_SIZE_MB or 0)
+    if mb <= 0:
+        return 0
+    if _bwrap_has_size is None:
+        _bwrap_has_size = _probe_bwrap_size()
+    if not _bwrap_has_size:
+        return 0
+    half_ram = _mem_total_mb() // 2
+    return min(mb, half_ram) if half_ram > 0 else mb
+
+
+def tmpfs_cap_preflight() -> None:
+    """Boot: probe ``bwrap --size`` support once and log the effective cap,
+    so an operator can see from the log whether sandboxes' /tmp is bounded."""
+    global _bwrap_has_size
+    _bwrap_has_size = _probe_bwrap_size()
+    configured = int(app_config.SANDBOX_TMP_SIZE_MB or 0)
+    if configured <= 0:
+        logger.info("sandbox /tmp cap disabled (SANDBOX_TMP_SIZE_MB=0)")
+        return
+    if not _bwrap_has_size:
+        logger.info(
+            "sandbox /tmp uncapped: this bubblewrap has no --size "
+            "(SANDBOX_TMP_SIZE_MB=%d ignored; the proxy image's bwrap has it)",
+            configured,
+        )
+        return
+    logger.info(
+        "sandbox /tmp cap: %d MB per sandbox (SANDBOX_TMP_SIZE_MB=%d, "
+        "host RAM/2=%d MB)", tmpfs_cap_mb(), configured, _mem_total_mb() // 2,
+    )
 
 
 def _nested_sandbox_probe() -> str | None:
@@ -422,6 +530,26 @@ class SandboxMount:
 
 
 @dataclass(frozen=True)
+class Mount:
+    """One decided entry of the role mount table: the host directory ``host``
+    appears at ``sandbox`` inside the session, read-write when ``rw``.
+
+    ``SandboxBuilder.workspace_mount_table`` is the single source of truth for
+    what a session can read and write: ``_workspace_mounts`` renders the list
+    as bwrap ``--bind`` / ``--ro-bind`` args for CLI + MCP processes, and the
+    Direct-LLM file tools (core/layers/direct/files.py — in-proxy, no bwrap
+    underneath) resolve their paths against the SAME list. Order matters:
+    bwrap gives a later bind precedence at the same or a deeper destination
+    (the RO root + RW subdir stacking below relies on it), so a resolver must
+    pick the longest matching ``sandbox`` prefix and, on a tie, the later
+    entry.
+    """
+    host: str       # real directory on the proxy host
+    sandbox: str    # mount point inside the session
+    rw: bool
+
+
+@dataclass(frozen=True)
 class SandboxConfig:
     """Immutable description of a sandbox for one session."""
     role: str                                # viewer / manager / admin
@@ -449,6 +577,15 @@ class SandboxConfig:
     # which stays human-manager-only. Computed by resolve_task_identity
     # from the dynamic task's creator; False everywhere else.
     knowledge_rw: bool = False
+    # External routes (core/session/external_identity.py): the session's
+    # caller is not a platform user. ``external`` masks the shared memory
+    # (knowledge/memory) out of the RO /knowledge bind; ``external_home``
+    # (host path; "" when the agent's mode has no personal scope or the
+    # target is remote) mounts the caller's own tree at /caller — RO root
+    # with workspace/, context/ and the CLI state dirs RW, like /users/{u}.
+    # Both ride the agent-scope branch (``username == ""``).
+    external: bool = False
+    external_home: str = ""
     # Attached knowledge libraries: ``(source_slug, subdir, writable)`` per
     # row of knowledge_library_attachments (``subdir == ''`` = whole-folder
     # share). Mirrors are real dirs inside THIS agent's knowledge tree
@@ -585,6 +722,9 @@ class SandboxBuilder:
         """Sandbox-internal CWD for this role."""
         username = self.cfg.username
 
+        if self.cfg.external_home:
+            # External caller with a private tree — their own home.
+            return EXTERNAL_SANDBOX_HOME
         if not username:
             # Agent-scoped task
             return "/workspace"
@@ -602,8 +742,11 @@ class SandboxBuilder:
             config_dir_name: Name of the config directory (".claude" or ".codex").
             config_env_var: Env var pointing to it ("CLAUDE_CONFIG_DIR" or "CODEX_CONFIG_DIR").
         """
-        # Config dir lives inside the user or workspace dir (no separate mount)
-        if self.cfg.username:
+        # Config dir lives inside the caller / user / workspace dir (no
+        # separate mount)
+        if self.cfg.external_home:
+            cfg_dir = f"{EXTERNAL_SANDBOX_HOME}/{config_dir_name}"
+        elif self.cfg.username:
             cfg_dir = f"/users/{self.cfg.username}/{config_dir_name}"
         else:
             cfg_dir = f"/workspace/{config_dir_name}"
@@ -732,9 +875,14 @@ class SandboxBuilder:
             if os.path.exists(path):
                 args.extend(["--ro-bind", path, path])
 
-        # Minimal /dev, /proc, /tmp
+        # Minimal /dev, /proc, /tmp. The tmpfs is HOME (see get_env_overrides)
+        # and the CLI's runtime root (claude_runtime_root); ``--size`` must
+        # directly precede the ``--tmpfs`` it bounds (see tmpfs_cap_mb).
         args.extend(["--dev", "/dev"])
         args.extend(["--proc", "/proc"])
+        cap_mb = tmpfs_cap_mb()
+        if cap_mb > 0:
+            args.extend(["--size", str(cap_mb * 1024 * 1024)])
         args.extend(["--tmpfs", "/tmp"])
 
         return args
@@ -744,7 +892,17 @@ class SandboxBuilder:
         return []
 
     def _workspace_mounts(self) -> list[str]:
-        """Role-dependent workspace mounts (3-tier per-agent model).
+        """bwrap args for the role mount table — rendered from
+        :meth:`workspace_mount_table` so the kernel view and the Direct-LLM
+        file resolver can never disagree."""
+        args: list[str] = []
+        for m in self.workspace_mount_table():
+            args.extend(["--bind" if m.rw else "--ro-bind", m.host, m.sandbox])
+        return args
+
+    def workspace_mount_table(self) -> list[Mount]:
+        """Role-dependent workspace mounts (3-tier per-agent model), as the
+        ordered list of :class:`Mount` decisions.
 
         Mount table:
 
@@ -772,9 +930,11 @@ class SandboxBuilder:
         Kernel-level enforcement is the single source of truth for file
         access — sidesteps Codex's hook bypass for non-Bash tools. The
         application-level path_policy is defense-in-depth that runs in the
-        Claude Code hook only.
+        Claude Code hook only — and the Direct-LLM file tools, which run
+        inside the proxy with no bwrap underneath, resolve against this very
+        list so they see exactly the kernel's view.
         """
-        args: list[str] = []
+        mounts: list[Mount] = []
         role = self.cfg.role
         username = self.cfg.username
         agent_dir_path = self._agent_dir
@@ -803,6 +963,10 @@ class SandboxBuilder:
             storage_quota.ensure_scope(self.cfg.agent_name, "shared")
             if username:
                 storage_quota.ensure_scope(self.cfg.agent_name, "user", username)
+            if self.cfg.external_home:
+                # Caller trees are metered as their own per-agent bucket so a
+                # caller cannot fill the agent's shared one.
+                storage_quota.ensure_scope(self.cfg.agent_name, "external")
         except Exception:
             pass  # never block a sandbox build on quota assignment
 
@@ -856,26 +1020,26 @@ class SandboxBuilder:
             # config_visible=False, so this stays byte-identical to the
             # pre-visibility-modes agent branch (/workspace RW + /knowledge RO).
             if role == "viewer":
-                args.extend(["--ro-bind", f"{agent_dir}/workspace", "/workspace"])
+                mounts.append(Mount(f"{agent_dir}/workspace", "/workspace", False))
             else:
-                args.extend(["--bind", f"{agent_dir}/workspace", "/workspace"])
+                mounts.append(Mount(f"{agent_dir}/workspace", "/workspace", True))
             if config_visible or self.cfg.knowledge_rw:
                 # Owner-tier human in the agent scope (curates knowledge +
                 # config) — or a manager-provenance task fire (knowledge_rw:
                 # knowledge RW, /config deliberately NOT mounted).
-                args.extend(["--bind", f"{agent_dir}/knowledge", "/knowledge"])
+                mounts.append(Mount(f"{agent_dir}/knowledge", "/knowledge", True))
                 if config_visible:
-                    args.extend(["--bind", f"{agent_dir}/config", "/config"])
+                    mounts.append(Mount(f"{agent_dir}/config", "/config", True))
                 # Read-only library mirrors stay kernel-RO under the RW
                 # parent — one nested bind per library SUBTREE.
                 for _src, _subdir, _writable in lib_attachments:
                     if not _writable:
-                        args.extend(["--ro-bind", _mirror_host(_src, _subdir),
-                                     _mirror_dest(_src, _subdir)])
+                        mounts.append(Mount(_mirror_host(_src, _subdir),
+                                            _mirror_dest(_src, _subdir), False))
             else:
                 # Knowledge is universal + RO for non-owners / service sessions
                 # (mirrors ride the RO parent — no nested binds needed).
-                args.extend(["--ro-bind", f"{agent_dir}/knowledge", "/knowledge"])
+                mounts.append(Mount(f"{agent_dir}/knowledge", "/knowledge", False))
                 # Agent-scope MCP credentials live at knowledge/.credentials
                 # (path_roles credentials_dir role) and MCP processes must
                 # WRITE there: workspace-mcp write-checks the dir on boot and
@@ -899,9 +1063,10 @@ class SandboxBuilder:
                         "tampering)", self.cfg.agent_name,
                     )
                 elif cred_dir.is_dir():
-                    args.extend(["--bind", str(cred_dir),
-                                 "/knowledge/.credentials"])
-            return args
+                    mounts.append(Mount(str(cred_dir),
+                                        "/knowledge/.credentials", True))
+            mounts.extend(self._external_mounts(agent_dir_path, agent_root_real))
+            return mounts
 
         # User-scope MOUNT — the session has its own personal dir. The dir
         # ROOT is read-only with the known subdirs stacked RW on top: agents
@@ -923,20 +1088,20 @@ class SandboxBuilder:
         # .codex is session_config_dir's job and is RW-bound below.
         for sub in (".git", ".agents"):
             (user_dir / sub).mkdir(parents=True, exist_ok=True)
-        args.extend(["--ro-bind", str(user_dir), f"/users/{username}"])
+        mounts.append(Mount(str(user_dir), f"/users/{username}", False))
         for sub in ("workspace", "context"):
             (user_dir / sub).mkdir(parents=True, exist_ok=True)
-            args.extend(["--bind", str(user_dir / sub), f"/users/{username}/{sub}"])
+            mounts.append(Mount(str(user_dir / sub), f"/users/{username}/{sub}", True))
         # CLI state dirs (session's own is pre-created by the layer) + the
         # per-user MCP OAuth token dir (MCP processes refresh tokens in place).
         for sub in (".claude", ".codex", ".credentials"):
             if (user_dir / sub).is_dir():
-                args.extend(["--bind", str(user_dir / sub), f"/users/{username}/{sub}"])
+                mounts.append(Mount(str(user_dir / sub), f"/users/{username}/{sub}", True))
 
         # /config — owner-tier only (the agent's behavior layer). Hoisted out of
         # the role branch so Personal-only managers (no shared dirs) still get it.
         if config_visible:
-            args.extend(["--bind", f"{agent_dir}/config", "/config"])
+            mounts.append(Mount(f"{agent_dir}/config", "/config", True))
 
         # Shared workspace + knowledge — present only when the agent's mode
         # offers the agent scope. Personal-only (``mount_shared=False``) omits
@@ -944,22 +1109,22 @@ class SandboxBuilder:
         if mount_shared:
             if role in ("manager", "admin"):
                 # Owner tier: knowledge RW (reference library) + workspace RW.
-                args.extend(["--bind", f"{agent_dir}/knowledge", "/knowledge"])
-                args.extend(["--bind", f"{agent_dir}/workspace", "/workspace"])
+                mounts.append(Mount(f"{agent_dir}/knowledge", "/knowledge", True))
+                mounts.append(Mount(f"{agent_dir}/workspace", "/workspace", True))
                 # Read-only library mirrors stay kernel-RO under the RW
                 # parent — one nested bind per library SUBTREE.
                 for _src, _subdir, _writable in lib_attachments:
                     if not _writable:
-                        args.extend(["--ro-bind", _mirror_host(_src, _subdir),
-                                     _mirror_dest(_src, _subdir)])
+                        mounts.append(Mount(_mirror_host(_src, _subdir),
+                                            _mirror_dest(_src, _subdir), False))
             elif role == "editor":
                 # Editor: workspace RW (collaboration), knowledge RO.
-                args.extend(["--ro-bind", f"{agent_dir}/knowledge", "/knowledge"])
-                args.extend(["--bind", f"{agent_dir}/workspace", "/workspace"])
+                mounts.append(Mount(f"{agent_dir}/knowledge", "/knowledge", False))
+                mounts.append(Mount(f"{agent_dir}/workspace", "/workspace", True))
             else:
                 # Viewer (or unknown): both RO — SEE state + docs, mutate nothing.
-                args.extend(["--ro-bind", f"{agent_dir}/knowledge", "/knowledge"])
-                args.extend(["--ro-bind", f"{agent_dir}/workspace", "/workspace"])
+                mounts.append(Mount(f"{agent_dir}/knowledge", "/knowledge", False))
+                mounts.append(Mount(f"{agent_dir}/workspace", "/workspace", False))
         elif lib_attachments:
             # Personal-only: no shared /knowledge exists, but attached
             # libraries still mount — each mirror individually, ALWAYS
@@ -968,10 +1133,64 @@ class SandboxBuilder:
             # With no parent bind, bwrap creates the /knowledge/shared
             # chain inside the sandbox root itself.
             for _src, _subdir, _writable in lib_attachments:
-                args.extend(["--ro-bind", _mirror_host(_src, _subdir),
-                             _mirror_dest(_src, _subdir)])
+                mounts.append(Mount(_mirror_host(_src, _subdir),
+                                    _mirror_dest(_src, _subdir), False))
 
-        return args
+        return mounts
+
+    def _external_mounts(self, agent_dir_path: Path, agent_root_real: Path) -> list[Mount]:
+        """The external-session additions to the agent-scope mount set
+        (``SandboxConfig.external`` — a phone caller who is not a platform
+        user), appended AFTER the shared binds so bwrap's later-bind
+        precedence (and the Direct resolver's longest-prefix rule) applies:
+
+        1. the shared agent memory is masked — an empty, platform-owned dir
+           is bound RO over ``/knowledge/memory`` (existence-guarded: bwrap
+           cannot create a mountpoint under the RO parent, and an agent
+           that never saved memory has nothing to hide);
+        2. the caller's own tree (``external_home``) at /caller — RO root
+           with ``workspace/`` + ``context/`` RW and the CLI state dirs RW
+           when present, the ``/users/{u}`` shape. Every bind source is
+           verified symlink-free under the resolved agent root (the tree
+           sits below agent-writable binds — see ``_verified_literal_path``).
+        """
+        cfg = self.cfg
+        if not cfg.external:
+            return []
+        mounts: list[Mount] = []
+        if (agent_dir_path / "knowledge" / "memory").is_dir():
+            mounts.append(Mount(str(empty_mount_dir()), "/knowledge/memory", False))
+        if not cfg.external_home:
+            return mounts
+        home = Path(cfg.external_home)
+        home_real = Path(os.path.realpath(home))
+        if home_real != home or not home_real.is_relative_to(agent_root_real):
+            raise RuntimeError(
+                f"Refusing sandbox build: external home {home} is not a "
+                "plain directory under the agent tree (possible tampering)"
+            )
+        rel_parts = home_real.relative_to(agent_root_real).parts
+        for sub in ("workspace", "context"):
+            p = _verified_literal_path(agent_root_real, *rel_parts, sub)
+            if p is None:
+                raise RuntimeError(
+                    f"Refusing sandbox build: external home subdir {home / sub} "
+                    "contains a symlinked component (possible tampering)"
+                )
+            p.mkdir(parents=True, exist_ok=True)
+            if os.path.realpath(p) != str(p):
+                raise RuntimeError(
+                    f"Refusing sandbox build: external home subdir {p} "
+                    "changed underneath the build (possible tampering)"
+                )
+        mounts.append(Mount(str(home), EXTERNAL_SANDBOX_HOME, False))
+        for sub in ("workspace", "context"):
+            mounts.append(Mount(str(home / sub), f"{EXTERNAL_SANDBOX_HOME}/{sub}", True))
+        for sub in (".claude", ".codex"):
+            p = _verified_literal_path(agent_root_real, *rel_parts, sub)
+            if p is not None and p.is_dir():
+                mounts.append(Mount(str(p), f"{EXTERNAL_SANDBOX_HOME}/{sub}", True))
+        return mounts
 
     def _mcp_mounts(self) -> list[str]:
         """Mount this session's MCP dirs at the SAME absolute paths (RO).
@@ -1114,8 +1333,15 @@ def resolve_sandbox_config(
     knowledge_rw: bool = False,
     mcp_config_path: str | Path | None = None,
     mcp_dir_binds: list[str] | None = None,
+    external: bool = False,
+    external_home: str = "",
 ) -> SandboxConfig:
     """Build a SandboxConfig from session context.
+
+    ``external`` / ``external_home`` describe an EXTERNAL session (a phone
+    caller who is not a platform user — see ``SandboxConfig``): the shared
+    memory is masked and, with a home, the caller's own tree mounts at
+    /caller.
 
     ``config_visible`` / ``mount_shared`` carry the visibility-modes decouple
     (``username`` here is the MOUNT username). Callers that resolve the agent's
@@ -1199,4 +1425,6 @@ def resolve_sandbox_config(
             list(mcp_dir_binds) if mcp_dir_binds is not None
             else mcp_dir_binds_from_config(mcp_config_path)
         ),
+        external=external,
+        external_home=external_home or "",
     )

@@ -2,7 +2,7 @@
   "name": "file-tools",
   "label": "File Tools",
   "description": "Document reading, creation, editing, conversion, image manipulation, and live Collabora preview",
-  "version": "1.1.0",
+  "version": "1.2.1",
   "category": "core",
 
   "server": {
@@ -40,7 +40,14 @@
       "id": "file-tools-usage",
       "loading": "always",
       "file": "skills/file-tools.md",
-      "description": "Document and image tool descriptions, usage instructions, preview behavior",
+      "description": "Document and image tool routing, usage rules, preview behavior",
+      "default_exclude_from": []
+    },
+    {
+      "id": "file-tools-guide",
+      "loading": "on_demand",
+      "file": "skills/file-tools-guide/SKILL.md",
+      "description": "Reference for the file-tools MCP — what each document, spreadsheet, PDF and image tool supports, read/write caps, Excel date and number formats, scanned-PDF and OCR handling, the visual review and mathematics workflows. Use before a document, spreadsheet, PDF or image job.",
       "default_exclude_from": []
     },
     {

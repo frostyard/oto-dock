@@ -324,8 +324,11 @@ async def test_chat_status_targets_shared_owner(monkeypatch):
     assert nm.chat_status_targets("agent::so", "") == []
 
 
+_END_ROW = {"user_sub": "u", "agent": "researcher"}  # what the turn-end job returns
+
+
 async def test_task_pump_broadcasts_ready_but_never_pings(pump_end):
-    _pump("task")._fire_end_of_turn()
+    _pump("task")._fire_end_of_turn(_END_ROW, False, "researcher")
     await asyncio.sleep(0)
     assert pump_end["ready"] == [("task-42", "ready")]
     assert pump_end["ephemeral"] == []
@@ -334,7 +337,7 @@ async def test_task_pump_broadcasts_ready_but_never_pings(pump_end):
 async def test_continued_task_chat_pump_keeps_ping(pump_end):
     # A re-warmed task chat runs through the dashboard pump (source_type
     # "chat") — its follow-up turns keep the end-of-turn ping.
-    _pump("chat")._fire_end_of_turn()
+    _pump("chat")._fire_end_of_turn(_END_ROW, False, "researcher")
     await asyncio.sleep(0)
     assert pump_end["ready"] == [("task-42", "ready")]
     assert pump_end["ephemeral"] == [("u", "task-42")]

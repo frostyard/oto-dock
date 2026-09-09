@@ -11,7 +11,7 @@ Resolution (single chokepoint — see acquire_subscription):
 Pool selection: scope-sticky first (sessions sharing a credential file stay on
 one account — see credential_scope_key), then BYO before relay, then the
 two-tier least-consumed headroom sort (5h recent burn, 7d weekly tiebreak),
-with the store's is_primary / least-active order breaking remaining ties.
+with the store's least-active order breaking remaining ties.
 Bindings are mirrored to the DB (subscription_session_bindings) so usage
 attribution and stickiness survive proxy restarts.
 
@@ -377,6 +377,12 @@ def fetch_anthropic_subscription_fields(access_token: str) -> tuple[str, str]:
 # in the resolver changes.
 _USER_BORROWABLE_AUTH_TYPES = frozenset({"api_key", "relay", "local_endpoint"})
 
+# Auth types whose per-turn cost is an ACTIVITY estimate, not money: a
+# subscription's flat fee (oauth) or a local model (local_endpoint). The chat
+# hides the cost line + gauge for these (usage is still recorded). Kept as a
+# hide-list so an unknown future type keeps showing — today's behaviour.
+_ACTIVITY_AUTH_TYPES = frozenset({"oauth", "local_endpoint"})
+
 
 class NoSubscriptionError(Exception):
     """Raised when USER-scoped work resolves to no usable credentials, so the
@@ -432,8 +438,8 @@ def _select(
     allowed_auth: frozenset[str] | None,
 ) -> SubscriptionHandle | None:
     """Try candidates in priority order, claiming the first that yields usable
-    credentials. ``candidates`` is already ordered (is_primary DESC, least-active
-    first) by the store; here we additionally push hosted-relay subs last (a real
+    credentials. ``candidates`` is already ordered (least-active first) by the
+    store; here we additionally push hosted-relay subs last (a real
     BYO credential always wins over the relay's credit cost + latency hop).
 
     ``allowed_auth=None`` → no auth-type restriction (agent-scope / the owner's own
@@ -444,8 +450,8 @@ def _select(
     Ordering: a real BYO credential always beats the hosted relay (credit cost +
     latency); within that, route to the LEAST-CONSUMED account — recent burn
     (the ~5h window, tracking the provider's rolling reset) first, the 7-day
-    total as tiebreak (weekly caps). The store's is_primary / least-active order
-    breaks remaining ties (stable sort). Subscriptions currently throttled
+    total as tiebreak (weekly caps). The store's least-active order breaks
+    remaining ties (stable sort). Subscriptions currently throttled
     (recently hit a provider limit) are skipped so the next chat/turn fails over
     to a fresh account.
     """
@@ -919,6 +925,28 @@ def get_session_subscription(session_id: str) -> str | None:
     if isinstance(row, dict):
         return row.get("subscription_id") or None
     return None
+
+
+def session_cost_billed(session_id: str) -> bool:
+    """Whether the credential serving this session costs real money — an API
+    key or the hosted relay — as opposed to a subscription's or a local
+    model's activity estimate (``_ACTIVITY_AUTH_TYPES``). Drives the
+    ``cost_billed`` flag on the per-turn metadata event, i.e. whether the chat
+    SHOWS the cost; recording is unaffected. Same read-through as
+    ``get_session_subscription``. A session with no pool binding (pool-external
+    credentials) or an unreadable subscription row answers True: the kind is
+    unknowable there and showing is today's behaviour."""
+    sub_id = get_session_subscription(session_id)
+    if not sub_id:
+        return True
+    try:
+        row = subscription_store.get_subscription(sub_id)
+    except Exception:
+        logger.debug("cost_billed: subscription lookup failed", exc_info=True)
+        return True
+    if not isinstance(row, dict):
+        return True
+    return row.get("auth_type") not in _ACTIVITY_AUTH_TYPES
 
 
 def restore_session_binding(session_id: str) -> str | None:
@@ -1485,12 +1513,16 @@ def resolve_subscription_env(
     """
     import config as app_config  # local import to avoid circular dependency
 
-    # 1. Resolve provider from execution path + model/agent config
-    if execution_path == "direct-llm":
-        resolved_provider = app_config.get_model_provider(model) if model else ""
+    # 1. Resolve the provider from the model: both multi-provider layers
+    # (direct-llm, codex-cli) carry OpenAI-compatible LOCAL endpoints next to
+    # their vendor accounts, and the model decides which one a session needs.
+    # Claude Code has one provider — no filter.
+    if execution_path in ("direct-llm", "codex-cli"):
+        resolved_provider = (
+            app_config.get_model_provider(model, layer=execution_path) if model else ""
+        )
     else:
-        # CLI and future layers (Codex, etc.) use per-agent provider field
-        resolved_provider = (agent_info or {}).get("codex_provider", "")
+        resolved_provider = ""
 
     # 2. Acquire subscription from pool (scope-sticky only meaningful for the
     # credential-FILE layers — direct-llm injects keys per env, nothing shared)
@@ -1525,8 +1557,14 @@ def resolve_subscription_env(
             import json as _json
             env["_CLAUDE_CREDS_BLOB"] = _json.dumps(sub_handle.claude_creds_blob)
     elif execution_path == "codex-cli":
-        # Codex CLI uses CODEX_API_KEY for API key auth
-        if sub_handle.api_key:
+        if sub_handle.auth_type == "local_endpoint":
+            # A key on a LOCAL endpoint rides its own variable: CODEX_API_KEY
+            # would switch Codex into API-key auth against its built-in
+            # OpenAI provider, not the custom one the layer writes.
+            if sub_handle.api_key:
+                env["_CODEX_LOCAL_API_KEY"] = sub_handle.api_key
+        elif sub_handle.api_key:
+            # Codex CLI uses CODEX_API_KEY for API key auth
             env["CODEX_API_KEY"] = sub_handle.api_key
         # ChatGPT OAuth token — layer writes it to .codex/auth.json
         if sub_handle.oauth_access_token:
@@ -1537,6 +1575,19 @@ def resolve_subscription_env(
             env["_CODEX_AUTH_BLOB"] = _json.dumps(sub_handle.codex_auth_blob)
         if sub_handle.endpoint_url:
             env["_CODEX_ENDPOINT_URL"] = sub_handle.endpoint_url
+            # The provider (ollama / openai_compatible) picks the AGENTS.md
+            # note that tells the model whether its MCP tools reach it
+            # (helpers.local_provider_note). Popped by the layers like the URL.
+            env["_CODEX_ENDPOINT_PROVIDER"] = sub_handle.provider or ""
+            # The provider's codex-cli model rows (id + context window) feed
+            # the per-session model catalog that makes Codex defer its MCP
+            # tools (core/layers/codex/local_model_catalog). Read HERE, off
+            # the event loop (this resolver runs under to_thread), so the
+            # layers never touch the store on the loop. Popped like the URL.
+            from core.layers.codex.local_model_catalog import (
+                LOCAL_MODEL_ROWS_ENV, local_model_rows_json,
+            )
+            env[LOCAL_MODEL_ROWS_ENV] = local_model_rows_json(sub_handle.provider or "")
     else:
         # Direct LLM and other layers use generic provider env vars.
         env["_PROVIDER"] = sub_handle.provider

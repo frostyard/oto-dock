@@ -169,6 +169,16 @@ def is_protected_agent_config_path(path: Path | str) -> bool:
         return True
     if len(before) >= 2 and before[-2] == "users":  # users/<username>/.<dir>
         return True
+    # An external caller's tree — CLAUDE_CONFIG_DIR / CODEX_HOME of a phone
+    # session that is not a platform user: sandbox-virtual ``/caller/.<dir>``,
+    # host ``externals/<channel>/<id>/.<dir>`` or the ephemeral
+    # ``externals/<channel>/_ephemeral/<session>/.<dir>``.
+    if before[-1] == "caller" and len(before) <= 2:
+        return True
+    if "externals" in before:
+        rest = before[before.index("externals") + 1:]
+        if len(rest) in (2, 3):
+            return True
     return False
 
 
@@ -199,6 +209,38 @@ def is_claude_bg_output_path(path: Path | str) -> bool:
     except StopIteration:
         return False
     return "tasks" in parts[claude_i + 1:-1]
+
+
+def is_session_runtime_path(
+    path: Path | str, root: str, session_id: str, *,
+    case_insensitive: bool = False,
+) -> bool:
+    """True when ``path`` lies inside THIS session's Claude-CLI runtime tree.
+
+    The tree is ``<root>/<cwd-slug>/<session_id>/…`` — scratchpad and
+    background-task outputs. ``root`` is the CLI's per-user runtime root
+    (``<tempdir>/claude-<uid>``: reported by a satellite's capabilities
+    probe, or ``core.sandbox.sandbox.claude_runtime_root()`` for a local
+    sandbox) and ``session_id`` must appear as a path segment below it —
+    the root itself is not the tree. The session-id equality is the
+    capability: another session (another platform user on a shared-admin
+    satellite, another sandbox on the proxy) can never name this session's
+    UUID. Forward- and back-slash forms match; ``case_insensitive`` is for
+    Windows / macOS roots. Widening-only — callers MUST run the credential /
+    agent-config / cross-user / ``.env`` denies first.
+    """
+    if not root or not session_id:
+        return False
+    c = str(path).replace("\\", "/").rstrip("/")
+    p = str(root).replace("\\", "/").rstrip("/")
+    if case_insensitive:
+        c, p = c.lower(), p.lower()
+    if not p or not (c == p or c.startswith(p + "/")):
+        return False
+    rel = c[len(p):].strip("/")
+    if not rel:
+        return False
+    return session_id.lower() in rel.split("/")
 
 
 # Scope-root-anchored match for the raw-command backstop below — same boundary
@@ -260,6 +302,10 @@ ROLES = (
 _PRIVILEGED = ("manager", "editor", "admin")
 _OWNER_TIER = ("manager", "admin")
 
+# Where an external caller's private tree is mounted (one fixed name — a
+# session only ever sees its own caller). Owned by external_identity.
+_EXTERNAL_HOME = "/caller"
+
 
 def resolve_role(
     role: str,
@@ -268,8 +314,15 @@ def resolve_role(
     user_role: str = "",
     subpath: str = "",
     force_config: bool = False,
+    external: bool = False,
 ) -> str:
     """Resolve a role name (+optional subpath) to a sandbox-style virtual path.
+
+    ``external`` = an external caller's session WITH a private tree mounted
+    at /caller (``core/session/external_identity.py``): ``workspace`` and
+    ``user_root`` resolve there, ``shared_workspace`` follows the route role
+    like a user session, ``config`` is never offered, credentials stay
+    agent-scope. ``username`` is "" on such sessions.
 
     The return value contains the literal token ``{session_id}`` for
     session-scoped roles; the caller (bwrap launcher or satellite path
@@ -308,16 +361,23 @@ def resolve_role(
     sp = subpath.lstrip("/") if subpath else ""
 
     if role == "workspace":
-        base = f"/users/{username}/workspace" if username else "/workspace"
+        if external:
+            base = f"{_EXTERNAL_HOME}/workspace"
+        else:
+            base = f"/users/{username}/workspace" if username else "/workspace"
         return f"{base}/{sp}" if sp else base
 
     if role == "user_root":
         # User-scoped sessions: the user's own dir (under which workspace,
-        # context, .keys, etc. live). Agent-scoped sessions have no user
-        # dir; return empty so multi-value callers drop the entry.
-        if not username:
+        # context, .keys, etc. live). An external caller's tree plays the
+        # same part. Agent-scoped sessions have no user dir; return empty so
+        # multi-value callers drop the entry.
+        if external:
+            base = _EXTERNAL_HOME
+        elif not username:
             return ""
-        base = f"/users/{username}"
+        else:
+            base = f"/users/{username}"
         return f"{base}/{sp}" if sp else base
 
     if role == "shared_workspace":
@@ -325,8 +385,13 @@ def resolve_role(
         #   - manager/admin user-scoped sessions (mounted alongside their
         #     own user dir)
         #   - agent-scoped sessions (the only workspace they have)
-        # Viewer user-scoped: no access to shared workspace; return empty.
-        if not username:
+        #   - external callers with a private tree, per the route role
+        # Viewer user-scoped / viewer external: no access; return empty.
+        if external:
+            if user_role not in _PRIVILEGED:
+                return ""
+            base = "/workspace"
+        elif not username:
             base = "/workspace"  # agent-scoped
         elif user_role in _PRIVILEGED:
             base = "/workspace"
@@ -335,6 +400,8 @@ def resolve_role(
         return f"{base}/{sp}" if sp else base
 
     if role == "config":
+        if external:
+            return ""  # never an owner-tier surface for a caller
         # Agent config dir. OWNER-only (manager/admin sessions). Editor +
         # viewer get empty — config is not mounted in their bwrap, not visible
         # in their dashboard tree. config shapes agent BEHAVIOR (prompt, MCP

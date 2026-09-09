@@ -136,20 +136,36 @@ async def test_final_transcript_fires_on_partial_final():
     assert stt.drain_transcript() == "more"
 
 
-# ── Dictation mode (chat-input relay; the Greek vanishing-words bug) ─────
+# ── Dictation mode (chat-input relay; painted words must neither die nor double) ─
 #
-# The composer paints interims as committed text. Deepgram on non-English
-# languages sometimes closes a window with an EMPTY final (orphaning the
-# painted interim — the base never advances and the next window's interim
-# replaces everything shown) or a final covering only the head of the shown
-# interim. Dictation mode promotes what the user saw; default mode keeps
-# call/duplex semantics byte-for-byte (a promoted noise interim would be
-# dispatched turn text / false barge-in evidence there).
+# The composer paints interims as committed text. Deepgram finals partition
+# the stream: a final covers [start, start+duration) and the next window
+# starts exactly at that end, re-recognizing everything after it — so words
+# of the shown interim past a final's end come back on their own (committing
+# them would print them twice: the English duplicate-words bug, 2026-09-08),
+# while a word that began inside the range is gone for good unless promoted
+# (Deepgram drops the word the boundary cuts; and on some languages it closes
+# a window with an EMPTY final, orphaning the whole painted interim — the
+# Greek vanishing-words bug, 2026-09-01). Dictation mode promotes exactly the
+# consumed part; default mode keeps call/duplex semantics byte-for-byte (a
+# promoted noise interim would be dispatched turn text / false barge-in
+# evidence there). Timings below are real Deepgram numbers from a probe.
 
 
-def _res(text: str, final: bool):
+def _res(text: str, final: bool, *, start: float = 0.0, end: float | None = None,
+         words: list[tuple[str, float, float]] | None = None):
+    """A live result. ``words`` carries (punctuated word, start, end); when
+    given, ``end`` defaults to the last word's end. Without ``words`` the
+    result is untimed (the text-only fallback path)."""
+
+    class _Word:
+        def __init__(self, w, s, e):
+            self.punctuated_word, self.word, self.start, self.end = w, w.strip(".,;"), s, e
+
     class _Alt:
         transcript = text
+
+    _Alt.words = [_Word(*w) for w in (words or [])]
 
     class _Chan:
         alternatives = [_Alt()]
@@ -158,43 +174,145 @@ def _res(text: str, final: bool):
         channel = _Chan()
         is_final = final
 
+    _Res.start = start
+    _Res.duration = ((end if end is not None else (words[-1][2] if words else 0.0)) - start)
     return _Res()
 
 
-async def test_dictation_empty_final_promotes_shown_interim():
+def _timed(text: str, start: float, step: float = 0.4) -> list[tuple[str, float, float]]:
+    """Evenly timed words for ``text`` from ``start`` (each ``step`` seconds)."""
+    out, t = [], start
+    for w in text.split():
+        out.append((w, round(t, 2), round(t + step, 2)))
+        t += step
+    return out
+
+
+async def test_dictation_empty_final_promotes_consumed_interim():
     stt = DeepgramSTT(api_key="k")
     stt.enable_dictation_mode()
-    await stt._on_transcript(None, _res("πήγα στο σπίτι μου σήμερα", False))
+    words = _timed("πήγα στο σπίτι μου σήμερα", 0.5)
+    await stt._on_transcript(None, _res("πήγα στο σπίτι μου σήμερα", False, words=words))
     assert stt.pop_interim() == "πήγα στο σπίτι μου σήμερα"
-    await stt._on_transcript(None, _res("", True))  # empty final
+    await stt._on_transcript(None, _res("", True, start=0.0, end=2.8))  # empty final past every word
     assert stt.drain_transcript() == "πήγα στο σπίτι μου σήμερα"
     assert stt.latest_interim == ""
 
 
+async def test_dictation_empty_final_leaves_words_past_its_end_live():
+    """Words the empty final's range does not reach are re-delivered by the
+    next window — they stay painted as the live interim instead of committing."""
+    stt = DeepgramSTT(api_key="k")
+    stt.enable_dictation_mode()
+    words = _timed("ένα δύο τρία τέσσερα", 0.5)  # ένα 0.5, δύο 0.9, τρία 1.3, τέσσερα 1.7
+    await stt._on_transcript(None, _res("ένα δύο τρία τέσσερα", False, words=words))
+    stt.pop_interim()
+    await stt._on_transcript(None, _res("", True, start=0.0, end=1.2))  # consumed: ένα, δύο
+    assert stt.drain_transcript() == "ένα δύο"
+    assert stt.pop_interim() == "τρία τέσσερα"
+
+
+async def test_dictation_empty_final_consuming_nothing_keeps_interim():
+    stt = DeepgramSTT(api_key="k")
+    stt.enable_dictation_mode()
+    await stt._on_transcript(None, _res("home into", False, words=_timed("home into", 8.46)))
+    assert stt.pop_interim() == "home into"
+    await stt._on_transcript(None, _res("", True, start=8.38, end=8.38))  # zero-length final at the window start
+    assert stt.drain_transcript() is None
+    assert stt.latest_interim == "home into"
+
+
 async def test_default_mode_empty_final_still_drops_interim():
     stt = DeepgramSTT(api_key="k")
-    await stt._on_transcript(None, _res("background noise guess", False))
-    await stt._on_transcript(None, _res("", True))
+    await stt._on_transcript(None, _res("background noise guess", False, words=_timed("background noise guess", 0.2)))
+    await stt._on_transcript(None, _res("", True, start=0.0, end=2.0))
     assert stt.drain_transcript() is None  # call/duplex semantics unchanged
 
 
-async def test_dictation_short_final_commits_shown_interim():
+async def test_dictation_short_final_keeps_re_delivered_tail_live_and_commits_the_cut_word():
+    """The probe's boundary: the final ends at 8.38, "smart" began at 8.25 (cut
+    by the boundary — Deepgram never delivers it again), "home into" begin
+    after it (re-delivered by the next window)."""
     stt = DeepgramSTT(api_key="k")
     stt.enable_dictation_mode()
-    await stt._on_transcript(None, _res("πήγα στο σπίτι μου σήμερα", False))
+    shown = [("And", 4.97, 5.21), ("your", 5.21, 5.37), ("assistant", 5.37, 5.85), ("pulls", 5.85, 6.25),
+             ("calendar,", 6.25, 7.05), ("weather,", 7.29, 7.93), ("and", 7.93, 8.09), ("your", 8.09, 8.25),
+             ("smart", 8.25, 8.57), ("home", 8.57, 8.81), ("into", 8.81, 9.05)]
+    await stt._on_transcript(None, _res(" ".join(w for w, *_ in shown), False, start=4.97, end=9.3, words=shown))
+    assert stt.pop_interim() == "And your assistant pulls calendar, weather, and your smart home into"
+    final = shown[:8]
+    await stt._on_transcript(None, _res("And your assistant pulls calendar, weather, and your", True,
+                                        start=4.97, end=8.38, words=final))
+    assert stt.drain_transcript() == "And your assistant pulls calendar, weather, and your smart"
+    assert stt.pop_interim() == "home into"  # still painted, no blink
+    nxt = [("home", 8.46, 8.78), ("into", 8.78, 9.18), ("one", 9.18, 9.42), ("glanceable", 9.42, 9.9)]
+    await stt._on_transcript(None, _res("home into one glanceable", False, start=8.38, end=10.0, words=nxt))
+    assert stt.pop_interim() == "home into one glanceable"
+    fin2 = nxt + [("card.", 10.06, 10.3)]
+    await stt._on_transcript(None, _res("home into one glanceable card.", True, start=8.38, end=11.4, words=fin2))
+    assert stt.drain_transcript() == "home into one glanceable card."
+
+
+async def test_dictation_short_final_with_tail_wholly_past_its_end_commits_final_only():
+    stt = DeepgramSTT(api_key="k")
+    stt.enable_dictation_mode()
+    head = _timed("Ask for a morning brief, and your assistant pulls calendar, weather,", 14.66, 0.3)
+    tail = [("and", 18.42, 18.58), ("your", 18.58, 18.74), ("smart", 18.74, 19.06), ("home", 19.06, 19.22), ("in", 19.22, 19.38)]
+    await stt._on_transcript(None, _res(" ".join(w for w, *_ in head + tail), False, start=14.42, end=19.4, words=head + tail))
     stt.pop_interim()
-    # Final covers only the head (smart_format casing/punctuation differs).
-    await stt._on_transcript(None, _res("Πήγα στο σπίτι.", True))
-    assert stt.drain_transcript() == "πήγα στο σπίτι μου σήμερα"
+    await stt._on_transcript(None, _res(" ".join(w for w, *_ in head), True, start=14.42, end=18.34, words=head))
+    assert stt.drain_transcript() == "Ask for a morning brief, and your assistant pulls calendar, weather,"
+    assert stt.pop_interim() == "and your smart home in"
+
+
+async def test_dictation_re_delivered_cut_word_is_stripped_once():
+    """A promoted word that straddled the boundary may be re-recognized from
+    its tail audio in the next window (start clamped to the window start):
+    that copy is dropped from the interim AND the final; a genuine repetition
+    (starting after the promoted word ended) is kept."""
+    stt = DeepgramSTT(api_key="k")
+    stt.enable_dictation_mode()
+    shown = [("and", 7.93, 8.09), ("your", 8.09, 8.25), ("smart", 8.25, 8.57), ("home", 8.57, 8.81)]
+    await stt._on_transcript(None, _res("and your smart home", False, start=4.97, end=9.0, words=shown))
+    stt.pop_interim()
+    await stt._on_transcript(None, _res("and your", True, start=4.97, end=8.38, words=shown[:2]))
+    assert stt.drain_transcript() == "and your smart"
+    assert stt.pop_interim() == "home"
+    redelivered = [("smart", 8.38, 8.54), ("home", 8.54, 8.78), ("into", 8.78, 9.18)]
+    await stt._on_transcript(None, _res("smart home into", False, start=8.38, end=9.3, words=redelivered))
+    assert stt.pop_interim() == "home into"
+    await stt._on_transcript(None, _res("smart home into one", True, start=8.38, end=9.8,
+                                        words=redelivered + [("one", 9.18, 9.42)]))
+    assert stt.drain_transcript() == "home into one"
+    # The strip is spent with that window: a later "smart" is real speech.
+    await stt._on_transcript(None, _res("smart", False, start=9.8, end=10.4, words=[("smart", 9.9, 10.3)]))
+    assert stt.pop_interim() == "smart"
+
+
+async def test_dictation_genuine_repetition_after_cut_word_is_kept():
+    stt = DeepgramSTT(api_key="k")
+    stt.enable_dictation_mode()
+    await stt._on_transcript(None, _res("very", False, start=0.0, end=1.3, words=[("very", 0.9, 1.3)]))
+    stt.pop_interim()
+    await stt._on_transcript(None, _res("", True, start=0.0, end=1.1))  # cuts "very" (0.9-1.3)
+    assert stt.drain_transcript() == "very"
+    # The next window starts at 1.1; a second "very" spoken AFTER the first
+    # ended (1.3) is a repetition, not the tail of the promoted word.
+    await stt._on_transcript(None, _res("very good", True, start=1.1, end=2.2,
+                                        words=[("very", 1.4, 1.8), ("good", 1.8, 2.1)]))
+    assert stt.drain_transcript() == "very good"
 
 
 async def test_dictation_revised_final_wins_when_not_an_extension():
     stt = DeepgramSTT(api_key="k")
     stt.enable_dictation_mode()
-    await stt._on_transcript(None, _res("να πάμε τώρα εκεί", False))
+    words = _timed("να πάμε τώρα εκεί", 0.5)
+    await stt._on_transcript(None, _res("να πάμε τώρα εκεί", False, words=words))
     stt.pop_interim()
-    await stt._on_transcript(None, _res("Θα πάμε τώρα.", True))  # reword
+    await stt._on_transcript(None, _res("Θα πάμε τώρα.", True, start=0.0, end=2.5,
+                                        words=_timed("Θα πάμε τώρα.", 0.5)))  # reword
     assert stt.drain_transcript() == "Θα πάμε τώρα."
+    assert stt.latest_interim == ""  # "εκεί" (1.7) was inside the range: Deepgram's revision wins
 
 
 async def test_dictation_shrunk_interim_not_resent():
@@ -214,18 +332,30 @@ async def test_dictation_short_final_after_backtrack_keeps_painted_text():
     head-only final must still commit the longer painted text."""
     stt = DeepgramSTT(api_key="k")
     stt.enable_dictation_mode()
-    await stt._on_transcript(None, _res("ένα δύο τρία τέσσερα", False))
+    words = _timed("ένα δύο τρία τέσσερα", 0.5)
+    await stt._on_transcript(None, _res("ένα δύο τρία τέσσερα", False, words=words))
     stt.pop_interim()  # painted
-    await stt._on_transcript(None, _res("ένα δύο", False))  # backtrack (suppressed)
+    await stt._on_transcript(None, _res("ένα δύο", False, words=words[:2]))  # backtrack (suppressed)
     assert stt.pop_interim() is None
-    await stt._on_transcript(None, _res("Ένα δύο.", True))  # final = head only
-    assert stt.drain_transcript() == "ένα δύο τρία τέσσερα"
+    await stt._on_transcript(None, _res("Ένα δύο.", True, start=0.0, end=2.5, words=_timed("Ένα δύο.", 0.5)))
+    assert stt.drain_transcript() == "Ένα δύο. τρία τέσσερα"
+
+
+async def test_dictation_untimed_results_count_everything_shown_as_consumed():
+    """A result without word timings cannot place the boundary: the whole
+    painted interim is treated as consumed (the pre-timing behaviour)."""
+    stt = DeepgramSTT(api_key="k")
+    stt.enable_dictation_mode()
+    await stt._on_transcript(None, _res("πήγα στο σπίτι μου σήμερα", False))
+    stt.pop_interim()
+    await stt._on_transcript(None, _res("Πήγα στο σπίτι.", True))
+    assert stt.drain_transcript() == "Πήγα στο σπίτι. μου σήμερα"
 
 
 async def test_dictation_finish_flushes_leftover_interim():
     stt = DeepgramSTT(api_key="k")
     stt.enable_dictation_mode()
-    await stt._on_transcript(None, _res("τελευταία λέξη", False))
+    await stt._on_transcript(None, _res("τελευταία λέξη", False, words=_timed("τελευταία λέξη", 0.3)))
     stt.pop_interim()
     assert await stt.finish() == "τελευταία λέξη"
     assert stt.latest_interim == ""
@@ -244,10 +374,21 @@ async def test_dictation_promotion_never_fires_partial_final_push():
     stt.enable_dictation_mode()
     got: list[str] = []
     stt.on_partial_final = got.append
-    await stt._on_transcript(None, _res("κάτι", False))
-    await stt._on_transcript(None, _res("", True))
+    await stt._on_transcript(None, _res("κάτι", False, words=_timed("κάτι", 0.2)))
+    await stt._on_transcript(None, _res("", True, start=0.0, end=1.0))
     assert got == []
     assert stt.drain_transcript() == "κάτι"
+
+
+async def test_start_and_clear_queue_reset_dictation_timeline():
+    stt = DeepgramSTT(api_key="k")
+    stt.enable_dictation_mode()
+    await stt._on_transcript(None, _res("very", False, start=0.0, end=1.3, words=[("very", 0.9, 1.3)]))
+    stt.pop_interim()
+    await stt._on_transcript(None, _res("", True, start=0.0, end=1.1))
+    assert stt._promoted_edge is not None
+    stt.clear_queue()
+    assert stt._promoted_edge is None and stt._latest_interim_words == []
 
 
 # ── Liveness (guard-task surface; spy-based, no network) ────────────────

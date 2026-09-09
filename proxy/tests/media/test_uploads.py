@@ -13,6 +13,7 @@ resolution branches without DB/auth ceremony — same approach as
 """
 
 import asyncio
+import os
 from io import BytesIO
 
 import pytest
@@ -417,3 +418,28 @@ def test_upload_response_carries_transfer_id_and_remote_push(app_with_router):
     body = resp.json()
     assert body["transfer_id"]
     assert body["remote_push"] is False  # has_fanout_candidates → none in tests
+
+
+# ---------------------------------------------------------------------------
+# Landing-dir confinement — the RESOLVED destination must stay in the agent
+# ---------------------------------------------------------------------------
+
+
+def test_upload_refuses_landing_dir_symlinked_out_of_agent(app_with_router, tmp_path):
+    """A symlink planted where the upload would land (``users/<u>/workspace/
+    uploads`` → outside the agent tree) is refused, not followed: the
+    destination check runs on the resolved path, before any mkdir."""
+    app, agents_dir = app_with_router
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    ws = agents_dir / "test-agent" / "users" / "alice" / "workspace"
+    ws.mkdir(parents=True)
+    os.symlink(outside, ws / "uploads")
+
+    resp = TestClient(app).post(
+        "/v1/upload",
+        files={"file": ("doc.pdf", BytesIO(b"PDF data"), "application/pdf")},
+        data={"agent": "test-agent"},
+    )
+    assert resp.status_code == 403, resp.text
+    assert list(outside.rglob("*")) == []

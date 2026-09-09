@@ -68,10 +68,31 @@ def _to_deepgram_lang(tag: str) -> str:
 _WORD_STRIP = ".,;:!?·»«\"'()[]{}"
 
 
+def _norm_word(word: str) -> str:
+    return word.strip(_WORD_STRIP).casefold()
+
+
 def _norm_words(text: str) -> list[str]:
     """Casefolded, punctuation-stripped tokens, for prefix comparisons between
     interim and final variants of the same audio window (dictation mode)."""
-    return [t for t in (w.strip(_WORD_STRIP).casefold() for w in text.split()) if t]
+    return [t for t in (_norm_word(w) for w in text.split()) if t]
+
+
+def _result_words(alt) -> list[Word]:
+    """Timed words of a live result (punctuated form, seconds from stream
+    start). Empty when the result carries no usable timings — callers then
+    fall back to text-only rules. Entries that normalize to nothing (bare
+    punctuation) are dropped so the list aligns 1:1 with ``_norm_words`` of
+    the transcript."""
+    out: list[Word] = []
+    for w in (getattr(alt, "words", None) or []):
+        try:
+            text = getattr(w, "punctuated_word", None) or w.word
+            if _norm_word(text):
+                out.append(Word(word=text, start=float(w.start), end=float(w.end)))
+        except (AttributeError, TypeError, ValueError):
+            return []
+    return out
 
 
 class DeepgramSTT(STTProvider):
@@ -110,6 +131,14 @@ class DeepgramSTT(STTProvider):
         self._transcript_ready = asyncio.Event()  # signalled on each new is_final
         self._latest_interim = ""  # most recent non-final partial (chat live text)
         self._last_interim_sent = ""  # dedup guard for pop_interim()
+        # Timed words behind the two interims above (dictation mode reads the
+        # timeline to tell consumed audio from audio the next window re-delivers).
+        self._latest_interim_words: list[Word] = []
+        self._last_interim_sent_words: list[Word] = []
+        # A promoted word that straddled a final's boundary: (normalized word,
+        # end). The next window may re-recognize it from its tail audio — that
+        # copy is stripped when it leads the window's results.
+        self._promoted_edge: tuple[str, float] | None = None
         self._interim_results = False  # mode last requested in start() (kept on reconnect)
         self._endpointing_override: int | None = None  # per-connection override (kept on reconnect)
         self._fatal_error: str | None = None  # last Error event, surfaced once via pop_fatal_error
@@ -240,6 +269,9 @@ class DeepgramSTT(STTProvider):
         self._send_skips = 0
         self._latest_interim = ""
         self._last_interim_sent = ""
+        self._latest_interim_words = []
+        self._last_interim_sent_words = []
+        self._promoted_edge = None
         self._fatal_error = None
         self._interim_results = interim_results
         self._endpointing_override = endpointing_ms
@@ -336,6 +368,8 @@ class DeepgramSTT(STTProvider):
         # interim that never finalizes reads as permanent speech "evidence"
         # to the barge-in pause monitor (audit A5, 2026-08-24).
         self._latest_interim = ""
+        self._latest_interim_words = []
+        self._promoted_edge = None
         if discarded:
             logger.info(f"STT queue cleared ({discarded} items discarded)")
 
@@ -377,6 +411,7 @@ class DeepgramSTT(STTProvider):
             if len(new) < len(old) and old[: len(new)] == new:
                 return None
         self._last_interim_sent = txt
+        self._last_interim_sent_words = list(self._latest_interim_words)
         return txt
 
     async def wait_for_transcript(self, timeout: float = 1.0) -> str | None:
@@ -444,12 +479,12 @@ class DeepgramSTT(STTProvider):
         if self.dictation_mode:
             # A tail the user saw but Deepgram never finalized (stop hit
             # mid-window) must still commit — the client's stop() waits
-            # ≤1.8s for exactly this trailing final.
-            leftover = self._shown_interim()
+            # ≤1.8s for exactly this trailing final. The stream is over, so
+            # nothing can re-deliver it: the whole shown text goes.
+            leftover, _ = self._shown_interim()
             if leftover:
                 parts.append(leftover)
-                self._latest_interim = ""
-                self._last_interim_sent = ""
+                self._set_interim("", [])
 
         transcript = " ".join(parts).strip() if parts else None
         if transcript:
@@ -561,67 +596,130 @@ class DeepgramSTT(STTProvider):
 
     # ── Event handlers ────────────────────────────────────────────
 
-    def _shown_interim(self) -> str:
+    def _shown_interim(self) -> tuple[str, list[Word]]:
         """The richer of the live interim and the last one actually sent to the
-        client — dictation paints whichever was delivered last, and a not-yet-
-        popped newer interim only ever shows MORE. Used by dictation mode to
-        decide what "the user already saw" for the never-drop guarantees."""
+        client (text + its timed words) — dictation paints whichever was
+        delivered last, and a not-yet-popped newer interim only ever shows
+        MORE. Used by dictation mode to decide what "the user already saw"
+        for the never-drop guarantees."""
         latest, sent = self._latest_interim, self._last_interim_sent
         if len(_norm_words(sent)) > len(_norm_words(latest)):
-            return sent
-        return latest
+            return sent, self._last_interim_sent_words
+        return latest, self._latest_interim_words
+
+    def _set_interim(self, text: str, words: list[Word]) -> None:
+        """Replace the live interim AND the sent baseline, so pop_interim
+        delivers ``text`` next (or nothing, when empty)."""
+        self._latest_interim, self._latest_interim_words = text, words
+        self._last_interim_sent, self._last_interim_sent_words = "", []
+
+    @staticmethod
+    def _split_shown(shown: str, words: list[Word], final_end: float) -> tuple[list[Word], list[Word]]:
+        """Split the painted interim into the words whose audio a final ending
+        at ``final_end`` consumed and the words the next window re-delivers.
+
+        Deepgram finals partition the stream: a final covers
+        ``[start, start + duration)`` and the next window starts exactly at
+        that end, re-recognizing everything after it — so interim words past
+        the boundary come back on their own and committing them now would
+        print them twice. A word that BEGAN inside the range but ends past it
+        is the one case Deepgram drops (the boundary cuts it; the next window
+        sees only its tail): that one counts as consumed, and
+        ``_promoted_edge`` strips the tail copy if the next window recognizes
+        it anyway. Without usable timings (a result whose word list does not
+        line up with its transcript) everything shown counts as consumed —
+        the pre-timing behaviour, never taken on Deepgram results.
+        """
+        if not words or len(words) != len(_norm_words(shown)):
+            return [Word(word=w, start=0.0, end=0.0) for w in shown.split()], []
+        consumed = [w for w in words if w.start < final_end]
+        return consumed, words[len(consumed):]
+
+    def _note_promoted_edge(self, consumed: list[Word], final_end: float) -> None:
+        last = consumed[-1] if consumed else None
+        if last is not None and last.end > final_end:
+            self._promoted_edge = (_norm_word(last.word), last.end)
+
+    def _strip_promoted_edge(self, transcript: str, words: list[Word]) -> tuple[str, list[Word]]:
+        """Drop a leading word that is the re-recognized tail of a word already
+        committed across the previous final's boundary (same normalized word,
+        starting before that word ended — a genuine repetition starts after)."""
+        edge = self._promoted_edge
+        if edge and words and _norm_word(words[0].word) == edge[0] and words[0].start < edge[1]:
+            words = words[1:]
+            transcript = " ".join(w.word for w in words)
+        return transcript, words
+
+    async def _commit(self, label: str, text: str, *, partial_final: str | None = None) -> None:
+        self._log_transcript(label, text)
+        await self._transcript_queue.put(text)
+        self._transcript_ready.set()
+        if partial_final:
+            self._emit_partial_final(partial_final)
 
     async def _on_transcript(self, _conn, result, **kwargs) -> None:
         """Handle transcript events from Deepgram."""
         try:
-            transcript = result.channel.alternatives[0].transcript
+            alt = result.channel.alternatives[0]
+            transcript = alt.transcript
             is_final = result.is_final
+            words = _result_words(alt) if self.dictation_mode else []
+            final_end = (float(getattr(result, "start", 0.0) or 0.0)
+                         + float(getattr(result, "duration", 0.0) or 0.0))
+            if self._promoted_edge:
+                transcript, words = self._strip_promoted_edge(transcript, words)
+                if is_final:
+                    self._promoted_edge = None  # re-delivery only happens in the window right after
 
             if transcript and is_final:
                 self._last_result_at = time.monotonic()
                 committed = transcript
                 if self.dictation_mode:
-                    # Never drop painted words: if the shown interim extends
-                    # this final (Deepgram sometimes finalizes only the head of
-                    # a window on non-English languages), commit exactly what
-                    # the user saw — the window's audio is consumed with its
-                    # final, so the tail would never be re-delivered.
-                    shown = self._shown_interim()
-                    fin, intr = _norm_words(transcript), _norm_words(shown)
-                    if len(intr) > len(fin) and intr[: len(fin)] == fin:
-                        committed = shown
+                    # Never drop painted words: of the shown interim, the
+                    # words past this final's end stay live (the next window
+                    # re-delivers them, and leaving them painted avoids a
+                    # blink); the words its audio consumed are gone for good
+                    # unless committed here — done when they extend the final
+                    # (normalized word-prefix match; a rewording wins as-is).
+                    shown, shown_words = self._shown_interim()
+                    consumed, rest = self._split_shown(shown, shown_words, final_end)
+                    fin = _norm_words(transcript)
+                    seen = [_norm_word(w.word) for w in consumed]
+                    if len(seen) > len(fin) and seen[: len(fin)] == fin:
+                        extra = consumed[len(fin):]
+                        committed = transcript + " " + " ".join(w.word for w in extra)
+                        self._note_promoted_edge(extra, final_end)
                         logger.info(
-                            "Deepgram short final — committing shown interim "
-                            f"(+{len(intr) - len(fin)} word(s))"
+                            "Deepgram short final — %d shown word(s) committed with it, "
+                            "%d left for the next window", len(extra), len(rest),
                         )
-                self._log_transcript("Deepgram final", committed)
-                self._latest_interim = ""  # utterance committed → clear live partial
-                self._last_interim_sent = ""
-                await self._transcript_queue.put(committed)
-                self._transcript_ready.set()
-                self._emit_partial_final(transcript)
+                    self._set_interim(" ".join(w.word for w in rest), rest)
+                await self._commit("Deepgram final", committed, partial_final=transcript)
             elif transcript and not is_final:
                 self._last_result_at = time.monotonic()
-                self._latest_interim = transcript
+                self._latest_interim, self._latest_interim_words = transcript, words
                 logger.debug(f"Deepgram interim: \"{transcript}\"")
             elif is_final and not transcript:
-                shown = self._shown_interim() if self.dictation_mode else ""
-                if shown:
-                    # An empty final orphans the painted interim: the base the
-                    # composer commits onto never advances, and the next
-                    # window's interim REPLACES everything shown (the Greek
-                    # vanishing-words bug, 2026-09-01). Promote what the user
-                    # saw instead. Duplex/call pipelines never take this path
-                    # (dictation_mode is chat-relay-only): a promoted noise
-                    # interim would be false barge-in evidence there.
-                    self._log_transcript(
-                        "Deepgram empty final — committing shown interim", shown)
-                    self._latest_interim = ""
-                    self._last_interim_sent = ""
-                    await self._transcript_queue.put(shown)
-                    self._transcript_ready.set()
-                else:
+                shown, shown_words = self._shown_interim() if self.dictation_mode else ("", [])
+                if not shown:
                     logger.debug("Deepgram final: (empty)")
+                    return
+                # An empty final orphans the painted interim: the base the
+                # composer commits onto never advances, and the next window's
+                # interim REPLACES everything shown (the Greek vanishing-words
+                # bug, 2026-09-01). Promote the part whose audio this final
+                # consumed; the rest stays live for the next window to
+                # re-deliver. Duplex/call pipelines never take this path
+                # (dictation_mode is chat-relay-only): a promoted noise
+                # interim would be false barge-in evidence there.
+                consumed, rest = self._split_shown(shown, shown_words, final_end)
+                if consumed:
+                    self._note_promoted_edge(consumed, final_end)
+                    self._set_interim(" ".join(w.word for w in rest), rest)
+                    await self._commit("Deepgram empty final — committing shown interim",
+                                       " ".join(w.word for w in consumed))
+                else:
+                    logger.debug("Deepgram final: (empty, shown interim all past its end)")
         except (IndexError, AttributeError) as e:
             logger.warning(f"Failed to parse Deepgram result: {e}")
 

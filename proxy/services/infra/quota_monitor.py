@@ -170,8 +170,12 @@ def _targets_for(scope: "storage_quota.QuotaScope") -> list[str]:
 
 def _message(scope: "storage_quota.QuotaScope", metric: str, threshold: int,
              used: int, limit: int) -> tuple[str, str]:
-    where = ("shared workspace" if scope.scope_type == "shared"
-             else f"personal folder ({scope.username})")
+    if scope.scope_type == "shared":
+        where = "shared workspace"
+    elif scope.scope_type == "external":
+        where = "callers' folders"
+    else:
+        where = f"personal folder ({scope.username})"
     if metric == "bytes":
         amount = f"{_fmt_bytes(used)} of {_fmt_bytes(limit)}"
         noun = "storage"

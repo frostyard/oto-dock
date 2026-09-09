@@ -17,6 +17,7 @@ from pydantic import BaseModel
 import config
 from storage import agent_store
 from auth.path_policy import SecurityContext
+from services.infra.path_confinement import PathOutsideRoot, join_under, resolve_under
 from core.session.session_state import (
     _sessions,
     set_session_mode,
@@ -56,6 +57,17 @@ def verify_api_key(authorization: str | None = Header(None)) -> None:
     if validate_session_token(token):
         return
     raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+def require_master_key(authorization: str | None) -> None:
+    """Master key ONLY — for the endpoints that mint whole sessions. A
+    session JWT (any agent subprocess, incl. a phone caller's) must never be
+    able to warm a new session for an arbitrary agent."""
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    parts = authorization.split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer" or not config.is_master_key(parts[1]):
+        raise HTTPException(status_code=403, detail="This endpoint requires the service key")
 
 
 def verify_session_match(authorization: str | None, session_id: str) -> None:
@@ -105,6 +117,7 @@ async def health():
     # constants read once at import — cheap enough for the 10s Docker healthcheck.
     # community_mcps_version is omitted until it has a runtime source.
     from ws.satellite import MIN_SATELLITE_VERSION
+    from core import log_queue, loop_watchdog
     return {
         "status": "ok",
         "service": "otodock",
@@ -112,6 +125,11 @@ async def health():
         "claude_cli_version": config.PINNED_CLAUDE_CODE_VERSION,
         "codex_cli_version": config.PINNED_CODEX_VERSION,
         "satellite_min_version": MIN_SATELLITE_VERSION,
+        # Event-loop stall counters (core/loop_watchdog.py) and the log
+        # writer's queue (core/log_queue.py) — low-sensitivity liveness
+        # telemetry, same audience as the version fields.
+        "loop": loop_watchdog.stats(),
+        "log": log_queue.stats(),
     }
 
 
@@ -130,25 +148,6 @@ async def list_models(authorization: str | None = Header(None)):
             for name in agent_store.get_agent_slugs()
         ],
     }
-
-
-@router.get("/v1/agents/{name}/config")
-async def get_agent_config(name: str, authorization: str | None = Header(None)):
-    """Return the built system prompt for an agent.
-
-    Used by the phone server's DirectLLMClient to get agent prompts
-    without going through the CLI. Keeps proxy as single source of truth.
-    """
-    verify_api_key(authorization)
-
-    prompt = config.build_agent_prompt(name)
-    if not prompt:
-        raise HTTPException(status_code=404, detail=f"Unknown agent: {name}")
-
-    from services.mcp import mcp_registry
-    runtime_mcps = mcp_registry.get_agent_mcps(name)
-
-    return {"agent": name, "system_prompt": prompt, "has_mcp_tools": len(runtime_mcps) > 0}
 
 
 @router.get("/v1/sessions/{session_id}/pending")
@@ -406,7 +405,7 @@ def _get_remote_session_info(session_id: str):
 def _remote_plans_cache_dir(session_id: str) -> Path:
     """Local cache directory for remote plan files (1h TTL — see purge logic)."""
     import config as app_config
-    cache = Path(app_config.SESSIONS_DIR) / "remote-plans" / session_id
+    cache = join_under(Path(app_config.SESSIONS_DIR) / "remote-plans", session_id)
     cache.mkdir(parents=True, exist_ok=True)
     return cache
 
@@ -424,7 +423,12 @@ async def _ensure_remote_plan_cached(
     if info is None:
         return None
     cache_dir = _remote_plans_cache_dir(session_id)
-    cached = cache_dir / filename
+    # filename came from the satellite manifest — keep the write inside the
+    # plans cache dir (pull_file_to_path trusts its dest, no traversal check).
+    try:
+        cached = resolve_under(cache_dir / filename, cache_dir)
+    except PathOutsideRoot:
+        return None
     if cached.exists() and (_time.time() - cached.stat().st_mtime) < 3600:
         return cached
 
@@ -445,12 +449,6 @@ async def _ensure_remote_plan_cached(
     from core.remote.satellite_connection import get_connection_manager
     from services.path_policy_v2 import PathRef
     cm = get_connection_manager()
-    # filename came from the satellite manifest — keep the write inside the
-    # plans cache dir (pull_file_to_path trusts its dest, no traversal check).
-    try:
-        cached.resolve().relative_to(cache_dir.resolve())
-    except ValueError:
-        return None
     ok = await cm.pull_file_to_path(
         info.machine_id,
         PathRef("agent_tree", rel_path),
@@ -565,7 +563,11 @@ async def get_plan_file(
             raise HTTPException(status_code=404, detail="Plan not found")
         return {"content": cached.read_text(), "filename": filename}
 
-    plan_path = _get_plans_dir(session_id) / filename
+    plans_dir = _get_plans_dir(session_id)
+    try:
+        plan_path = resolve_under(plans_dir / filename, plans_dir)
+    except PathOutsideRoot:
+        raise HTTPException(status_code=404, detail="Plan not found")
     if not plan_path.is_file() or plan_path.suffix != ".md":
         raise HTTPException(status_code=404, detail="Plan not found")
     return {"content": plan_path.read_text(), "filename": filename}
@@ -591,8 +593,23 @@ async def warmup_session_endpoint(req: WarmupRequest, authorization: str | None 
 
     Used by phone server during greeting playback so MCP tools are warm
     by the time the user speaks. Returns the session_id for follow-up requests.
+
+    Phone sessions are NOT warmed here any more: a call's identity (the
+    route, the caller, the PIN gate) rides the management WebSocket warmup
+    (``ws/phone.py``); this legacy HTTP path builds a bare, identity-less
+    session, so it refuses ``phone_mode`` outright rather than run a caller
+    outside the external-route rules.
     """
-    verify_api_key(authorization)
+    require_master_key(authorization)
+    if req.phone_mode:
+        raise HTTPException(
+            status_code=410,
+            detail=(
+                "Phone sessions are warmed over the management WebSocket "
+                "(/ws/phone); the HTTP warmup carries no caller identity and "
+                "is not available for calls."
+            ),
+        )
 
     session_id = req.session_id or str(uuid.uuid4())
 

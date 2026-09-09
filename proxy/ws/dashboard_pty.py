@@ -64,9 +64,10 @@ class PtyViewerController:
         # PER-AGENT role is what governs (a platform member can be an editor on
         # one agent and a viewer on another), read live so a just-revoked role
         # takes effect immediately.
+        from storage.pg import run_db
         from ws.dashboard import _effective_agent_role
-        if _effective_agent_role(
-            self.user_sub, sess.agent_name, fallback_user=self.user,
+        if await run_db(
+            _effective_agent_role, self.user_sub, sess.agent_name, fallback_user=self.user,
         ) == "viewer":
             await self._send_error("Viewers cannot take over a terminal session")
             return

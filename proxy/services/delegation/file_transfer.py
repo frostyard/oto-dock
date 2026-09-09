@@ -14,10 +14,18 @@ send_files is the PASSIVE half of the delegation pair: it never spawns a
 turn on the target (autonomy stays with explicit ``delegate``); the
 target hears about the drop from the file-inbox context block at its
 next session start (``storage/db_file_transfers``).
+
+Remote sources (2026-09-05): satellite → platform workspace sync runs at
+turn boundaries, so for a session executing on a remote machine the
+endpoint calls ``prefetch_remote_sources`` first — every requested path is
+read through from the satellite (``remote_file_flow.pull_through``, the
+display/file hooks' path) so a file written or modified in the SAME turn
+is copied with its current bytes. Local sessions never enter that step.
 """
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import logging
 import os
@@ -30,8 +38,9 @@ from fastapi import HTTPException
 import config
 from auth.providers import UserContext
 from core.session.visibility import available_scopes_for
-from storage import agent_store, db_file_transfers, mcp_store
+from storage import agent_store, db_file_transfers, mcp_store, remote_store
 from storage import database as task_store
+from storage.pg import run_db
 
 logger = logging.getLogger("claude-proxy.delegation")
 
@@ -63,6 +72,39 @@ def validate_rel_dir(value: str) -> str | None:
     if any(p.startswith(".") for p in parts):
         return "must not contain hidden directories"
     return None
+
+
+class MissingSourcePath(HTTPException):
+    """404 for a requested path that is neither a file nor a directory in
+    the platform copy of the caller's tree. Same status + detail every
+    caller always got; ``raw`` lets the endpoint re-word it for a remote
+    session whose satellite could not provide the path either."""
+
+    def __init__(self, raw: str):
+        super().__init__(
+            status_code=404,
+            detail=f"No such file or directory in your workspace: '{raw}'",
+        )
+        self.raw = raw
+
+
+def validate_send_path(raw: str) -> str:
+    """Normalize one ``paths`` entry to a workspace-relative posix path, or
+    raise the 400s ``perform_send_files`` always raised (empty, absolute,
+    ``..``). Shared with the remote prefetch so nothing the copy would
+    refuse ever reaches ``pull_through`` (which mkdirs the parent chain)."""
+    rel = (raw or "").strip().strip("/")
+    if not rel:
+        raise HTTPException(status_code=400, detail="Empty path in `paths`.")
+    if raw.strip().startswith(("/", "\\")) or ".." in Path(rel).parts:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid path '{raw}': paths are relative to your "
+                   "workspace and must not contain '..'.",
+        )
+    # Path() collapses `./` and doubled slashes — the form `src_root / rel`
+    # resolves to anyway, and the form the satellite manifest reports.
+    return Path(rel).as_posix()
 
 
 @dataclass
@@ -309,15 +351,7 @@ def perform_send_files(
     picked: list[tuple[Path, Path]] = []
     skipped: list[str] = []
     for raw in paths:
-        rel = (raw or "").strip().strip("/")
-        if not rel:
-            raise HTTPException(status_code=400, detail="Empty path in `paths`.")
-        if raw.strip().startswith(("/", "\\")) or ".." in Path(rel).parts:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid path '{raw}': paths are relative to your "
-                       "workspace and must not contain '..'.",
-            )
+        rel = validate_send_path(raw)
         src = src_root / rel
         if src.is_symlink():
             skipped.append(f"{rel} (symlink)")
@@ -342,10 +376,7 @@ def perform_send_files(
                 raise HTTPException(status_code=400, detail=f"Path '{raw}' escapes your workspace.")
             picked.append((resolved, Path(src.name)))
         else:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No such file or directory in your workspace: '{raw}'",
-            )
+            raise MissingSourcePath(raw)
         if len(picked) > max_files:
             raise HTTPException(
                 status_code=413,
@@ -465,3 +496,164 @@ def perform_send_files(
         total_bytes=total_bytes,
         skipped=skipped,
     )
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Remote sources — read-through before the copy (2026-09-05)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+async def prefetch_remote_sources(
+    session_id: str,
+    authz: SendFilesAuthz,
+    paths: list[str],
+    *,
+    max_files: int | None = None,
+) -> list[str]:
+    """Bring the requested paths up to date from the caller's satellite
+    BEFORE ``perform_send_files`` reads the platform tree.
+
+    Satellite → platform workspace sync runs at turn boundaries, so a file
+    written on the remote machine and sent in the same turn is absent (404)
+    or stale (silently old bytes) platform-side until the turn ends. For a
+    remote session every path is read through ``remote_file_flow``:
+
+    - a cheap ``file_stat`` probe first (0.5.95+; ``exists`` False = absent
+      OR a directory) so a typo never mkdirs a junk chain and a directory
+      never costs a failed pull; then
+    - ``pull_through`` — the display/file hooks' path: revalidation fast
+      path, pull under the per-(agent, path) write lock, platform-mirror
+      fallback. Called for EVERY existing file (a copy that arrived via the
+      turn-end sync has no pull-stat record, so the current bytes are
+      pulled); and
+    - for a directory (or a path the probe does not know as a file): ONE
+      ``request_manifest`` per call, the entries under it pulled one by
+      one, stopping after ``max_files + 1`` pulls across the call — past
+      that ``perform`` 413s anyway.
+
+    Returns the raw paths that resolved to nothing on either side (for the
+    endpoint's remote-aware 404 — ``perform`` still decides). Local sessions
+    return at once; invalid paths are left for ``perform``'s 400 and never
+    reach the satellite; every probe / pull / manifest failure degrades to
+    today's platform-tree behaviour. Deletions inside a directory this turn
+    still ride the turn-end scan (the manifest drives pulls, not deletes).
+    """
+    from core.remote import remote_file_flow
+
+    if not session_id or not remote_file_flow.is_remote_session(session_id):
+        return []
+    try:
+        prefix = authz.source_root.relative_to(
+            config.get_agent_dir(authz.source_agent),
+        ).as_posix()
+    except ValueError:
+        return []
+
+    unavailable: list[str] = []
+    manifest: list[str] | None = None
+    manifest_failed = False
+    budget: int | None = None
+    pulled: list[str] = []
+
+    async def _pull(remote_rel: str) -> Path | None:
+        try:
+            got = await remote_file_flow.pull_through(session_id, remote_rel)
+            if got is not None:
+                pulled.append(remote_rel)
+            return got
+        except Exception:
+            logger.warning(
+                "send_files prefetch: pull failed for %s", remote_rel, exc_info=True,
+            )
+            return None
+
+    async def _probe(remote_rel: str) -> dict | None:
+        try:
+            return await remote_file_flow.stat_probe(session_id, remote_rel)
+        except Exception:
+            logger.warning(
+                "send_files prefetch: probe failed for %s", remote_rel, exc_info=True,
+            )
+            return None
+
+    async def _files_under(remote_rel: str) -> list[str] | None:
+        nonlocal manifest, manifest_failed, budget
+        if manifest is None and not manifest_failed:
+            try:
+                manifest = await remote_file_flow.list_remote_files(session_id, prefix)
+            except Exception:
+                logger.warning("send_files prefetch: manifest failed", exc_info=True)
+                manifest = None
+            if manifest is None:
+                manifest_failed = True
+            if budget is None:
+                cap = max_files
+                if cap is None:
+                    cap = await asyncio.to_thread(
+                        _config_int, "SEND_FILES_MAX_FILES", DEFAULT_MAX_FILES,
+                    )
+                budget = cap + 1
+        if manifest is None:
+            return None
+        want = remote_rel.rstrip("/") + "/"
+        return [p for p in manifest if p.startswith(want)]
+
+    for raw in paths:
+        try:
+            rel = validate_send_path(raw)
+        except HTTPException:
+            continue  # perform raises the same 400 — nothing reaches the satellite
+        remote_rel = prefix if rel == "." else f"{prefix}/{rel}"
+        # A platform-side directory can't be a satellite file — straight to
+        # the manifest. Anything else: probe, then pull when it is (or may
+        # be) a file over there.
+        if not (authz.source_root / rel).is_dir():
+            probe = await _probe(remote_rel)
+            if probe is None or probe.get("exists"):
+                if await _pull(remote_rel) is not None:
+                    continue
+        under = await _files_under(remote_rel)
+        if not under:
+            # Nothing the satellite could name — a directory the platform
+            # still holds copies as today; a path absent on both sides
+            # gets the remote-aware 404 from the endpoint.
+            unavailable.append(raw)
+            continue
+        for entry in under:
+            if budget is not None and budget <= 0:
+                break
+            if budget is not None:
+                budget -= 1
+            await _pull(entry)
+    logger.info(
+        "send_files prefetch: session=%s agent=%s paths=%d read through=%d "
+        "manifest=%s unavailable=%s",
+        session_id[:8], authz.source_agent, len(paths), len(pulled),
+        "failed" if manifest_failed else ("yes" if manifest is not None else "no"),
+        unavailable or "-",
+    )
+    return unavailable
+
+
+async def remote_source_label(session_id: str) -> str:
+    """Human label of the remote machine behind ``session_id`` for error
+    text: the live connection's cached name, else the machine row (read off
+    the loop), else the id prefix."""
+    from core.remote import remote_file_flow
+    machine_id = remote_file_flow.remote_machine_id(session_id)
+    if not machine_id:
+        return "for this session"
+    name = ""
+    try:
+        from core.remote.satellite_connection import get_connection_manager
+        conn = get_connection_manager().get_connection(machine_id)
+        name = getattr(conn, "name", "") if conn is not None else ""
+    except Exception:
+        name = ""
+    if not name:
+        try:
+            row = await run_db(remote_store.get_remote_machine, machine_id)
+        except Exception:
+            row = None
+        name = (row or {}).get("name") or ""
+    return f"'{name}'" if name else machine_id[:8]

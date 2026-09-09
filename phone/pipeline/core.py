@@ -225,24 +225,14 @@ class CallPipeline(PinGateMixin, PlaybackMixin, TurnMixin, OutboundMixin, LlmStr
 
             # Outbound: reuse the pre-warmed connection — it holds the live proxy
             # session that already generated the opening + task context, so the
-            # call continues with full context instead of a cold session. Falls
-            # back to a fresh backend if pre-warm didn't run, its socket died, or
-            # the LLM mode differs — so this only matches or improves the old path.
+            # call continues with full context instead of a cold session. The
+            # pre-generation may still be running when the callee answers (a
+            # slow local model): the pipeline WAITS for it (fillers cover the
+            # silence) — never sends the opening prompt a second time on that
+            # session. Falls back to a fresh backend if pre-warm didn't run,
+            # timed out, its socket died, or the LLM mode differs.
             if self._is_outbound and self.llm is None and self._call_manager:
-                pw_call = self._call_manager.get_call(self._outbound_call_id)
-                pw_client = getattr(pw_call, "warmup_client", None) if pw_call else None
-                if pw_client is not None:
-                    pw_call.warmup_client = None  # pipeline takes ownership
-                    if (getattr(pw_client, "_ws_connected", False)
-                            and getattr(pw_client, "llm_mode", "proxy") == self.route.llm_mode):
-                        self.llm = pw_client
-                        logger.info(
-                            f"[{self.conn.peer_addr}] Reusing pre-warmed connection "
-                            f"(session={pw_client.session_id})"
-                        )
-                    else:
-                        with contextlib.suppress(Exception):
-                            await pw_client.close()
+                self.llm = await self._adopt_prewarmed_backend()
 
             # Create LLM backend (all modes go through ProxyClient).
             # Thread audiosocket UUID + caller info into the proxy warmup
@@ -256,6 +246,7 @@ class CallPipeline(PinGateMixin, PlaybackMixin, TurnMixin, OutboundMixin, LlmStr
                     caller_phone=self._caller_info.get("phone", ""),
                     caller_did=self._caller_info.get("did", ""),
                     dial_event=self._caller_info.get("dial_event") or None,
+                    pin_verified=self.state.pin_verified,
                 )
             self._is_direct = getattr(self.llm, 'llm_mode', 'proxy') == 'direct'
             logger.info(

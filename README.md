@@ -4,145 +4,87 @@
 
 <p align="center"><b>OtoDock — Collaborative Agents</b></p>
 
-<h1 align="center">Your AI workforce, self-hosted.</h1>
+<h1 align="center">The agentic company OS.</h1>
 
 <p align="center">
-  OtoDock turns Claude Code and Codex into a team of agents that work for you.<br/>
-  It runs on your server, and connects with your Anthropic and OpenAI subscriptions.
+  The brains of your company, built on Claude Code &amp; Codex, working on your Anthropic and OpenAI subscriptions.
 </p>
 
 <p align="center">
   <a href="LICENSE"><img alt="License: FSL-1.1-Apache-2.0" src="https://img.shields.io/badge/license-FSL--1.1--Apache--2.0-146bb5"></a>
-  <img alt="Version" src="https://img.shields.io/badge/version-1.5.0-146bb5">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.6.0-146bb5">
   <a href="https://github.com/OtoDock/oto-dock/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/OtoDock/oto-dock/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <a href="https://docs.otodock.io"><img alt="Docs" src="https://img.shields.io/badge/docs-docs.otodock.io-0d9488"></a>
   <a href="https://otodock.io"><img alt="Website" src="https://img.shields.io/badge/website-otodock.io-673a97"></a>
 </p>
 
 <p align="center">
-  <b>Free to self-host up to 5 users. No credit card. Your hardware, your data.</b><br/>
-  <sub>Runs on&nbsp; Claude Code · Codex · your API keys · local models (Ollama)</sub>
+  <a href="https://docs.otodock.io">Docs</a> ·
+  <a href="#quick-start">Install</a> ·
+  <a href="https://otodock.io/features">Features</a> ·
+  <a href="https://github.com/OtoDock/oto-dock/discussions">Discussions</a>
 </p>
 
-https://github.com/user-attachments/assets/76cd5989-be4f-4a85-bc58-8b2c4675cc91
+<br/>
 
-<p align="center"><em>This entire video was directed, captured and edited by an OtoDock agent.
-<a href="https://otodock.io">Watch it in full quality on otodock.io</a>.</em></p>
+<p align="center">
+  <b>Self-hosted · Multi-tenant by design · Fair source</b><br/>
+  <sub>Runs on&nbsp; Claude Code · Codex · your API keys · local models</sub>
+</p>
+
+<br/>
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/3a050b1b-0af3-42f5-abe5-0e4c95a26d6e" alt="Seven faces of the OtoDock dashboard: the company map, an agent's dashboard, an Excel file in the chat, an artifact, the tools page, a meeting and the terminal" width="100%" />
+</p>
+
+<p align="center"><em>Dashboard highlights. <a href="#the-two-minute-video">The two-minute video</a> tells the whole story.</em></p>
+
+<p align="center">If OtoDock is useful to you, a star on this repository helps other people find it.</p>
 
 ---
 
-The most capable coding agents as the engine, a live dashboard on top, and
-the security to let them work, on infrastructure you control.
+## Why OtoDock
 
-- **Claude Code and Codex are the engine.** You inherit every capability the
-  CLIs ship.
-- **Everyone brings their own AI.** Every user connects their own Claude or
-  ChatGPT subscription. Admins can also share API keys or local models
-  (Ollama).
-- **Security, enforced.** Every agent works in a locked-down sandbox,
-  isolated from your network by default.
-- **Your server, your data.** Chats, files, memory, credentials: everything
-  lives on your server, and never leaves.
+OtoDock acts as the brain of your company. You create powerful agents that
+connect to the tools your company runs on, work in departments, delegate to
+each other, and keep working on their own when no one is watching. It is
+multi-tenant by design. Many people work with the same agents, and there
+are four modes that decide how an agent is shared and where its work lands.
+You work with your agents on your self-hosted dashboard, or you can even
+give them a phone line and talk to them. All of it runs on your own
+Anthropic and OpenAI subscriptions, and on local models.
 
-## What you get
+## Build your own AI agents
 
-### A workspace for everyone, and one for the team
+Every agent gets a name and a job, like a Personal Assistant, a System Admin
+or a Marketing Manager, and runs on your server. An agent is made of six
+parts, and you can edit every one of them.
 
-Every person gets their own drive: files, charts, photos, videos, live
-previews. Collaborative agents add a shared workspace everyone can browse.
-Personal, shared, or both: set it per agent with one switch.
-
-### Dashboard or terminal
-
-Watch every tool call stream in the chat, or open the interactive Claude
-Code and Codex CLIs in the terminal.
-
-In the chat, every step streams in live: the reasoning, each tool call,
-file edits as red/green diffs, plans and to-do lists ticking off as the
-agent moves. Approve sensitive actions inline, or let trusted agents run.
-
-In the terminal, you get the CLI itself, with the agent's credentials,
-tools and MCPs already loaded.
+- **Persona.** Plain-language instructions tell the agent who it is and how
+  it works.
+- **Memory.** The agent keeps its own notes across chats.
+- **Workspace.** The folder where the everyday work lands. It is private for
+  each person, shared by the whole team, or both, depending on the agent's
+  mode.
+- **Knowledge.** Reference documents are always on hand.
+- **Skills.** The agent learns techniques it can apply to its work.
+- **Tools.** The agent uses only what it is allowed to use.
 
 <p align="center">
-  <img src=".github/media/readme-chat-tools.jpg" alt="A chat mid-task: streaming tool calls with expandable detail and live progress" />
+  <img src=".github/media/story-anatomy.jpg" alt="An agent with its six parts around it: persona, memory, workspace, knowledge, skills and tools" />
 </p>
 
-### Build
+## Four ways to share one agent
 
-Reports, dashboards and mini-apps render right in the chat — pin one as
-your agent's home page.
+Every agent has a mode that decides how people share it.
 
-Agents build interactive charts, tables, calculators and little tools,
-rendered right in the conversation, theme-matched and safely sandboxed.
-
-Turn an agent-built dashboard into a standing mini-app: a morning brief, a
-status board, a control panel. Refreshed live by scheduled tasks, with
-buttons you approve once that run tasks, message the agent, or call a tool
-instantly.
-
-### Automate
-
-Schedule tasks that work in the background and get notified when they
-finish.
-
-Work runs on any interval: every 17 hours, every 3 days, exactly as you
-mean it. Fire agents from webhooks. Every run is a full chat you can open,
-read and continue. Notifications escalate through four severities, from a
-quiet chime to a persistent danger alarm.
-
-### Meetings for agents
-
-Agents can hold meetings to collaborate and share information.
-
-Put specialist agents in one room and give them a topic. A moderator runs
-the discussion, agents address each other and answer in parallel, and you
-watch the whole conversation converge, or join in. Meetings run inside
-scheduled tasks too.
-
-<p align="center">
-  <img src=".github/media/readme-meeting.gif" alt="A live meeting: three agents replying in parallel while the moderator directs" />
-</p>
-
-### Documents
-
-Agents create and edit Word, Excel, PowerPoint and PDF documents inline in
-the chat.
-
-The files are complete with tables, charts and formatting, and the document
-opens right in the conversation, in a live editor you and your team can
-type into.
-
-<p align="center">
-  <img src=".github/media/readme-documents.jpg" alt="An agent-created document open in the live in-chat editor" />
-</p>
-
-### Anywhere
-
-The same agents on your phone, with voice and notifications. Hands-free
-conversations, plus dictation and read-aloud in every chat, in multiple
-languages.
-
-### Everything included
-
-One platform, the whole toolkit:
-
-- **Memory that persists.** Agents keep transparent, editable memory files,
-  per user and per agent.
-- **Image generation & editing.** Generate and iterate on images in chat,
-  plus a professional-grade editing pipeline for photos.
-- **Video toolkit.** A full editing pipeline for agents: AI-generated footage
-  and transitions, timeline edits, captions, voice-overs, and music.
-- **Web browsing.** Add the browser tool from the community catalog to
-  enable your agents to research the live web.
-- **Community catalog.** Install ready-made agents, tools and skills in one
-  click: a browser, GitHub, Notion, and more landing regularly.
-- **Extensible by design.** Add capabilities with MCP tool servers: install
-  from a manifest and assign tools per agent.
-- **Usage & budgets.** Per-user and per-agent cost tracking with weekly or
-  monthly limits.
-
-See the full tour at [otodock.io/features](https://otodock.io/features).
+| Mode | What it means |
+|---|---|
+| **Personal only** | A private workspace for each person. |
+| **Personal + shared** | A private workspace for each person as the default, and a shared one for the team. |
+| **Shared + personal** | A shared team workspace as the default for everyday work, plus a private one per person. |
+| **Shared only** | Everyone shares one history and one workspace. |
 
 ## Everyone gets the right seat
 
@@ -150,12 +92,102 @@ Admins add each person to the agents they need.
 
 | Three platform roles | Three roles on every agent |
 |---|---|
-| **Admin** — runs the platform and its users | **Manager** — builds and changes the agent itself |
-| **Agent creator** — builds and configures new agents | **Editor** — works in the shared workspace every day |
-| **Member** — works with the agents they're given | **Viewer** — sees the shared work, changes nothing |
+| An **Admin** runs the platform. | A **Manager** has full control of the agent. |
+| A **Creator** creates agents. | An **Editor** edits the shared files. |
+| A **Member** uses the agents they are given. | A **Viewer** chats and reads the shared files. |
 
-Roles govern the shared space; everyone also keeps a private workspace of
-their own.
+## Claude Code or Codex. Your subscription.
+
+Claude Code runs on your Anthropic subscription, and Codex runs on your
+ChatGPT subscription. Every user connects their own subscription. Local
+models on your own hardware work as well. You pick the engine per agent,
+and you can switch it per chat.
+
+<p align="center">
+  <img src=".github/media/story-engines.jpg" alt="Claude Code and Codex plugged into one agent, each with a your-subscription tag" />
+</p>
+
+## They work while you are away
+
+Agents run on any schedule, when a webhook event fires, or once at a time
+you choose. They work in your workspace, where their reports, files and
+updates land, and they notify you when something needs you. Notifications
+come in four severities, from a quiet chime to a persistent danger alarm.
+Every run is a full chat you can open, read and continue, so no one has to
+be watching.
+
+<p align="center">
+  <img src=".github/media/story-automation.jpg" alt="Three triggers feeding an agent that works in the workspace and sends notifications" />
+</p>
+
+## Give an agent a phone number
+
+Agents answer and place phone calls. Bring your own Twilio account, or
+connect the Asterisk or FreePBX server you already run.
+
+<p align="center">
+  <img src=".github/media/story-phone.jpg" alt="An agent with a phone number, taking incoming and outgoing calls over Twilio or Asterisk and FreePBX" />
+</p>
+
+## Runs on your server. Works on your machines.
+
+By default, all your agents run on your server, in an isolated sandbox, with
+one dashboard controlling all of them. You can also pair a laptop, a
+workstation or a PC running macOS, Linux or Windows with a one-line install.
+The machine keeps a single outbound connection to your server, so it needs
+no open ports, and its files stay in sync. The same agent then runs on that
+machine with full access to it, and you work with it from the same
+dashboard, anywhere. If the machine goes offline, your server takes over.
+
+<p align="center">
+  <img src=".github/media/story-remote.jpg" alt="Your server with its agents, linked to a paired laptop, workstation and PC" />
+</p>
+
+<h3 align="center">Your own cloud of agents.</h3>
+
+## The two-minute video
+
+https://github.com/user-attachments/assets/2d829ee3-2d4c-4001-8b40-73c2eb90c661
+
+<p align="center"><em>This entire video was directed, captured and edited by an OtoDock agent.
+<a href="https://otodock.io">Watch it in full quality on otodock.io</a>.</em></p>
+
+## The company, running
+
+<table>
+  <tr>
+    <td width="50%"><img src=".github/media/screen-map.jpg" alt="The 3D company map: the Engineering, Marketing and Independent stages with their agents and the delegation lines between them" /></td>
+    <td width="50%"><img src=".github/media/screen-dashboard.jpg" alt="The CEO agent's dashboard: the company graph and the day's numbers, kept fresh by the agent" /></td>
+  </tr>
+  <tr>
+    <td><b>Departments.</b> Organize your agents into departments, decide who can delegate to whom, or put them in a meeting together.</td>
+    <td><b>Live dashboards.</b> Every agent gets live dashboards, so you can manage them effortlessly.</td>
+  </tr>
+  <tr>
+    <td><img src=".github/media/screen-tools.jpg" alt="The home agent's control panel: alarm, climate, scenes and light sliders, run by the agent" /></td>
+    <td><img src=".github/media/tour-documents.jpg" alt="An Excel workbook opened and edited inside the chat, sheets and charts included" /></td>
+  </tr>
+  <tr>
+    <td><b>Endless tools.</b> Your agents are digital employees. They connect to endless tools, from your calendar to your smart home.</td>
+    <td><b>Documents.</b> They edit Excel, Word and PowerPoint files right in the chat.</td>
+  </tr>
+  <tr>
+    <td><img src=".github/media/screen-artifact.jpg" alt="An interactive party budget built by the agent, rendered inside the chat" /></td>
+    <td><img src=".github/media/screen-meeting.jpg" alt="The CEO agent opening a meeting with the developer agent, its work streaming live in the chat" /></td>
+  </tr>
+  <tr>
+    <td><b>Artifacts.</b> Agents answer with live, interactive UI, rendered right in the chat.</td>
+    <td><b>Meetings.</b> Specialist agents discuss a topic together and converge on an answer, live in the dashboard.</td>
+  </tr>
+  <tr>
+    <td><img src=".github/media/screen-terminal.jpg" alt="A Claude Code terminal running inside the dashboard with the agent's tools loaded" /></td>
+    <td><img src=".github/media/screen-remote-machines.jpg" alt="Your server and the paired machines it runs agents on" /></td>
+  </tr>
+  <tr>
+    <td><b>Terminal.</b> The Claude Code or Codex terminal opens in the dashboard, with the agent's tools already loaded.</td>
+    <td><b>Remote machines.</b> The same agent, with all its tools and its synced workspace, runs on any machine you pair with one command, and it can use everything on that machine.</td>
+  </tr>
+</table>
 
 ## Locked down by default
 
@@ -176,6 +208,37 @@ isolation, and you grant access one service at a time.
 
 [Read the security model →](https://docs.otodock.io/security/overview)
 
+## Everything included
+
+One platform, the whole toolkit.
+
+- **Memory that persists.** Agents keep transparent, editable memory files,
+  per user and per agent.
+- **Documents and files.** Agents create and edit Word, Excel, PowerPoint
+  and PDF files, and every file opens in a live editor inside the chat.
+- **Images.** Agents generate and edit images in the chat, and a
+  professional-grade pipeline handles photo editing.
+- **Video and audio.** Agents generate footage and transitions, cut
+  timelines, add captions, voice-overs and music, transcribe audio and video
+  into text and subtitles, and produce speech and music of their own.
+- **Web browsing.** The browser tool from the community catalog lets agents
+  research the live web.
+- **Built-in tools.** Schedules, triggers, notifications, meetings,
+  delegation, phone calls, file transfer between agents, live charts and
+  mini-apps, SSH hosts, and browser and computer control on paired machines
+  all ship with the platform.
+- **Community catalog.** Ready-made agents, tools and skills install in one
+  click, with GitHub, Notion, Home Assistant, Nextcloud, Prometheus, UniFi
+  and Uptime Kuma among them, and more landing regularly.
+- **Extensible by design.** Any MCP tool server installs from a manifest,
+  and tools are assigned per agent.
+- **Usage and budgets.** Costs are tracked per user and per agent, with
+  weekly or monthly limits.
+- **Team-ready security.** SSO and OIDC, two-factor auth, per-agent roles,
+  encrypted credentials and scoped API keys come from day one.
+
+See all features at [otodock.io/features](https://otodock.io/features).
+
 ## Quick start
 
 A Linux server with Docker is all you need (4 GB RAM minimum, see the
@@ -191,23 +254,31 @@ bash install.sh
 The installer checks Docker, writes a `.env` with a generated database
 password, handles the Ubuntu 24.04+ host step automatically when the host
 needs it, downloads the release-pinned `docker-compose.yml` plus the
-phone-service overlay, and starts the stack. Everything lands in the folder you run it from, and it performs
-fresh installs only: it stops rather than touch an existing install.
+phone-service overlay, and starts the stack. Everything lands in the folder
+you run it from. The script performs fresh installs only, and stops rather
+than touch an existing install.
 
-Then open **http://localhost:8400**. A fresh install greets you with the
-setup wizard: create your admin account, connect your AI, and you're
-chatting with your first agent minutes later
-([First run](https://docs.otodock.io/getting-started/first-run)). If your
-users browse to the server by name or IP, set `DASHBOARD_PUBLIC_URL` in the
-generated `.env`. Behind a reverse proxy, also set `TRUSTED_PROXY` to your
-proxy's IP
-([reverse proxy & HTTPS](https://docs.otodock.io/getting-started/installation#put-it-behind-https));
-every optional knob is documented in the
-[Configuration reference](https://docs.otodock.io/administration/configuration).
+If your users browse to the server by name or IP, set `DASHBOARD_PUBLIC_URL`
+in the generated `.env`. Behind a reverse proxy, also set `TRUSTED_PROXY` to
+your proxy's IP
+([reverse proxy & HTTPS](https://docs.otodock.io/getting-started/installation#put-it-behind-https)).
+Every optional knob is documented in the
+[Configuration reference](https://docs.otodock.io/administration/configuration),
+and the [installation guide](https://docs.otodock.io/getting-started/installation)
+also covers building from source, bare-metal development, and running
+behind a reverse proxy with HTTPS.
 
-Building from source, bare-metal development, reverse proxy and HTTPS:
-the [installation guide](https://docs.otodock.io/getting-started/installation)
-covers them all.
+## The first five minutes
+
+Open **http://localhost:8400** and the setup wizard greets you. Create the
+owner account, and OtoDock installs the Personal Assistant for you, with the
+tools it needs. Connect your Claude or ChatGPT subscription under Setup,
+AI Engines, and the banner that reminds you goes away. Open the Personal
+Assistant from the Agents page and send it your first message. Its reply
+streams in live, with every tool call and every file it creates
+([First run](https://docs.otodock.io/getting-started/first-run)). From there
+you add agents from the community catalog or build your own, and you add
+the people who will work with them.
 
 ## How it fits together
 
@@ -226,10 +297,6 @@ covers them all.
 Agents run as Claude Code / Codex processes inside per-session kernel
 sandboxes, talk to their tools over MCP, and stream every step back to the
 dashboard. PostgreSQL holds the platform state.
-
-**Roadmap:** the Android app and more integrations (Google Workspace,
-Slack, Linear, Microsoft 365, Zoom, and more). What each brings:
-[docs.otodock.io/roadmap](https://docs.otodock.io/roadmap).
 
 ## Community
 
@@ -262,8 +329,8 @@ and connect it to my services. So I built the platform around that idea.
 It has since become the place where my own agents work: large parts of
 OtoDock were built, tested, and shipped by agents running on OtoDock.
 
-It's fair source so you can run it the same way. Make it yours, and show
-me what you build: the
-[discussions](https://github.com/OtoDock/oto-dock/discussions) are open.
+It's fair source so you can run it the same way for your company, and you
+can share your builds in the
+[discussions](https://github.com/OtoDock/oto-dock/discussions).
 
 — Dimitris Mourtzis

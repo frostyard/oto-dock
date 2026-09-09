@@ -107,13 +107,19 @@ async def lifespan(app: FastAPI):
     # unprivileged user+net namespace (never silently run agents un-isolated),
     # and materialize the stub-resolver resolv.conf swap so every later sandbox
     # build is a pure argv transform.
-    from core.sandbox.sandbox import netns_preflight, cli_version_preflight
+    from core.sandbox.sandbox import (
+        netns_preflight, cli_version_preflight, tmpfs_cap_preflight,
+    )
     netns_preflight()
 
     # CLI pin drift check (warn-only): if the proxy host's claude/codex differ
     # from VERSIONS.md, log it so an operator can reconcile. Satellites self-heal
     # on auth; the proxy host is fixed by re-running the installer.
     cli_version_preflight()
+
+    # Per-sandbox /tmp cap: probe bwrap --size once and log the effective cap
+    # (or that this bubblewrap cannot cap), so it is visible in the boot log.
+    tmpfs_cap_preflight()
 
     # Fail fast with an actionable message if the agents dir isn't writable by
     # the runtime user. In the containerised (uid 1000) deployment the named
@@ -415,11 +421,16 @@ async def lifespan(app: FastAPI):
                 await _catalog_install_registry.sweep_stale()
             except Exception:
                 logger.exception("catalog_install_registry sweep failed")
+            # Every store touch in this 60 s loop goes through run_db
+            # (storage/pg.py's event-loop rule): a periodic DELETE + COMMIT
+            # on the loop is exactly what froze the proxy on 2026-09-03 when
+            # the disk went slow.
+            from storage.pg import run_db as _run_db
             try:
                 from services.media import media_pipeline as _mp
                 from storage import database as _db
                 _mp.sweep_host_media_cache()      # TTL satellite-host media
-                _db.sweep_expired_media_tokens()  # reap expired workspace tokens
+                await _run_db(_db.sweep_expired_media_tokens)  # reap expired workspace tokens
             except Exception:
                 logger.exception("media cache sweep failed")
             try:
@@ -433,14 +444,14 @@ async def lifespan(app: FastAPI):
                 # Workspace Recover Bin: reap entries past their 7-day TTL
                 # (DB rows + on-disk bytes). Quick indexed delete, usually 0.
                 from storage import recover_bin_store as _rbstore
-                _rbstore.delete_expired()
+                await _run_db(_rbstore.delete_expired)
             except Exception:
                 logger.exception("recover-bin reap failed")
             try:
                 # File-sync delete tombstones: reap past their 30-day TTL (an
                 # offline satellite is assumed long-since caught up). Indexed delete.
                 from storage import file_tombstones_store as _tstore
-                _tstore.delete_expired()
+                await _run_db(_tstore.delete_expired)
             except Exception:
                 logger.exception("tombstone reap failed")
             try:
@@ -553,6 +564,17 @@ async def lifespan(app: FastAPI):
     from services.engines import token_fanout
     token_fanout.start_worker()
 
+    # Event-loop stall watchdog — deliberately the LAST boot step: every
+    # synchronous boot step above (schema init, preflight, manifest scan,
+    # concurrency init) has run, so a long boot can never read as a stall.
+    # Stopped in _shutdown_cleanup right before the pool closes.
+    from core import loop_watchdog
+    if loop_watchdog.start(config.LOOP_WATCHDOG_THRESHOLD_S):
+        logger.info(
+            "Event-loop watchdog started (threshold %.1fs)",
+            config.LOOP_WATCHDOG_THRESHOLD_S,
+        )
+
     yield
     # ── Graceful Shutdown ──
     logger.info("Proxy shutdown starting...")
@@ -636,12 +658,17 @@ def _arm_exit_failsafe() -> None:
         return
 
     def _fire() -> None:
+        from core import log_queue
         logger.error(
             "Shutdown failsafe fired after %.0fs — a non-daemon thread "
             "blocked interpreter exit (SIGUSR1 dumps stacks next time); "
             "hard-exiting with code 3", _EXIT_FAILSAFE_GRACE_S,
         )
-        logging.shutdown()
+        # A log writer that cannot drain in 2 s is wedged on the disk and
+        # holds the file handler's lock — logging.shutdown() would block on
+        # it and the exit below would never happen.
+        if log_queue.drain(2.0):
+            logging.shutdown()
         os._exit(3)
 
     timer = threading.Timer(_EXIT_FAILSAFE_GRACE_S, _fire)
@@ -688,6 +715,31 @@ async def _shutdown_cleanup(logger) -> None:
     _bg_tasks.clear()
 
     scheduler.stop()
+
+    # Satellite status/caps persists queued by the WS teardown (uvicorn
+    # closes sockets BEFORE lifespan shutdown) are still in flight on the DB
+    # executor — give them a bounded moment to land, then stop the executor
+    # (cancel what never started; a worker parked on a stalled commit is the
+    # exit failsafe's problem, not ours).
+    try:
+        from core.remote.satellite_connection import get_connection_manager
+        if not await get_connection_manager().drain_persists(timeout=2.0):
+            logger.warning("Shutdown: satellite status persists still pending after 2s")
+    except Exception:
+        logger.exception("Shutdown: persist drain failed (continuing)")
+    # Same for the per-chat writer lanes (turn rows queued by pumps that were
+    # still unwinding when the sockets closed).
+    try:
+        from core.events import chat_writer
+        if not await chat_writer.drain_all(timeout=3.0):
+            logger.warning("Shutdown: chat writer jobs still pending after 3s")
+    except Exception:
+        logger.exception("Shutdown: chat writer drain failed (continuing)")
+    # The watchdog reported stalls through the DB work above; stop it now
+    # (flag first, then the tick task — never a fake stall at shutdown).
+    from core import loop_watchdog
+    loop_watchdog.stop()
+    pg_pool.shutdown_db_executor()
 
     # From here down nothing may touch the DB.
     pg_pool.close_pool()

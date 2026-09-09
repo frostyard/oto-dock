@@ -51,6 +51,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import contextlib
+from services.infra.path_confinement import PathOutsideRoot, resolve_under, safe_agent_dir
 
 logger = logging.getLogger("claude-proxy.workspace-fanout")
 
@@ -108,6 +109,9 @@ def fanout_targets(
         from core.session.visibility import is_shared_only
         if is_shared_only(agent_slug):
             return []
+    # External callers' trees never fan out (proxy host only).
+    if rel_path.startswith("externals/"):
+        return []
 
     try:
         from core.session.session_manager import _get_remote_layer
@@ -309,9 +313,12 @@ async def fan_out_write(
     if isinstance(source, (bytes, bytearray)):
         size = len(source)
     else:
+        # Every caller passes the platform copy of ``rel_path`` inside the
+        # agent tree; the size probe re-states that instead of trusting the
+        # path it was handed.
         try:
-            size = source.stat().st_size
-        except OSError:
+            size = resolve_under(source, safe_agent_dir(agent_slug)).stat().st_size
+        except (OSError, PathOutsideRoot):
             size = 0
     if not machines:
         if transfer_id is not None:

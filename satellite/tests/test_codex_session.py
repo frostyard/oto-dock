@@ -11,6 +11,7 @@ control-request handling.
 
 import asyncio
 import json
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -364,3 +365,443 @@ def test_pty_config_toml_header_keys():
     assert cfg["features"]["hooks"] is True
     assert cfg["features"]["default_mode_request_user_input"] is True
     assert cfg["projects"]["/home/u/work"]["trust_level"] == "trusted"
+    # Codex 0.152.0 made update_plan opt-in — the plan tool stays on.
+    assert cfg["tools"]["update_plan"]["enabled"] is True
+    # No local endpoint in the payload → no selector and no provider table.
+    assert "model_provider" not in cfg
+    assert "model_providers" not in cfg
+
+
+# ---------------------------------------------------------------------------
+# Local OpenAI-compatible endpoint carried in the start payload
+# (``local_model_provider``) — twin of the proxy's provider block
+# ---------------------------------------------------------------------------
+
+_LOCAL = {"base_url": "http://192.168.1.8:8080/v1", "env_key": "OTO_LOCAL_API_KEY"}
+
+
+_CATALOG = '{"models": [{"slug": "qwen3.6-35b-a3b", "supports_search_tool": true}]}\n'
+_LOCAL_FULL = {
+    "base_url": "http://127.0.0.1:11434/v1", "env_key": "",
+    "stream_idle_timeout_ms": 1800000, "catalog_json": _CATALOG,
+}
+
+
+def test_local_provider_toml_shapes():
+    from satellite.sessions.codex_session import local_provider_toml
+    assert local_provider_toml(None) == ("", "")
+    assert local_provider_toml({}) == ("", "")
+    assert local_provider_toml({"base_url": "  "}) == ("", "")
+    root, table = local_provider_toml({"base_url": 'http://h/v1"x', "env_key": ""})
+    assert root == 'model_provider = "oto_local"'
+    assert 'base_url = "http://h/v1\\"x"' in table
+    assert 'wire_api = "responses"' in table
+    # Keyless → no env_key line (codex-rs refuses a provider naming an unset var).
+    assert "env_key" not in table
+    # A 0.5.116-era payload (no timeout, no catalog) → neither line.
+    assert "stream_idle_timeout_ms" not in table
+    assert "model_catalog_json" not in root
+    _, keyed = local_provider_toml(_LOCAL)
+    assert 'env_key = "OTO_LOCAL_API_KEY"' in keyed
+
+
+def test_local_provider_toml_catalog_and_idle_timeout(tmp_path):
+    import tomllib
+    from satellite.sessions.codex_session import local_provider_toml
+    codex_dir = tmp_path / "users" / "alice" / ".codex"
+    root, table = local_provider_toml(_LOCAL_FULL, codex_dir)
+    cfg = tomllib.loads(root + "\n" + table + "\n")
+    # Both root keys precede the table; the catalog path is this host's
+    # absolute CODEX_HOME path (TOML-escaped, so a Windows path round-trips).
+    assert cfg["model_provider"] == "oto_local"
+    assert cfg["model_catalog_json"] == str(codex_dir / "models.json")
+    assert cfg["model_providers"]["oto_local"]["stream_idle_timeout_ms"] == 1800000
+    assert "env_key" not in cfg["model_providers"]["oto_local"]
+    win = Path(r"C:\Users\d\.codex") if sys.platform == "win32" else None
+    if win is not None:
+        assert tomllib.loads(local_provider_toml(_LOCAL_FULL, win)[0])["model_catalog_json"] == str(win / "models.json")
+    # No codex_dir (a caller without a CODEX_HOME) or an empty catalog → no key.
+    assert "model_catalog_json" not in local_provider_toml(_LOCAL_FULL)[0]
+    assert "model_catalog_json" not in local_provider_toml(dict(_LOCAL_FULL, catalog_json=""), codex_dir)[0]
+    # A garbage timeout is ignored rather than breaking the TOML.
+    _, bad = local_provider_toml(dict(_LOCAL_FULL, stream_idle_timeout_ms="soon"), codex_dir)
+    assert "stream_idle_timeout_ms" not in bad
+
+
+def test_write_or_drop_model_catalog(tmp_path):
+    from satellite.sessions.codex_session import write_or_drop_model_catalog
+    write_or_drop_model_catalog(tmp_path, _LOCAL_FULL)
+    path = tmp_path / "models.json"
+    assert path.read_text(encoding="utf-8") == _CATALOG
+    if sys.platform != "win32":
+        assert path.stat().st_mode & 0o777 == 0o600
+    # A session without one removes the previous session's file.
+    write_or_drop_model_catalog(tmp_path, {"base_url": "http://h/v1", "catalog_json": ""})
+    assert not path.exists()
+    write_or_drop_model_catalog(tmp_path, None)
+    assert not path.exists()
+
+
+def test_pty_config_toml_local_provider_block(tmp_path):
+    import tomllib
+    from satellite.terminal.codex_pty_session import _build_codex_config_toml
+    text = _build_codex_config_toml(
+        "/home/u/work", '[mcp_servers.task-mcp]\ncommand = "python3"',
+        local_provider=_LOCAL,
+    )
+    cfg = tomllib.loads(text)
+    # The selector is a ROOT key: it parses at root, i.e. precedes every table.
+    assert cfg["model_provider"] == "oto_local"
+    assert text.index('model_provider = "oto_local"') < text.index("[memories]")
+    prov = cfg["model_providers"]["oto_local"]
+    assert prov["base_url"] == "http://192.168.1.8:8080/v1"
+    assert prov["wire_api"] == "responses"
+    assert prov["env_key"] == "OTO_LOCAL_API_KEY"
+    # Header keys unchanged; the MCP section survives after the provider table.
+    assert cfg["features"]["hooks"] is True
+    assert cfg["projects"]["/home/u/work"]["trust_level"] == "trusted"
+    assert cfg["mcp_servers"]["task-mcp"]["command"] == "python3"
+    # With the catalog + timeout (0.5.117 payload): the catalog root key sits
+    # with the other root keys and the timeout in the provider table.
+    text = _build_codex_config_toml(
+        "/home/u/work", "", local_provider=_LOCAL_FULL, codex_dir=tmp_path,
+    )
+    cfg = tomllib.loads(text)
+    assert cfg["model_catalog_json"] == str(tmp_path / "models.json")
+    assert text.index("model_catalog_json") < text.index("[memories]")
+    assert cfg["model_providers"]["oto_local"]["stream_idle_timeout_ms"] == 1800000
+
+
+class TestCodexSessionLocalProvider:
+    """Headless app-server path: the provider block lands in config.toml, the
+    file is ALWAYS written (a hosted session never inherits a stale block), and
+    the proxy's leading [features] block keeps the root key first."""
+
+    def _config(self, **overrides):
+        base = {
+            "cwd_relative": "users/alice",
+            "codex_dir_relative": "users/alice/.codex",
+            "system_prompt": "You are a test agent.",
+            "agents_md_content": "# Test Agent",
+            "mcp_config_toml": '[mcp_servers.task-mcp]\ncommand = "python3"',
+            "model": "qwen3.6-35b-a3b",
+            "env": {"PROXY_URL": "http://100.1.2.3:8400", "PROXY_API_KEY": "test-key"},
+        }
+        base.update(overrides)
+        return base
+
+    async def _start(self, tmp_agent_dir, sat_config, config) -> Path:
+        session = CodexSession("sess-lp", tmp_agent_dir, config, sat_config)
+        mock_client = AsyncMock()
+        mock_client.proc = None
+
+        async def fake_request(method, params=None):
+            return {"thread": {"id": "thread-lp"}}
+
+        mock_client.request = fake_request
+        c1, c2, c3 = _patch_daemon(session, mock_client)
+        with c1, c2, c3:
+            await session.start()
+            await session.close()
+        return tmp_agent_dir / "users" / "alice" / ".codex" / "config.toml"
+
+    @pytest.mark.asyncio
+    async def test_keyed_provider_block_with_mcp_sections(self, tmp_agent_dir, sat_config):
+        import tomllib
+        path = await self._start(
+            tmp_agent_dir, sat_config, self._config(local_model_provider=_LOCAL),
+        )
+        text = path.read_text()
+        cfg = tomllib.loads(text)
+        assert cfg["model_provider"] == "oto_local"
+        # Root keys (the headless header's cap + the provider's) precede every
+        # [table] header.
+        assert text.index('model_provider = "oto_local"') < text.index("[")
+        assert cfg["project_doc_max_bytes"] == 300000
+        # The [tools] table sits between the root keys and the MCP sections.
+        assert cfg["tools"]["update_plan"]["enabled"] is True
+        assert text.index("[tools]") < text.index("[mcp_servers")
+        prov = cfg["model_providers"]["oto_local"]
+        assert prov["base_url"] == "http://192.168.1.8:8080/v1"
+        assert prov["wire_api"] == "responses"
+        assert prov["env_key"] == "OTO_LOCAL_API_KEY"
+        assert "task-mcp" in cfg["mcp_servers"]
+        # The provider table closes the file (after every MCP transform).
+        assert text.rstrip().endswith('env_key = "OTO_LOCAL_API_KEY"')
+        if sys.platform != "win32":
+            assert path.stat().st_mode & 0o777 == 0o600
+        # A 0.5.116-era payload: no catalog file, no key.
+        assert not (path.parent / "models.json").exists()
+        assert "model_catalog_json" not in cfg
+
+    @pytest.mark.asyncio
+    async def test_catalog_and_idle_timeout_land_in_codex_home(self, tmp_agent_dir, sat_config):
+        import tomllib
+        path = await self._start(
+            tmp_agent_dir, sat_config, self._config(local_model_provider=_LOCAL_FULL),
+        )
+        text = path.read_text()
+        cfg = tomllib.loads(text)
+        codex_dir = path.parent
+        assert cfg["model_catalog_json"] == str(codex_dir / "models.json")
+        assert text.index("model_catalog_json") < text.index("[mcp_servers")
+        assert (codex_dir / "models.json").read_text(encoding="utf-8") == _CATALOG
+        assert cfg["model_providers"]["oto_local"]["stream_idle_timeout_ms"] == 1800000
+        # The warm gate knows the declared servers and the local model.
+        assert "task-mcp" in cfg["mcp_servers"]
+
+    @pytest.mark.asyncio
+    async def test_hosted_session_drops_a_stale_catalog(self, tmp_agent_dir, sat_config):
+        codex_dir = tmp_agent_dir / "users" / "alice" / ".codex"
+        codex_dir.mkdir(parents=True)
+        (codex_dir / "models.json").write_text(_CATALOG)
+        await self._start(
+            tmp_agent_dir, sat_config, self._config(
+                mcp_config_toml="", model="gpt-5.6-terra", env={"CODEX_API_KEY": "sk-test"},
+            ),
+        )
+        assert not (codex_dir / "models.json").exists()
+
+    @pytest.mark.asyncio
+    async def test_keyless_provider_and_empty_mcp_toml_still_writes(
+        self, tmp_agent_dir, sat_config,
+    ):
+        import tomllib
+        path = await self._start(
+            tmp_agent_dir, sat_config, self._config(
+                mcp_config_toml="",
+                local_model_provider={"base_url": "http://127.0.0.1:8080/v1", "env_key": ""},
+            ),
+        )
+        cfg = tomllib.loads(path.read_text())
+        assert cfg["model_provider"] == "oto_local"
+        assert "env_key" not in cfg["model_providers"]["oto_local"]
+        assert "mcp_servers" not in cfg
+
+    @pytest.mark.asyncio
+    async def test_root_key_precedes_the_proxys_features_block(
+        self, tmp_agent_dir, sat_config,
+    ):
+        import tomllib
+        path = await self._start(
+            tmp_agent_dir, sat_config, self._config(
+                mcp_config_toml=(
+                    "[features]\ndefault_mode_request_user_input = true\n\n"
+                    '[mcp_servers.task-mcp]\ncommand = "python3"'
+                ),
+                local_model_provider=_LOCAL,
+            ),
+        )
+        text = path.read_text()
+        cfg = tomllib.loads(text)
+        assert cfg["model_provider"] == "oto_local"
+        assert text.index("model_provider") < text.index("[features]")
+        assert cfg["features"]["default_mode_request_user_input"] is True
+        assert cfg["model_providers"]["oto_local"]["base_url"] == _LOCAL["base_url"]
+
+    @pytest.mark.asyncio
+    async def test_hosted_session_overwrites_a_stale_provider(
+        self, tmp_agent_dir, sat_config,
+    ):
+        # A local-endpoint session leaves the block behind in the persistent
+        # CODEX_HOME; the next hosted session with NO MCP toml must not inherit
+        # it — config.toml is always rewritten (empty here).
+        codex_dir = tmp_agent_dir / "users" / "alice" / ".codex"
+        codex_dir.mkdir(parents=True)
+        (codex_dir / "config.toml").write_text(
+            'model_provider = "oto_local"\n\n[model_providers.oto_local]\n'
+            'base_url = "http://192.168.1.8:8080/v1"\nenv_key = "OTO_LOCAL_API_KEY"\n'
+        )
+        import tomllib
+        path = await self._start(
+            tmp_agent_dir, sat_config, self._config(
+                mcp_config_toml="", model="gpt-5.6-terra",
+                env={"CODEX_API_KEY": "sk-test"},
+            ),
+        )
+        assert path.exists()
+        cfg = tomllib.loads(path.read_text())
+        # Only the always-on headless header remains — no provider, no MCPs,
+        # no hook floor (an attended session).
+        assert cfg == {
+            "project_doc_max_bytes": 300000,
+            "tools": {"update_plan": {"enabled": True}},
+            "memories": {"use_memories": False, "generate_memories": False},
+            "features": {"plugins": False},
+        }
+
+    @pytest.mark.asyncio
+    async def test_session_without_oauth_drops_a_stale_auth_json(
+        self, tmp_agent_dir, sat_config,
+    ):
+        # A ChatGPT session left auth.json in the persistent CODEX_HOME; the
+        # local-endpoint session that follows carries no auth_json and must not
+        # let Codex load (and loop on refreshing) the stale token.
+        codex_dir = tmp_agent_dir / "users" / "alice" / ".codex"
+        codex_dir.mkdir(parents=True)
+        (codex_dir / "auth.json").write_text(
+            '{"auth_mode": "chatgpt", "tokens": {"refresh_token": ""}}'
+        )
+        await self._start(
+            tmp_agent_dir, sat_config, self._config(local_model_provider=_LOCAL),
+        )
+        assert not (codex_dir / "auth.json").exists()
+
+
+def test_write_or_drop_auth_json(tmp_path):
+    from satellite.sessions.codex_session import write_or_drop_auth_json
+    write_or_drop_auth_json(tmp_path, {"auth_mode": "chatgpt", "tokens": {}})
+    assert json.loads((tmp_path / "auth.json").read_text())["auth_mode"] == "chatgpt"
+    if sys.platform != "win32":
+        assert (tmp_path / "auth.json").stat().st_mode & 0o777 == 0o600
+    write_or_drop_auth_json(tmp_path, None)
+    assert not (tmp_path / "auth.json").exists()
+    write_or_drop_auth_json(tmp_path, {})  # empty payload value == absent; idempotent
+    assert not (tmp_path / "auth.json").exists()
+
+
+class TestHooksFloor:
+    """The PreToolUse permission floor for UNATTENDED remote Codex sessions
+    (0.5.118): the proxy's ``codex_hooks_floor`` payload field turns on the
+    three per-session pieces — ``[features] hooks = true``, thread-level
+    ``bypass_hook_trust`` on thread/start AND thread/resume, and the deny-only
+    / no-forward hook env. An attended session (no field) gets none of them
+    and keeps the JSON-RPC approval bridge alone."""
+
+    def _config(self, **overrides):
+        base = {
+            "cwd_relative": "users/alice",
+            "codex_dir_relative": "users/alice/.codex",
+            "system_prompt": "You are a test agent.",
+            "agents_md_content": "# Test Agent",
+            "mcp_config_toml": '[mcp_servers.task-mcp]\ncommand = "python3"',
+            "model": "gpt-5.6-sol",
+            "env": {"PROXY_URL": "http://100.1.2.3:8400", "PROXY_API_KEY": "test-key"},
+        }
+        base.update(overrides)
+        return base
+
+    async def _start(self, tmp_agent_dir, sat_config, config):
+        """Run start()+close() against the mock daemon; return
+        (config.toml text, [(method, params)], daemon env)."""
+        session = CodexSession("sess-hf", tmp_agent_dir, config, sat_config)
+        calls: list[tuple[str, dict]] = []
+        seen_env: dict = {}
+        mock_client = AsyncMock()
+        mock_client.proc = None
+
+        async def fake_request(method, params=None):
+            calls.append((method, params or {}))
+            return {"thread": {"id": (params or {}).get("threadId") or "thread-hf"}}
+
+        mock_client.request = fake_request
+
+        async def _connect(env):
+            seen_env.update(env)
+            session._client = mock_client
+
+        with patch.object(session, "_connect_with_retry", new=AsyncMock(side_effect=_connect)), \
+                patch.object(session, "_warm_mcps", new=AsyncMock()), \
+                patch.object(session, "_run_forwarder", new=AsyncMock()):
+            await session.start()
+            await session.close()
+        text = (tmp_agent_dir / "users" / "alice" / ".codex" / "config.toml").read_text()
+        return text, calls, seen_env
+
+    @pytest.mark.asyncio
+    async def test_floor_writes_the_feature_trusts_the_thread_and_sets_the_env(
+        self, tmp_agent_dir, sat_config,
+    ):
+        import tomllib
+        text, calls, env = await self._start(
+            tmp_agent_dir, sat_config, self._config(codex_hooks_floor=True),
+        )
+        cfg = tomllib.loads(text)
+        assert cfg["features"] == {"plugins": False, "hooks": True}
+        assert text.count("[features]") == 1
+        start = next(p for m, p in calls if m == "thread/start")
+        assert start["config"] == {"bypass_hook_trust": True}
+        assert start["approvalPolicy"] == "on-request"   # mode-derived, unchanged
+        assert env["OTO_HOOK_DENY_ONLY"] == "1"
+        assert env["OTO_HOOK_NO_FORWARD"] == "1"
+        assert env["OTO_SESSION_ID"] == "sess-hf"
+
+    @pytest.mark.asyncio
+    async def test_attended_session_gets_none_of_it(self, tmp_agent_dir, sat_config):
+        import tomllib
+        text, calls, env = await self._start(tmp_agent_dir, sat_config, self._config())
+        cfg = tomllib.loads(text)
+        assert cfg["features"] == {"plugins": False}
+        assert "hooks" not in cfg["features"]
+        start = next(p for m, p in calls if m == "thread/start")
+        assert "config" not in start
+        assert "OTO_HOOK_DENY_ONLY" not in env and "OTO_HOOK_NO_FORWARD" not in env
+        # hooks.json is still written (dormant without trust).
+        assert (tmp_agent_dir / "users" / "alice" / ".codex" / "hooks.json").exists()
+
+    @pytest.mark.asyncio
+    async def test_resume_carries_the_trust_too(self, tmp_agent_dir, sat_config):
+        _, calls, _ = await self._start(
+            tmp_agent_dir, sat_config,
+            self._config(codex_hooks_floor=True, thread_id="thread-existing"),
+        )
+        resume = next(p for m, p in calls if m == "thread/resume")
+        assert resume["threadId"] == "thread-existing"
+        assert resume["config"] == {"bypass_hook_trust": True}
+
+    @pytest.mark.asyncio
+    async def test_floor_merges_with_the_proxys_features_block(self, tmp_agent_dir, sat_config):
+        import tomllib
+        text, _, _ = await self._start(
+            tmp_agent_dir, sat_config, self._config(
+                codex_hooks_floor=True,
+                mcp_config_toml=(
+                    "[features]\ndefault_mode_request_user_input = true\n\n"
+                    '[mcp_servers.task-mcp]\ncommand = "python3"'
+                ),
+                local_model_provider=_LOCAL,
+            ),
+        )
+        cfg = tomllib.loads(text)
+        assert text.count("[features]") == 1
+        assert cfg["features"] == {
+            "plugins": False, "default_mode_request_user_input": True, "hooks": True,
+        }
+        assert "task-mcp" in cfg["mcp_servers"]
+        # Root keys still first, the provider table still closes the file.
+        assert text.index("model_provider") < text.index("[")
+        assert text.rstrip().endswith('env_key = "OTO_LOCAL_API_KEY"')
+
+    @pytest.mark.asyncio
+    async def test_headless_header_matches_the_local_writer(self, tmp_agent_dir, sat_config):
+        import tomllib
+        text, _, _ = await self._start(tmp_agent_dir, sat_config, self._config())
+        cfg = tomllib.loads(text)
+        assert cfg["project_doc_max_bytes"] == 300000
+        assert cfg["memories"] == {"use_memories": False, "generate_memories": False}
+        assert cfg["features"]["plugins"] is False
+        assert cfg["tools"]["update_plan"]["enabled"] is True
+        assert text.index("project_doc_max_bytes") < text.index("[")
+
+
+def test_features_table_shapes():
+    from satellite.sessions.codex_session import features_table
+    mcp = '[mcp_servers.task-mcp]\ncommand = "python3"'
+    prepended = "[features]\ndefault_mode_request_user_input = true\n# note\n\n" + mcp
+
+    assert features_table(False, "") == ("[features]\nplugins = false", "")
+    assert features_table(True, mcp) == ("[features]\nplugins = false\nhooks = true", mcp)
+    assert features_table(False, prepended) == (
+        "[features]\nplugins = false\ndefault_mode_request_user_input = true", mcp,
+    )
+    assert features_table(True, prepended) == (
+        "[features]\nplugins = false\ndefault_mode_request_user_input = true\nhooks = true",
+        mcp,
+    )
+    # A prepended block that is the whole TOML leaves no MCP sections.
+    assert features_table(True, "[features]\nhooks = true") == (
+        "[features]\nplugins = false\nhooks = true", "",
+    )
+    # A key the proxy already set is not repeated.
+    block, _ = features_table(True, "[features]\nplugins = false\nhooks = true\n\n" + mcp)
+    assert block == "[features]\nplugins = false\nhooks = true"

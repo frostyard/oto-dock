@@ -916,6 +916,13 @@ def _parse_manifest(manifest_path: Path) -> McpManifest | None:
     except ValueError as e:
         raise ValueError(f"{name}: invalid tool_filter block — {e}") from e
 
+    # Direct-LLM deferred tool loading opt-out (optional, strict bool).
+    always_load = data.get("always_load", False)
+    if not isinstance(always_load, bool):
+        raise ValueError(
+            f"{name}: always_load must be true or false, got {always_load!r}"
+        )
+
     # Tool-arg path declarations (optional). Strict — bad
     # JSONPath syntax fails the install with a clear error.
     try:
@@ -1015,6 +1022,7 @@ def _parse_manifest(manifest_path: Path) -> McpManifest | None:
         permissions=permissions,
         agent_context=agent_context_blocks,
         tool_filter=tool_filter,
+        always_load=always_load,
         placement=placement,
         remote_policy=remote_policy,
         requires_display=bool(data.get("requires_display", False)),

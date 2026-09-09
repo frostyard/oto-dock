@@ -114,6 +114,69 @@ _CONFIG_SYNC_CAP_MIN_VERSION = (0, 5, 103)
 # loss-window backstop is missing).
 _CODEX_BG_TERMINALS_MIN_VERSION = (0, 5, 105)
 
+# Minimum SATELLITE_VERSION that writes the ``local_model_provider`` start-payload
+# field into its Codex config.toml (the ``[model_providers.oto_local]`` block for
+# a local OpenAI-compatible endpoint). An older satellite would run the local
+# model name against Codex's built-in OpenAI provider, so the remote layer
+# refuses a local-endpoint Codex spawn below this instead of forwarding it.
+_LOCAL_MODEL_PROVIDER_MIN_VERSION = (0, 5, 116)
+
+# Minimum SATELLITE_VERSION whose Codex writers honour the ``stream_idle_timeout_ms``
+# and ``catalog_json`` fields of ``local_model_provider`` (the per-session model
+# catalog that makes Codex defer its MCP tools) and whose warm gate waits for
+# every MCP server. Additive: an older satellite ignores the fields and runs a
+# local-model session the 0.5.116 way (every tool on every request, Codex's
+# 5-minute idle timeout), so this only decides whether the proxy sends them and
+# warns — the hard gate above stays at 0.5.116 and auto-update brings the
+# satellite to 0.5.117 at its next reconnect.
+_LOCAL_MODEL_CATALOG_MIN_VERSION = (0, 5, 117)
+
+# Minimum SATELLITE_VERSION whose Codex app-server sessions honour the
+# ``codex_hooks_floor`` start-payload field: ``[features] hooks = true``,
+# thread-level ``bypass_hook_trust`` and the deny-only / no-forward hook env,
+# so an UNATTENDED remote Codex session (task / phone / meeting / trigger /
+# internal) runs ``permission_gate.py`` as its PreToolUse hook exactly like
+# the local layer does. Additive: an older satellite ignores the field and
+# gates by the prompt rules only (today's behaviour), so the proxy only warns
+# and auto-update brings the satellite here at its next reconnect.
+_CODEX_HOOKS_FLOOR_MIN_VERSION = (0, 5, 118)
+
+# Heartbeat persistence cadence. The heartbeat handler refreshes the in-memory
+# ``last_heartbeat`` / ``last_seen_iso`` on EVERY heartbeat (20 s) but hands a
+# ``last_seen`` write to the persister at most this often per machine — plus
+# immediately on a status TRANSITION (disconnected → online). One COMMIT per
+# machine per minute instead of three, and never on the event loop (the 09-03
+# stall: a slow disk made every heartbeat's synchronous commit freeze the
+# whole proxy). The live badge never reads the DB for a connected machine
+# (services/remote/remote_status.py), so the only visible effect is the admin
+# list's "last seen" text lagging ≤ this many seconds.
+HEARTBEAT_PERSIST_INTERVAL_S = 60.0
+
+# Persist lanes, in flush order. Each lane holds the NEWEST requested value per
+# machine; a single flusher task per machine writes them off-loop in this order
+# (status before capabilities so a fresh row never shows stale caps with a new
+# status). Superseded values are never written.
+_PERSIST_LANE_ORDER = ("status", "caps", "paused", "update_result")
+
+
+def _persist_write(lane: str, machine_id: str, value) -> None:
+    """Execute one lane's write. Resolves the store function at CALL time so
+    test patches on ``storage.remote_store`` take effect."""
+    from storage import remote_store
+    if lane == "status":
+        status, last_seen = value
+        remote_store.update_machine_status(
+            machine_id, status, last_seen=last_seen or None,
+        )
+    elif lane == "caps":
+        remote_store.update_machine_capabilities(machine_id, value)
+    elif lane == "paused":
+        remote_store.set_paused(machine_id, bool(value))
+    elif lane == "update_result":
+        remote_store.record_update_result(machine_id, **value)
+    else:  # pragma: no cover — programming error
+        raise ValueError(f"unknown persist lane {lane!r}")
+
 
 @dataclass
 class SatelliteConnection:
@@ -132,6 +195,23 @@ class SatelliteConnection:
     # Reported SATELLITE_VERSION from the auth message. Drives feature gates like
     # remote Codex bg-sub-agent supervision (see satellite_supports_bg).
     satellite_version: str = ""
+    # Wall-clock ISO of the last contact (auth or heartbeat). The DB's
+    # ``last_seen`` is a COALESCED copy of this (HEARTBEAT_PERSIST_INTERVAL_S);
+    # deregister / the heartbeat monitor persist the exact value on the way
+    # down so the admin offline-alert downtime clock starts at the true last
+    # contact.
+    last_seen_iso: str = ""
+    # Last status handed to the persister for this connection ("" = none yet)
+    # + when the last ``last_seen`` write was requested (monotonic). Drive the
+    # heartbeat coalescing in ``_maybe_persist_heartbeat``.
+    persisted_status: str = ""
+    last_seen_persisted_at: float = 0.0
+    # Cached ``remote_machines`` columns read off-loop at register (and
+    # refreshed by the admin endpoint via ``note_max_sessions``) so the
+    # capacity pre-check and the admin stats never touch the DB on the loop.
+    # ``max_sessions`` None = no admin override (fail-open, as before).
+    max_sessions: int | None = None
+    name: str = ""
     # Idle-sync: latest cheap STAT fingerprint per agent slug reported on the
     # heartbeat (`agent_fingerprints`), and the fingerprint as of the last COMPLETED
     # idle merge (`synced_fingerprints`). The periodic sweep runs the merge for a
@@ -232,12 +312,14 @@ async def _notify_admins_machine_state_change(
     from storage import remote_store
     from services.notifications import notification_manager
 
-    machine = await asyncio.to_thread(remote_store.get_remote_machine, machine_id)
+    from storage.pg import run_db
+
+    machine = await run_db(remote_store.get_remote_machine, machine_id)
     if not machine or (machine.get("pairing_scope") or "") != "admin":
         return
 
     machine_name = machine.get("name") or machine_id[:8]
-    admin_subs = await asyncio.to_thread(_list_admin_subs)
+    admin_subs = await run_db(_list_admin_subs)
     if not admin_subs:
         return
 
@@ -333,10 +415,167 @@ class SatelliteConnectionManager(
         # Registered at startup by core.remote.run_recovery.
         self._sessions_alive_callback = None
         self._lock = asyncio.Lock()
+        # Off-loop persistence of per-machine DB state (status/last_seen,
+        # capabilities, paused, update result). ``_persist_pending`` holds the
+        # NEWEST requested value per machine per lane and is touched only from
+        # the loop thread; ``_persist_tasks`` holds at most ONE flusher task per
+        # machine, which drains the lanes in order on the dedicated DB executor
+        # (storage.pg.run_db). Newest-wins gives ordering (a fast reconnect's
+        # ``online`` can never be overtaken by the preceding ``disconnected``)
+        # and coalescing (a burst of heartbeats is one write). See
+        # ``_request_persist`` / ``_persist_flusher``.
+        self._persist_pending: dict[str, dict[str, object]] = {}
+        self._persist_tasks: dict[str, asyncio.Task] = {}
+        self._persist_warned_at: dict[tuple[str, str], float] = {}
 
     def set_sessions_alive_callback(self, cb) -> None:
         """Register the run-recovery handler for `sessions_alive` reports."""
         self._sessions_alive_callback = cb
+
+    # --- Off-loop persistence (status / caps / paused / update_result) ---
+
+    def persist_lane(self, machine_id: str, lane: str, value) -> None:
+        """Public entry for other modules (the auth handshake in
+        ``ws/satellite.py``): queue a newest-wins off-loop write."""
+        self._request_persist(machine_id, lane, value)
+
+    def _request_persist(self, machine_id: str, lane: str, value) -> None:
+        """Record the newest desired ``value`` for ``lane`` and make sure a
+        flusher is running for this machine. Loop-thread only; returns at
+        once — the DB write happens on the DB executor."""
+        if lane not in _PERSIST_LANE_ORDER:
+            raise ValueError(f"unknown persist lane {lane!r}")
+        self._persist_pending.setdefault(machine_id, {})[lane] = value
+        task = self._persist_tasks.get(machine_id)
+        if task is None or task.done():
+            self._persist_tasks[machine_id] = asyncio.create_task(
+                self._persist_flusher(machine_id),
+                name=f"sat-persist-{machine_id[:8]}",
+            )
+
+    async def _persist_flusher(self, machine_id: str) -> None:
+        """Drain this machine's pending lanes until none are left. A failed
+        write keeps its value pending (a NEWER value requested meanwhile
+        wins) and is retried by the next request — the heartbeat cadence
+        guarantees one within HEARTBEAT_PERSIST_INTERVAL_S — never by a tight
+        loop against a sick database. Loop-closed / cancellation are silent
+        (shutdown, tests)."""
+        from storage.pg import run_db
+        try:
+            while True:
+                pending = self._persist_pending.pop(machine_id, None)
+                if not pending:
+                    return
+                failed: dict[str, object] = {}
+                for lane in _PERSIST_LANE_ORDER:
+                    if lane not in pending:
+                        continue
+                    value = pending[lane]
+                    try:
+                        await run_db(_persist_write, lane, machine_id, value)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        self._warn_persist_failure(machine_id, lane, e)
+                        failed[lane] = value
+                if failed:
+                    # Re-park the failed values under anything newer that
+                    # arrived during the write; do NOT loop on them.
+                    fresh = self._persist_pending.get(machine_id)
+                    if fresh is None:
+                        self._persist_pending[machine_id] = failed
+                        return
+                    for lane, value in failed.items():
+                        fresh.setdefault(lane, value)
+                    return
+        except asyncio.CancelledError:
+            return
+        except RuntimeError:
+            # Event loop closed underneath us (process exit / test teardown).
+            return
+        finally:
+            if self._persist_tasks.get(machine_id) is asyncio.current_task():
+                self._persist_tasks.pop(machine_id, None)
+
+    def _warn_persist_failure(self, machine_id: str, lane: str, err: Exception) -> None:
+        now = time.monotonic()
+        key = (machine_id, lane)
+        if now - self._persist_warned_at.get(key, 0.0) < 60.0:
+            return
+        self._persist_warned_at[key] = now
+        logger.warning(
+            "Satellite %s: persisting %s failed (%s: %s); will retry on the "
+            "next request", machine_id[:8], lane, type(err).__name__, err,
+        )
+
+    async def drain_persists(self, timeout: float = 5.0) -> bool:
+        """Await every in-flight flusher (tests, shutdown). True when all
+        landed within ``timeout``; False if some are still running (a stalled
+        DB) — the caller decides whether to wait longer."""
+        tasks = [t for t in self._persist_tasks.values() if not t.done()]
+        if not tasks:
+            return True
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        return not pending
+
+    def _persist_status(self, conn, status: str, last_seen: str | None) -> None:
+        """Hand a status (+ optional last_seen) write to the persister and
+        record what we asked for on the connection. ``conn`` may be a bare
+        test stand-in — attribute access is defensive."""
+        machine_id = getattr(conn, "machine_id", None)
+        if not machine_id:
+            return
+        try:
+            conn.persisted_status = status
+            if last_seen:
+                conn.last_seen_persisted_at = time.monotonic()
+        except AttributeError:  # pragma: no cover — frozen stand-ins
+            pass
+        self._request_persist(machine_id, "status", (status, last_seen))
+
+    def _maybe_persist_heartbeat(self, conn) -> None:
+        """Coalesced heartbeat persistence: write ``online`` + ``last_seen``
+        on a status transition or when the last write is older than
+        HEARTBEAT_PERSIST_INTERVAL_S; otherwise the in-memory refresh is all
+        that happens."""
+        now = time.monotonic()
+        transition = getattr(conn, "persisted_status", "") != "online"
+        stale = (
+            now - float(getattr(conn, "last_seen_persisted_at", 0.0) or 0.0)
+            >= HEARTBEAT_PERSIST_INTERVAL_S
+        )
+        if transition or stale:
+            self._persist_status(conn, "online", getattr(conn, "last_seen_iso", "") or None)
+
+    async def _refresh_machine_cache(self, machine_id: str, conn) -> None:
+        """Read the admin ``max_sessions`` override + machine name off-loop
+        and cache them on the connection (only while it is still the live
+        one). Fail-open on any error: the caches stay None/"" and the
+        capacity pre-check falls back to the satellite's own recommendation
+        exactly as before."""
+        from storage import remote_store
+        from storage.pg import run_db
+        try:
+            m = await run_db(remote_store.get_remote_machine, machine_id)
+        except Exception:
+            logger.debug("machine cache refresh failed for %s", machine_id[:8], exc_info=True)
+            return
+        if not m or self._connections.get(machine_id) is not conn:
+            return
+        raw = m.get("max_sessions")
+        try:
+            conn.max_sessions = int(raw) if raw else None
+        except (TypeError, ValueError):
+            conn.max_sessions = None
+        conn.name = m.get("name") or ""
+
+    def note_max_sessions(self, machine_id: str, value: int | None) -> None:
+        """Admin endpoint hook: refresh the cached override for a connected
+        machine. Loop-thread only (callers on a worker thread use
+        ``loop.call_soon_threadsafe``)."""
+        conn = self._connections.get(machine_id)
+        if conn is not None:
+            conn.max_sessions = int(value) if value else None
 
     def get_sync_lock(self, machine_id: str, agent_slug: str) -> asyncio.Lock:
         """Return the per-(machine, agent) workspace-sync lock (lazily created).
@@ -551,27 +790,28 @@ class SatelliteConnectionManager(
             name=f"ws-writer-{machine_id[:8]}",
         )
 
-        # Mark online + refresh last_seen. Admin offline/online
-        # notifications are deliberately NOT fired from this connect edge —
-        # they're owned by the sustained-state evaluator
+        # Mark online + refresh last_seen — OFF the loop, through the
+        # per-machine persister (newest-wins, so a stale ``disconnected`` from
+        # the connection this one replaces can never land after it). Admin
+        # offline/online notifications are deliberately NOT fired from this
+        # connect edge — they're owned by the sustained-state evaluator
         # (_evaluate_admin_machine_alerts), which clears any outstanding
         # `offline_alerted` flag and fires the "back online" notice on its
         # next tick. Keeping it out of the hot connect path is what makes a
         # reconnect after a proxy restart / auto-update / blip silent.
-        from storage import remote_store
-        remote_store.update_machine_status(
-            machine_id, "online", last_seen=_iso_now()
-        )
+        conn.last_seen_iso = _iso_now()
+        self._persist_status(conn, "online", conn.last_seen_iso)
         # Bounded persist — same rule as the cli_status handler: an
         # authenticated-but-compromised satellite must not park arbitrary
         # payloads in the capabilities column (it is parsed and returned to
-        # admin/owner dashboards verbatim).
+        # admin/owner dashboards verbatim). The caps lane is shared with the
+        # cli_status re-report so the two writes can never land out of order.
         try:
             caps_size = len(json.dumps(capabilities))
         except (TypeError, ValueError):
             caps_size = -1
         if 0 <= caps_size <= 64 * 1024:
-            remote_store.update_machine_capabilities(machine_id, capabilities)
+            self._request_persist(machine_id, "caps", dict(capabilities))
         else:
             logger.warning(
                 "Satellite %s sent an oversized/unserializable capabilities "
@@ -581,6 +821,10 @@ class SatelliteConnectionManager(
             "Satellite %s connected (capabilities: %s)",
             machine_id[:8], list(capabilities.get("installed_clis", [])),
         )
+
+        # Cache the admin max_sessions override + name off-loop (fail-open
+        # until it lands — same as an unknown cap today).
+        asyncio.create_task(self._refresh_machine_cache(machine_id, conn))
 
         # Kick off a background MCP verify pass. If any MCP on the satellite
         # is marked unhealthy (mid-install marker present) or its version_hash
@@ -757,8 +1001,12 @@ class SatelliteConnectionManager(
             if lock is not None and not lock.locked():
                 self._install_locks.pop(machine_id, None)
 
-            from storage import remote_store
-            remote_store.update_machine_status(machine_id, "disconnected")
+            # Off-loop, newest-wins; carries the EXACT last contact so the
+            # admin offline-alert downtime clock is unaffected by the
+            # coalesced heartbeat writes.
+            self._persist_status(
+                conn, "disconnected", getattr(conn, "last_seen_iso", "") or None,
+            )
             logger.info("Satellite %s disconnected", machine_id[:8])
             # No admin notification on this disconnect edge: the
             # sustained-state evaluator (_evaluate_admin_machine_alerts)
@@ -793,14 +1041,9 @@ class SatelliteConnectionManager(
         conn = self._connections.get(machine_id)
         if not conn:
             return False
-        cap = None
-        try:
-            from storage import remote_store
-            m = remote_store.get_remote_machine(machine_id) or {}
-            if m.get("max_sessions"):
-                cap = int(m["max_sessions"])
-        except Exception:
-            cap = None
+        # Admin override from the per-connection cache (filled off-loop at
+        # register, refreshed by note_max_sessions) — never a DB read here.
+        cap = getattr(conn, "max_sessions", None)
         if cap is None:
             rec = (conn.capabilities or {}).get("recommended_max_sessions")
             cap = int(rec) if rec else None
@@ -813,19 +1056,15 @@ class SatelliteConnectionManager(
         Sourced from the heartbeat (authoritative — includes interactive +
         native-CLI/otodock sessions), NOT proxy-side session_queues (which are
         blind to those). Consumed by core.concurrency.get_stats()['satellites']."""
-        from storage import remote_store
         out: list[dict] = []
         for mid, conn in list(self._connections.items()):
             caps = conn.capabilities or {}
-            try:
-                m = remote_store.get_remote_machine(mid) or {}
-            except Exception:
-                m = {}
             rec = caps.get("recommended_max_sessions")
-            db_max = m.get("max_sessions")
+            # Cached at register (off-loop); no DB read on the loop.
+            db_max = getattr(conn, "max_sessions", None)
             out.append({
                 "machine_id": mid,
-                "name": m.get("name") or mid[:8],
+                "name": getattr(conn, "name", "") or mid[:8],
                 "online": True,
                 "active_sessions": conn.reported_sessions,
                 "max_sessions": int(db_max) if db_max else (int(rec) if rec else None),
@@ -913,6 +1152,42 @@ class SatelliteConnectionManager(
         stays a no-op instead of burning an ack timeout on a silently-dropped
         frame — the router's OOB hook covers live completions either way."""
         return self._satellite_at_least(machine_id, _CODEX_BG_TERMINALS_MIN_VERSION)
+
+    def satellite_supports_local_model_provider(self, machine_id: str) -> bool:
+        """True if the connected satellite writes the ``local_model_provider``
+        start-payload field into its Codex config.toml (SATELLITE_VERSION
+        0.5.116). When False the remote layer refuses a local-endpoint Codex
+        spawn, naming the satellite's version, rather than letting the local
+        model name run against Codex's built-in OpenAI provider."""
+        return self._satellite_at_least(machine_id, _LOCAL_MODEL_PROVIDER_MIN_VERSION)
+
+    def satellite_supports_local_model_catalog(self, machine_id: str) -> bool:
+        """True if the connected satellite writes ``local_model_provider``'s
+        ``stream_idle_timeout_ms`` and ``catalog_json`` (SATELLITE_VERSION
+        0.5.117). When False the remote layer sends the provider without them
+        and logs it — the session still runs, the 0.5.116 way."""
+        return self._satellite_at_least(machine_id, _LOCAL_MODEL_CATALOG_MIN_VERSION)
+
+    def satellite_supports_codex_hooks_floor(self, machine_id: str) -> bool:
+        """True if the connected satellite runs the PreToolUse permission
+        floor for unattended Codex app-server sessions when the start payload
+        carries ``codex_hooks_floor`` (SATELLITE_VERSION 0.5.118). When False
+        the remote layer still sends the field and logs that the session
+        runs prompt-gated until the satellite updates."""
+        return self._satellite_at_least(machine_id, _CODEX_HOOKS_FLOOR_MIN_VERSION)
+
+    def satellite_version(self, machine_id: str) -> str:
+        """The connected satellite's reported SATELLITE_VERSION, or ``""`` when
+        it is offline or never reported one (user-facing messages)."""
+        conn = self._connections.get(machine_id)
+        return str(getattr(conn, "satellite_version", "") or "") if conn else ""
+
+    def satellite_name(self, machine_id: str) -> str:
+        """The connected satellite's display name, falling back to the short
+        machine id (user-facing messages)."""
+        conn = self._connections.get(machine_id)
+        name = str(getattr(conn, "name", "") or "") if conn else ""
+        return name or machine_id[:8]
 
     def effective_sync_cap(self, machine_id: str) -> int:
         """Largest file (bytes) the proxy may send this satellite: the
@@ -1144,9 +1419,9 @@ class SatelliteConnectionManager(
             # Deliberate pause (tray Pause). Persist so the sustained-outage
             # evaluator skips this machine (no false admin alert). The
             # satellite closes the WS right after this; the next successful
-            # auth (tray Resume / reboot) clears the flag.
-            from storage import remote_store
-            await asyncio.to_thread(remote_store.set_paused, machine_id, True)
+            # auth (tray Resume / reboot) clears the flag — through the same
+            # lane, so the two writes keep their order.
+            self._request_persist(machine_id, "paused", True)
 
         elif msg_type == "cli_status":
             # Per-CLI {version, path} from the satellite's pin reconcile
@@ -1174,29 +1449,18 @@ class SatelliteConnectionManager(
                             "path": path[:300] if isinstance(path, str) else None,
                         }
                 conn.capabilities["cli_status"] = clis
-                # Persist a SNAPSHOT: json.dumps on the worker thread must
-                # never iterate a dict the event loop can still mutate.
-                snapshot = dict(conn.capabilities)
-                from storage import remote_store
-                await asyncio.to_thread(
-                    remote_store.update_machine_capabilities, machine_id, snapshot,
-                )
-                # A reconnect may have replaced the connection while the
-                # persist ran — register() wrote the fresh capabilities but
-                # our thread's write may have landed after it. Re-persist the
-                # current connection's snapshot so a stale write never
-                # stands (its own cli_status re-report follows anyway).
-                fresh = self._connections.get(machine_id)
-                if fresh is not conn and fresh is not None:
-                    await asyncio.to_thread(
-                        remote_store.update_machine_capabilities,
-                        machine_id, dict(fresh.capabilities),
-                    )
+                # Persist a SNAPSHOT through the caps lane: json.dumps on
+                # the worker thread must never iterate a dict the event loop
+                # can still mutate, and the lane's newest-wins rule means a
+                # register() snapshot and this re-report can never land out
+                # of order (the old to_thread pair could).
+                self._request_persist(machine_id, "caps", dict(conn.capabilities))
 
         elif msg_type == "heartbeat":
             conn = self._connections.get(machine_id)
             if conn:
                 conn.last_heartbeat = time.monotonic()
+                conn.last_seen_iso = _iso_now()
                 # Measure the signed clock offset (proxy_utc − satellite_utc) so the
                 # file-sync merge can adjust the satellite's epoch mtimes into the
                 # proxy clock before ordering a divergence. Best-effort; epoch mtime
@@ -1233,10 +1497,11 @@ class SatelliteConnectionManager(
                 _active = msg.get("active_sessions")
                 if isinstance(_active, int):
                     conn.reported_sessions = _active
-            from storage import remote_store
-            remote_store.update_machine_status(
-                machine_id, "online", last_seen=_iso_now()
-            )
+                # ``online`` + ``last_seen`` → the persister, coalesced to one
+                # write per machine per HEARTBEAT_PERSIST_INTERVAL_S (or at
+                # once on a transition). NEVER a synchronous commit here: this
+                # branch runs every 20 s per satellite on the event loop.
+                self._maybe_persist_heartbeat(conn)
             # Respond with pong
             await self.send_fire_and_forget(machine_id, {"type": "pong"})
 
@@ -1487,6 +1752,13 @@ class SatelliteConnectionManager(
             from core.remote.satellite_http_tunnel import get_dispatcher
             get_dispatcher().handle_request_chunk(machine_id, msg)
 
+        elif msg_type == "http_abort":
+            # 0.5.115+: the satellite's local client (hook script / MCP
+            # client) went away mid-stream — close our upstream now instead
+            # of holding it until the idle sweep.
+            from core.remote.satellite_http_tunnel import get_dispatcher
+            get_dispatcher().abort_stream(machine_id, str(msg.get("stream_id", "")))
+
         elif msg_type == "local_session_open":
             # otodock-CLI: a satellite-initiated request to open an interactive
             # session (the user ran `otodock` on the machine). Identity is
@@ -1524,10 +1796,15 @@ class SatelliteConnectionManager(
                 if elapsed > 300:
                     stale.append(machine_id)
                 elif elapsed > 90:
-                    from storage import remote_store
-                    remote_store.update_machine_status(
-                        machine_id, "disconnected"
-                    )
+                    # Silent-but-open socket: mark it down (off-loop, once —
+                    # the next heartbeat flips it back to online at once via
+                    # the transition rule) with the exact last contact so the
+                    # admin offline-alert grace clock stays honest.
+                    if getattr(conn, "persisted_status", "") != "disconnected":
+                        self._persist_status(
+                            conn, "disconnected",
+                            getattr(conn, "last_seen_iso", "") or None,
+                        )
 
             for machine_id in stale:
                 logger.warning(
