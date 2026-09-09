@@ -31,7 +31,7 @@ committed requirements; dashboard dependencies used `npm ci`.
 | Dashboard typecheck | `cd dashboard && npx tsc --noEmit` | Passed. |
 | Dashboard build | `cd dashboard && npm run build` | Passed; existing large-chunk warning. |
 | Dashboard tests | `cd dashboard && npx vitest run` | 123 files, 801 tests passed; jsdom canvas warnings. |
-| Proxy | `cd proxy && python -m pytest -n 8 -q` | Did not collect: no PostgreSQL listening on localhost:5432. Disposable container provisioning was rejected by the workstation's container image policy. Fork CI must establish this baseline using its PostgreSQL service. |
+| Proxy | `cd proxy && python -m pytest -n 8 -q` | Did not collect locally: no PostgreSQL listening on localhost:5432. Disposable container provisioning was rejected by the workstation's container image policy. The subsequent fork CI run below establishes this baseline using its PostgreSQL service. |
 
 The two satellite failures were config-file tests that called `CodexSession.start()`
 without replacing its daemon connection. They attempted to launch a real
@@ -41,10 +41,22 @@ return a deterministic thread ID, and close the session. Their file-content
 assertions are unchanged. The suite no longer requires a Codex installation or
 inference credentials for these tests.
 
-## Remaining C0 evidence
+## Executed Frostyard CI baseline
 
-- Link an executed Frostyard CI run, including the full proxy suite against its
-  disposable PostgreSQL service, and record any pre-existing failures.
-- Record the release image/update-channel audit alongside this baseline.
+[Run 34405648436](https://github.com/frostyard/oto-dock/actions/runs/34405648436)
+passed all three jobs for commit `b74b440` on
+[PR #3](https://github.com/frostyard/oto-dock/pull/3). This is executed fork CI,
+not a skipped repository guard.
 
-Local checks alone do not mark C0 or any Copilot parity requirement complete.
+| Gate | CI result |
+| --- | --- |
+| Proxy against disposable PostgreSQL 16.14 | 7,994 passed, 14 skipped, 88 warnings; 278.64 seconds. |
+| Audio | 134 passed, 2 skipped. |
+| Satellite | 509 passed. |
+| Dashboard | Typecheck/build passed; 123 test files, 801 tests passed. |
+| Repository lint | Passed. |
+
+The [release image and update-channel audit](../development/frostyard-releases.md)
+records the remaining upstream boundaries and the fork's source-build policy.
+Together with the executed CI baseline, this completes C0. It does not establish
+any Copilot runtime capability or satisfy the later parity acceptance gates.

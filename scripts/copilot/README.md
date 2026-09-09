@@ -1,0 +1,123 @@
+# Copilot compatibility probes
+
+These are development probes for C1 of the
+[parity plan](../../docs/plans/copilot-parity.md). They do not register an engine,
+change an OtoDock installation, or establish full parity.
+
+## Isolated SDK environment
+
+Use Python 3.13 for the recorded environment. The dependency lock includes the
+published SDK **1.0.13**, which pins runtime **1.0.83** and protocol **3**.
+
+```bash
+python3 -m venv /tmp/otodock-copilot-probe-venv
+/tmp/otodock-copilot-probe-venv/bin/python -m pip install --require-hashes -r scripts/copilot/requirements.txt
+COPILOT_CLI_EXTRACT_DIR=/tmp/otodock-copilot-runtime /tmp/otodock-copilot-probe-venv/bin/python -m copilot download-runtime
+```
+
+The SDK downloader verifies the release checksums. Keep the complete staged
+runtime tree, including `runtime.node`; do not copy just its executable. The
+commands below use the Linux x64 staging path. Other architectures need the
+matching path and have not been qualified by these results. The SDK transport
+probe currently uses a POSIX child environment.
+
+Regenerate the development lock with `uv pip compile
+scripts/copilot/requirements.in --python-version 3.13 --generate-hashes
+--output-file scripts/copilot/requirements.txt` (recorded with uv 0.12.12).
+These dependencies are deliberately separate from platform requirements while
+the production session/auth design is unimplemented.
+
+## Transport, history, and permission callback
+
+No credentials or inference by default:
+
+```bash
+/tmp/otodock-copilot-probe-venv/bin/python scripts/copilot/probe.py \
+  --runtime /tmp/otodock-copilot-runtime/prebuilds/linux-x64/copilot-runtime \
+  --output /tmp/copilot-offline-results.json
+```
+
+The live variant explicitly selects the current `gh` identity. The token stays
+in memory and the runtime's environment; output contains counts and outcomes,
+not tokens, account details, prompts, or raw protocol errors. It submits three
+short turns to the selected account: a fixed marker, recall after runtime
+restart, and a file creation which the permission callback rejects.
+
+```bash
+/tmp/otodock-copilot-probe-venv/bin/python scripts/copilot/probe.py \
+  --runtime /tmp/otodock-copilot-runtime/prebuilds/linux-x64/copilot-runtime \
+  --output /tmp/copilot-live-results.json --live --use-gh-token
+```
+
+The default model is `gpt-5-mini`; `--model` can select an available model. Each
+send has a 45-second timeout and the full probe defaults to 180 seconds. Runtime
+1.0.83 rejects native session caps below 30 AI credits; this is a ceiling rather
+than an expected charge. External subprocesses get fresh temporary state and
+an explicit environment. The script is a **transport/policy callback test outside
+the OtoDock sandbox**; it exposes only the native `create` tool during the denial
+turn and never approves a tool call. Cleanup checks tracked process identities,
+with bounded forced cleanup on failure. It is not a production supervisor.
+
+The event translator sees live serialized events and reports mapping failures.
+It does not declare a turn settled: background/permission reconciliation belongs
+to the future session supervisor. Event counters preserve the original type of
+vendor events unknown to the SDK enum.
+
+## Actual Linux sandbox
+
+`sandbox_probe.py` uses OtoDock's real `SandboxBuilder` and network launcher. Run
+it in an environment with the proxy's dependencies installed. It creates only
+temporary configuration and agent data, then tests a protocol ping, read-only
+mount enforcement, and descendant cleanup. It needs bubblewrap and pasta on the
+host, but does not modify host policy.
+
+```bash
+python scripts/copilot/sandbox_probe.py \
+  --runtime-dir /tmp/otodock-copilot-runtime/prebuilds/linux-x64
+python scripts/copilot/sandbox_probe.py \
+  --runtime-dir /tmp/otodock-copilot-runtime/prebuilds/linux-x64 \
+  --exercise-timeout --timeout 2
+```
+
+With both the proxy dependencies and the pinned SDK installed, test one
+authenticated no-tool turn through the actual sandbox:
+
+```bash
+python scripts/copilot/sandbox_sdk_probe.py \
+  --runtime-dir /tmp/otodock-copilot-runtime/prebuilds/linux-x64 \
+  --output /tmp/copilot-sandbox-sdk-results.json --live --use-gh-token
+```
+
+This uses the existing resolver preflight with temporary application data and
+configuration; it does not change host DNS or namespace policy.
+
+## Stdio MCP boundary
+
+The fixed-tool MCP probe selects only its bundled fixture and allows only that
+tool's permission request. See [MCP results](../../docs/plans/copilot-mcp-results.md)
+before interpreting its result: the raw SDK passes its inference token to the
+MCP child. Functional success alone does not pass the credential-isolation gate.
+
+```bash
+python scripts/copilot/mcp_probe.py \
+  --runtime /tmp/otodock-copilot-runtime/prebuilds/linux-x64/copilot-runtime \
+  --live --use-gh-token --output /tmp/copilot-mcp-result.json
+```
+
+Add `--otodock-interceptor` to test the verified fix candidate using OtoDock's
+existing wrapper. That variant additionally requires the Copilot inference and
+connection-token variables to be absent from the fixture's environment. It does
+not establish filesystem/process-information isolation or wire production MCPs.
+
+## Offline regression tests
+
+With the repository's test dependencies and `psutil` installed:
+
+```bash
+python -m pytest scripts/copilot/tests -q
+```
+
+These tests require neither inference credentials nor PostgreSQL. They cover
+credential isolation in the probe and adverse event ordering in the translator.
+See the [recorded results](../../docs/plans/copilot-spike-results.md) for what has
+actually been run and what remains open.

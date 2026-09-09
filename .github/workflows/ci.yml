@@ -131,3 +131,8 @@ jobs:
         # Run at the repository root so satellite is importable. This suite
         # is independent of the proxy's PostgreSQL fixtures and pytest.ini.
         run: python -m pytest satellite/tests -q --timeout=120
+
+      - name: Copilot offline contract tests
+        # No SDK install or inference credentials: deterministic event and
+        # probe-isolation tests run independently of PostgreSQL.
+        run: python -m pytest scripts/copilot/tests -q --timeout=120
