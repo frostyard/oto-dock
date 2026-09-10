@@ -1,0 +1,389 @@
+{
+  "result": "passed",
+  "sdk_version": "1.0.13",
+  "runtime_version": "1.0.83",
+  "model_calls": 0,
+  "credentials_supplied": false,
+  "sandboxed": true,
+  "dispatch": "session.tools.execute",
+  "authority": "controlled fixture through real bridge",
+  "native_approve_all": true,
+  "model_path_coverage": false,
+  "operations": [
+    {
+      "generation": 1,
+      "phase": "deny",
+      "tool": "create",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": false,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 1,
+      "phase": "deny",
+      "tool": "edit",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": false,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 1,
+      "phase": "deny",
+      "tool": "view",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": false,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 1,
+      "phase": "deny",
+      "tool": "bash",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": false,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 1,
+      "phase": "deny",
+      "tool": "glob",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": false,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 1,
+      "phase": "deny",
+      "tool": "grep",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": false,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 1,
+      "phase": "allow",
+      "tool": "create",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": true,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 1,
+      "phase": "allow",
+      "tool": "edit",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": true,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 1,
+      "phase": "allow",
+      "tool": "view",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": true,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 1,
+      "phase": "allow",
+      "tool": "bash",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": true,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 1,
+      "phase": "allow",
+      "tool": "glob",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": true,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 1,
+      "phase": "allow",
+      "tool": "grep",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": true,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 1,
+      "phase": "deny",
+      "tool": "view",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": false,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 1,
+      "phase": "allow",
+      "tool": "create",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": true,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 1,
+      "phase": "unknown_custom",
+      "tool": "oto_unknown_fixture",
+      "hook_calls": 1,
+      "authority_calls": 0,
+      "permission_calls": 0,
+      "expected_allow": false,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 1,
+      "phase": "authority_error",
+      "tool": "create",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": false,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 2,
+      "phase": "deny",
+      "tool": "create",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": false,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 2,
+      "phase": "deny",
+      "tool": "edit",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": false,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 2,
+      "phase": "deny",
+      "tool": "view",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": false,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 2,
+      "phase": "deny",
+      "tool": "bash",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": false,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 2,
+      "phase": "deny",
+      "tool": "glob",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": false,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 2,
+      "phase": "deny",
+      "tool": "grep",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": false,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 2,
+      "phase": "allow",
+      "tool": "create",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": true,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 2,
+      "phase": "allow",
+      "tool": "edit",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": true,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 2,
+      "phase": "allow",
+      "tool": "view",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": true,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 2,
+      "phase": "allow",
+      "tool": "bash",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": true,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 2,
+      "phase": "allow",
+      "tool": "glob",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": true,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 2,
+      "phase": "allow",
+      "tool": "grep",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": true,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 2,
+      "phase": "deny",
+      "tool": "view",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": false,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 2,
+      "phase": "allow",
+      "tool": "create",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": true,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 2,
+      "phase": "unknown_custom",
+      "tool": "oto_unknown_fixture",
+      "hook_calls": 1,
+      "authority_calls": 0,
+      "permission_calls": 0,
+      "expected_allow": false,
+      "expected_effect_observed": true
+    },
+    {
+      "generation": 2,
+      "phase": "authority_error",
+      "tool": "create",
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "permission_calls": 0,
+      "expected_allow": false,
+      "expected_effect_observed": true
+    }
+  ],
+  "catalogs_validated": 2,
+  "cold_resume_error_type": "JsonRpcError",
+  "cold_resume_history_absent": true,
+  "same_session_resumed": false,
+  "injected_managed_deny": {
+    "contents_blocked": true,
+    "hook_calls": 1,
+    "authority_calls": 1,
+    "permission_calls": 0
+  },
+  "builtin_source_collisions": [
+    {
+      "override_builtin_requested": false,
+      "registration_rejected": true,
+      "error_type": "JsonRpcError",
+      "custom_handler_executions": 0
+    },
+    {
+      "override_builtin_requested": true,
+      "registration_rejected": false,
+      "native_fixture_read": false,
+      "hook_calls": 1,
+      "authority_calls": 1,
+      "custom_handler_executions": 1,
+      "unsafe_raw_sdk_negative_control": true
+    }
+  ],
+  "guarded_override_rejections": [
+    {
+      "action": "create",
+      "rejected": true,
+      "sdk_accesses": 0,
+      "custom_handler_executions": 0
+    },
+    {
+      "action": "resume",
+      "rejected": true,
+      "sdk_accesses": 0,
+      "custom_handler_executions": 0
+    }
+  ],
+  "guarded_native_view": {
+    "native_fixture_read": true,
+    "authority_calls": 1,
+    "custom_handler_executions": 0
+  },
+  "runtime_closed": true,
+  "normal_cleanup": true,
+  "runtime_count": 2,
+  "counts": {
+    "custom_executions": 1,
+    "decisions": 33,
+    "hooks": 34
+  },
+  "elapsed_seconds": 5.914
+}

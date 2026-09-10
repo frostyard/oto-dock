@@ -4,6 +4,36 @@ These are development probes for C1 of the
 [parity plan](../../docs/plans/copilot-parity.md). They do not register an engine,
 change an OtoDock installation, or establish full parity.
 
+## Native tool policy
+
+With proxy dependencies and the pinned SDK installed, run the deterministic
+native invocation probe without credentials or inference:
+
+```bash
+python scripts/copilot/native_policy_probe.py \
+  --runtime-dir /tmp/otodock-copilot-runtime/prebuilds/linux-x64 \
+  --run --output /tmp/copilot-native-policy.json
+```
+
+It checks six native tools against controlled allow/deny decisions in a disposable
+Linux sandbox. An explicitly labelled raw-SDK override case is an unsafe negative
+control; the guarded constructors reject that configuration before SDK access.
+This RPC-only probe does not establish model-driven execution or cold resume.
+
+To test two short model turns across guarded create and cold resume:
+
+```bash
+python scripts/copilot/native_model_probe.py \
+  --runtime-dir /tmp/otodock-copilot-runtime/prebuilds/linux-x64 \
+  --live --use-gh-token --output /tmp/copilot-native-model.json
+```
+
+The token stays in memory. The model creates a fixture, then attempts a denied
+edit after runtime replacement. The overall deadline is 180 seconds, each turn
+has a 60-second deadline, and the native session credit ceiling is its minimum
+30 credits. This is a controlled policy test, not real dashboard approval or
+complete native tool qualification. See [results and remaining gates](../../docs/plans/copilot-native-tool-results.md).
+
 ## Owned permission callbacks
 
 With the proxy dependencies and pinned SDK installed, run the bounded Linux
