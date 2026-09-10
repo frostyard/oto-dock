@@ -46,7 +46,7 @@ class FakeClient:
         self.stopped = False
 
     async def start(self):
-        code = 'import time; time.sleep(60)'
+        code = getattr(self, 'fixture_code', 'import time; time.sleep(60)')
         if self.hang_stop:
             code = 'import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(60)'
         command = [sys.executable, '-c', code]
@@ -474,3 +474,179 @@ def test_private_state_cannot_be_replaced_or_overlay_runtime(monkeypatch, tmp_pa
             runtime._command()
     finally:
         state.discard()
+
+
+@async_test
+async def test_process_fence_capture_requires_started_runtime_and_precedes_sessions(monkeypatch, tmp_path):
+    runtime, client = fake_runtime(monkeypatch, tmp_path)
+    client._sessions = {}
+    with pytest.raises(RuntimeError, match='baseline must precede'):
+        runtime.capture_process_fence()
+    try:
+        await runtime.start()
+        fence = runtime.capture_process_fence()
+        with pytest.raises(RuntimeError, match='baseline must precede'):
+            runtime.capture_process_fence()
+        client._sessions['owned'] = SimpleNamespace(session_id='owned')
+        assert fence.is_settled() is True
+    finally:
+        await runtime.close()
+    with pytest.raises(RuntimeError, match='settlement is unavailable'):
+        fence.is_settled()
+
+
+@async_test
+async def test_process_fence_refuses_capture_after_session_creation(monkeypatch, tmp_path):
+    runtime, client = fake_runtime(monkeypatch, tmp_path)
+    client._sessions = {'already-created': SimpleNamespace(session_id='already-created')}
+    try:
+        await runtime.start()
+        with pytest.raises(RuntimeError, match='baseline must precede'):
+            runtime.capture_process_fence()
+    finally:
+        await runtime.close()
+
+
+def fence_fixture():
+    root = module._Process(100, 1000, 1, 100, 'S')
+    processes = [root]
+    client = SimpleNamespace(_sessions={'owned': SimpleNamespace(session_id='owned')})
+    runtime = SimpleNamespace(
+        alive=True, _client=client,
+        _tree=SimpleNamespace(handshake_verified=True, live=lambda: list(processes)),
+        _observe=lambda: None,
+    )
+    return module._RuntimeProcessFence(runtime), runtime, processes
+
+
+@pytest.mark.parametrize('sessions', [{}, {'one': SimpleNamespace(session_id='one'),
+    'two': SimpleNamespace(session_id='two')}, None, [], {'owned': None},
+    {'wrong-key': SimpleNamespace(session_id='owned')}])
+def test_process_fence_requires_one_consistent_session_and_failure_is_sticky(sessions):
+    fence, runtime, _ = fence_fixture()
+    runtime._client._sessions = sessions
+    with pytest.raises(RuntimeError, match='settlement is unavailable'):
+        fence.is_settled()
+    runtime._client._sessions = {'owned': SimpleNamespace(session_id='owned')}
+    with pytest.raises(RuntimeError, match='settlement is unavailable'):
+        fence.is_settled()
+
+
+@pytest.mark.parametrize('change', ['object', 'key', 'id', 'client'])
+def test_process_fence_rejects_session_or_client_identity_replacement(change):
+    fence, runtime, _ = fence_fixture()
+    assert fence.is_settled() is True
+    current = runtime._client._sessions['owned']
+    if change == 'object':
+        runtime._client._sessions['owned'] = SimpleNamespace(session_id='owned')
+    elif change == 'key':
+        runtime._client._sessions = {'different': current}
+    elif change == 'id':
+        current.session_id = 'different'
+    else:
+        runtime._client = SimpleNamespace(_sessions={'owned': current})
+    with pytest.raises(RuntimeError, match='settlement is unavailable'):
+        fence.is_settled()
+
+
+@pytest.mark.parametrize('change', ['session', 'disconnect', 'handshake'])
+def test_process_fence_revalidates_ownership_after_census(change):
+    fence, runtime, _ = fence_fixture()
+
+    def observe():
+        if change == 'session':
+            runtime._client._sessions['owned'] = SimpleNamespace(session_id='owned')
+        elif change == 'disconnect':
+            runtime.alive = False
+        else:
+            runtime._tree.handshake_verified = False
+
+    runtime._observe = observe
+    with pytest.raises(RuntimeError, match='settlement is unavailable'):
+        fence.is_settled()
+
+
+def test_process_fence_matches_pid_and_start_ticks_not_pid_alone():
+    fence, _runtime, processes = fence_fixture()
+    assert fence.is_settled() is True
+    processes[:] = [module._Process(100, 2000, 1, 100, 'S')]
+    assert fence.is_settled() is False
+    processes[:] = [module._Process(100, 1000, 1, 100, 'S')]
+    assert fence.is_settled() is True
+
+
+def test_process_fence_second_census_catches_late_owned_process():
+    fence, runtime, processes = fence_fixture()
+    calls = []
+
+    def observe():
+        calls.append(True)
+        if len(calls) == 2:
+            processes.append(module._Process(101, 2000, 100, 100, 'S'))
+
+    runtime._observe = observe
+    assert fence.is_settled() is False
+    assert len(calls) == 2
+
+
+def test_process_fence_census_error_is_sanitized_and_sticky():
+    fence, runtime, _ = fence_fixture()
+
+    def observe():
+        raise OSError('private process identity payload')
+
+    runtime._observe = observe
+    with pytest.raises(RuntimeError) as error:
+        fence.is_settled()
+    assert str(error.value) == 'Copilot owned process settlement is unavailable'
+    assert error.value.__context__ is None
+    runtime._observe = lambda: None
+    with pytest.raises(RuntimeError):
+        fence.is_settled()
+
+
+@async_test
+async def test_real_owned_child_after_baseline_blocks_but_unrelated_child_does_not(
+    monkeypatch, tmp_path, unrelated_child,
+):
+    runtime, client = fake_runtime(monkeypatch, tmp_path)
+    client._sessions = {}
+    trigger = tmp_path / 'spawn-child'
+    pid_file = tmp_path / 'owned-child.pid'
+    stop = tmp_path / 'stop-child'
+    child_code = (
+        'import time; from pathlib import Path; '
+        f'p=Path({str(stop)!r}); '
+        '\nwhile not p.exists(): time.sleep(0.005)'
+    )
+    client.fixture_code = (
+        'import subprocess,sys,time; from pathlib import Path\n'
+        f'while not Path({str(trigger)!r}).exists(): time.sleep(0.005)\n'
+        f'child=subprocess.Popen([sys.executable,"-c",{child_code!r}], start_new_session=True)\n'
+        f'Path({str(pid_file)!r}).write_text(str(child.pid))\n'
+        'child.wait()\n'
+        'time.sleep(60)\n'
+    )
+    try:
+        await runtime.start()
+        fence = runtime.capture_process_fence()
+        client._sessions['owned'] = SimpleNamespace(session_id='owned')
+        assert fence.is_settled() is True
+        assert unrelated_child.poll() is None
+        trigger.write_text('spawn')
+        async with asyncio.timeout(2):
+            while not pid_file.exists():
+                await asyncio.sleep(0.005)
+        child_pid = int(pid_file.read_text())
+        assert fence.is_settled() is False
+        assert child_pid in {process.pid for process in runtime._tree.live()}
+        assert unrelated_child.pid not in {process.pid for process in runtime._tree.live()}
+        stop.write_text('stop')
+        async with asyncio.timeout(2):
+            while not fence.is_settled():
+                await asyncio.sleep(0.005)
+        assert unrelated_child.poll() is None
+    finally:
+        stop.write_text('stop')
+        await runtime.close()
+    assert unrelated_child.poll() is None
