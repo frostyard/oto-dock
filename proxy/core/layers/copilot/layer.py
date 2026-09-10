@@ -13,6 +13,7 @@ from pathlib import Path
 
 from auth.path_policy import SecurityContext
 from core.execution_layer import AgentConfig, ExecutionLayer, LayerCapabilities
+from core.layers.copilot.catalog import CopilotCatalogOwner
 from core.layers.copilot.credentials import CopilotAccountScope
 from core.layers.copilot.local_session import CopilotLocalSession, CopilotLocalSessionConfig
 from core.layers.copilot.sandbox_home import CopilotSandboxHomes
@@ -42,7 +43,8 @@ class _Entry:
     session_id: str
     config: CopilotAgentConfig
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    owner: CopilotLocalSession | None = None
+    owner: CopilotLocalSession | CopilotCatalogOwner | None = None
+    catalog: bool = False
     context: object = None
     registration_started: bool = False
     startup: asyncio.Task | None = None
@@ -128,12 +130,26 @@ class CopilotExecutionLayer(ExecutionLayer):
         )
 
     async def start_session(self, session_id, config):
+        await self._open_entry(session_id, config)
+
+    async def list_models(self, session_id, config):
+        """One selected-account inventory, returned only after owned disposal."""
+        entry = await self._open_entry(session_id, config, catalog=True)
+        try:
+            rows = deepcopy(entry.owner.rows)
+        finally:
+            await self._close_entry(entry)
+        return rows
+
+    async def _open_entry(self, session_id, config, *, catalog=False):
         if self._closing is not None:
             raise CopilotLayerError("Copilot execution layer is closed")
         failed = False
         try:
             config = deepcopy(config)
             local = self._validate(session_id, config)
+            if catalog and config.resume:
+                raise CopilotLayerError("Catalog requests cannot resume native history")
         except Exception:
             failed = True
         if failed:
@@ -143,7 +159,7 @@ class CopilotExecutionLayer(ExecutionLayer):
         if (session_id in _claims or state.get_session_security(session_id) is not None
                 or has_legacy_session(session_id)):
             raise CopilotLayerError("Copilot platform session is already owned")
-        entry = _Entry(session_id, config)
+        entry = _Entry(session_id, config, catalog=catalog)
         entry.claim = register_owned_session(
             session_id=session_id, engine="copilot-cli", agent=config.agent_name,
             user_sub=config.user_sub, username=config.security_context.mount_username,
@@ -157,10 +173,12 @@ class CopilotExecutionLayer(ExecutionLayer):
             await entry.startup
             if entry.closing is not None or not entry.claim.active:
                 raise CopilotLayerError("Copilot session closed during startup")
-            return
+            return entry
         except asyncio.CancelledError:
             await self._close_entry(entry)
-            raise
+            if not catalog or asyncio.current_task().cancelling():
+                raise
+            failed = True
         except Exception:
             failed = True
         with suppress(Exception):
@@ -181,7 +199,13 @@ class CopilotExecutionLayer(ExecutionLayer):
         finally:
             entry.context = state.get_session_security(entry.session_id)
         state._record_session_use(entry.session_id, config.client_type, config.agent_name)
-        home = self._homes.get(entry.session_id)
+        if entry.catalog:
+            entry.owner = CopilotCatalogOwner(local, runtime_path=self._runtime_path, state_root=self._records.state_root)
+            self._records.validate_roots()
+            home = entry.owner.prepare()
+            self._records.validate_roots()
+        else:
+            home = self._homes.get(entry.session_id)
         sandbox = resolve_sandbox_config(
             role=ctx.role, username=ctx.mount_username, agent_name=config.agent_name,
             is_admin_agent=ctx.is_admin_agent, host_claude_dir=home, user_sub=config.user_sub,
@@ -190,18 +214,21 @@ class CopilotExecutionLayer(ExecutionLayer):
             knowledge_rw=ctx.knowledge_rw, mcp_dir_binds=[],
             trusted_runtime_mounts=[SandboxMount(str(self._runtime_path.parent), "/opt/copilot-runtime", "ro")],
         )
-        builder = SandboxBuilder(sandbox)
-        command = builder.build_command_prefix([])
-        for index, option in enumerate(command):
-            if option in {"--bind", "--ro-bind", "--bind-try", "--ro-bind-try"}:
-                source = Path(command[index + 1]).resolve()
-                if (self._homes.root.is_relative_to(source)
-                        or (source.is_relative_to(self._homes.root) and source != home)):
-                    raise CopilotLayerError("Copilot scratch homes overlap sandbox mounts")
-        entry.owner = await CopilotLocalSession.open(
-            local, builder=builder, runtime_path=self._runtime_path,
-            records=self._records, resume=config.resume,
-        )
+        if entry.catalog:
+            await entry.owner.start(sandbox)
+        else:
+            builder = SandboxBuilder(sandbox)
+            command = builder.build_command_prefix([])
+            for index, option in enumerate(command):
+                if option in {"--bind", "--ro-bind", "--bind-try", "--ro-bind-try"}:
+                    source = Path(command[index + 1]).resolve()
+                    if (self._homes.root.is_relative_to(source)
+                            or (source.is_relative_to(self._homes.root) and source != home)):
+                        raise CopilotLayerError("Copilot scratch homes overlap sandbox mounts")
+            entry.owner = await CopilotLocalSession.open(
+                local, builder=builder, runtime_path=self._runtime_path,
+                records=self._records, resume=config.resume,
+            )
         if asyncio.current_task().cancelling():
             raise asyncio.CancelledError
         entry.reaper = asyncio.create_task(self._watch(entry))
@@ -287,7 +314,7 @@ class CopilotExecutionLayer(ExecutionLayer):
     def _live(self, session_id):
         entry = self._sessions.get(session_id)
         if (self._closing is not None or entry is None or entry.closing is not None
-                or entry.owner is None or not entry.claim.active):
+                or entry.catalog or entry.owner is None or not entry.claim.active):
             raise CopilotLayerError("Copilot execution session is unavailable")
         return entry
 

@@ -27,8 +27,10 @@ preview before releasing that layer during shutdown.
 
 Use a signed-in human dashboard account. Connect a GitHub account in the nearby
 account section, enable its personal use, then select an accessible agent, that
-account, a model ID and a permission mode. The model input starts at
-`gpt-5-mini`; runtime preflight validates model availability. GitHub identity
+account and a permission mode. Click **Load available models**, then choose a
+selectable model returned for that account. Discovery starts a temporary sandbox
+for metadata only; runtime preflight validates the choice again at chat startup.
+See the [model catalog contract](copilot-model-catalog-contract.md). GitHub identity
 validation alone does not establish Copilot entitlement or model access. This
 preview does not borrow contributed platform accounts or choose a fallback payer.
 
@@ -115,7 +117,7 @@ not a browser or reverse-proxy deployment qualification.
 
 The [agent chat route](copilot-agent-chat-contract.md) shares message rendering
 and sidebar navigation. General engine registration, shared chat persistence,
-attachments, queued input, model catalog/default integration, shared payers and
+attachments, queued input, persisted model/default integration, shared payers and
 general onboarding remain open. Saved preview conversations
 have a separate owner-only read and explicit clean-resume path.
 Graceful steering/interrupt semantics, MCP/delegation, remote machines, terminal

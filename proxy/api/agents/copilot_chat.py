@@ -47,6 +47,11 @@ class CreateRequest(_Body):
     permission_mode: Literal["default", "acceptEdits", "plan", "dontAsk"] = "default"
 
 
+class ModelsRequest(_Body):
+    agent: Identifier
+    account_id: Identifier
+
+
 class TurnRequest(_Body):
     text: Annotated[str, Field(strict=True, min_length=1, max_length=65536)]
 
@@ -216,6 +221,28 @@ async def create(req: CreateRequest, request: Request, user: UserContext | None 
     return await _open_session(request, user, service, service.create(
         user, req.agent, req.account_id, req.model, permission_mode=req.permission_mode,
     ))
+
+
+@router.post("/models")
+async def models(req: ModelsRequest, request: Request, user: UserContext | None = Depends(get_current_user)):
+    user = _human(request, user)
+    _mutation(request)
+    task = asyncio.create_task(_service(request).list_models(user, req.agent, req.account_id))
+    stopped = asyncio.Event()
+    disconnected = asyncio.create_task(_disconnected(request, stopped))
+    try:
+        await asyncio.wait((task, disconnected), return_when=asyncio.FIRST_COMPLETED)
+        if disconnected.done() or await request.is_disconnected():
+            raise HTTPException(499, "Copilot model connection closed")
+        return JSONResponse(await _call(task), headers={"Cache-Control": "no-store"})
+    finally:
+        stopped.set()
+        disconnected.cancel()
+        async def finish():
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, disconnected, return_exceptions=True)
+        await _join(finish())
 
 
 async def _open_session(request, user, service, operation):

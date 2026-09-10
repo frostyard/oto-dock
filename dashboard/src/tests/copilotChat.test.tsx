@@ -21,6 +21,7 @@ const frame = (event: object) => `data: ${JSON.stringify(event)}\n\n`
 beforeEach(() => {
   vi.restoreAllMocks(); apiFetch.mockReset(); auth.user = { sub: 'alice', role: 'member' }
   apiFetch.mockImplementation(async (url: string, options: RequestInit = {}) => {
+    if (url.endsWith('/models')) return json({ models: [{ id: 'gpt-5-mini', name: 'GPT-5 mini', available: true, policy: 'enabled', multiplier: 0.33 }] })
     if (url.endsWith('/status')) return json({ available: true })
     if (url === '/v1/agents') return json({ agents: [{ name: 'demo', display_name: 'Demo agent' }] })
     if (url === '/v1/copilot/accounts') return json({ accounts: [{ id: 'account-1', label: 'My account', principal_id: 'github:user:1', revision: 'r1', status: 'active', use_personal: true, contribute_platform: false, expires_at: null, auth_kind: 'user_token' }] })
@@ -37,6 +38,14 @@ function mount() {
 }
 async function send(text = 'Please help') {
   const button = await screen.findByRole('button', { name: 'Send' })
+  const picker = screen.getByLabelText('Model')
+  if (picker.tagName === 'SELECT' && !(picker as HTMLSelectElement).value) {
+    const load = screen.getByRole('button', { name: 'Load available models' })
+    await waitFor(() => expect(load).toBeEnabled())
+    fireEvent.click(load)
+    await screen.findByRole('option', { name: /GPT-5 mini/ })
+    fireEvent.change(picker, { target: { value: 'gpt-5-mini' } })
+  }
   fireEvent.change(screen.getByLabelText('Message'), { target: { value: text } })
   await waitFor(() => expect(button).toBeEnabled())
   fireEvent.click(button)
@@ -252,7 +261,8 @@ it('explicitly resumes the stored revision with a fresh handle and fixed configu
   const row = savedFixture(), base = apiFetch.getMockImplementation()!
   apiFetch.mockImplementation((url, options) => url.endsWith('/resume') ? Promise.resolve(json({ session_id: 'fresh-owner', conversation_id: row.id })) : base(url, options))
   mount(); await selectSaved()
-  expect(screen.getByLabelText('Model ID (preview)')).toHaveValue('saved-model')
+  expect(screen.getByLabelText('Model')).toHaveValue('saved-model')
+  expect(screen.queryByRole('button', { name: 'Load available models' })).not.toBeInTheDocument()
   expect(screen.getByLabelText('Permission mode')).toHaveValue('plan')
   expect(screen.getByLabelText('Personal Copilot account')).toBeDisabled()
   fireEvent.click(screen.getByRole('button', { name: 'Resume conversation' }))
@@ -263,7 +273,7 @@ it('explicitly resumes the stored revision with a fresh handle and fixed configu
   await send('Continue saved work')
   expect(await screen.findByText('Hello from Copilot')).toBeInTheDocument()
   expect(apiFetch.mock.calls.some(([url]) => url.endsWith('/fresh-owner/turn'))).toBe(true)
-  expect(apiFetch.mock.calls.some(([url]) => url.endsWith('/sessions'))).toBe(false)
+  expect(apiFetch.mock.calls.some(([url]) => url.endsWith('/sessions') || url.endsWith('/models'))).toBe(false)
   expect(vi.mocked(chat.listCopilotConversations).mock.calls.length).toBeGreaterThan(1)
 })
 it('ignores an older history response after a different selection', async () => {

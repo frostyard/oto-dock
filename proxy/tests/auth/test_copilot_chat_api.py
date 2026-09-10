@@ -61,6 +61,18 @@ class Service:
         self.create_hook = None
         self.closed = asyncio.Event()
 
+    async def list_models(self, user, agent, account_id):
+        self.calls.append(("models", user, agent, account_id))
+        try:
+            if self.error:
+                raise self.error
+            if self.create_hook:
+                await self.create_hook()
+            return {"models": [{"id": "model-a", "name": "Model A", "available": True,
+                                "policy": "enabled", "multiplier": None}]}
+        finally:
+            self.closed.set()
+
     async def create(self, user, agent, account_id, model, permission_mode="default"):
         options = {"agent": agent, "account_id": account_id, "model": model, "permission_mode": permission_mode}
         self.calls.append(("create", user, options))
@@ -659,3 +671,98 @@ async def test_agent_query_bounds_reject_before_service(api, agent, path):
     path += '?agent=' + agent
     response = await post(api, path, {'revision': 1}) if '/resume?' in path else await api.client.get(BASE + path)
     assert response.status_code == 422 and not api.service.calls
+
+
+@pytest.mark.asyncio
+async def test_models_explicit_post_forwards_only_authenticated_agent_and_account(api):
+    response = await post(api, '/models', {'agent': 'demo', 'account_id': 'account-one'})
+    assert response.status_code == 200
+    assert response.headers['cache-control'] == 'no-store'
+    assert response.json()['models'][0]['id'] == 'model-a'
+    assert api.service.calls == [('models', api.user[0], 'demo', 'account-one')]
+    assert api.service.closed.is_set()
+    assert (await api.client.get(BASE + '/models')).status_code == 405
+    assert len(api.service.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('extra', [{'model': 'injected'}, {'scope': 'platform'}, {'user_sub': 'other'},
+                                  {'permission_mode': 'acceptEdits'}, {'agent': ''}, {'account_id': True},
+                                  {'account_id': 'x' * 257}])
+async def test_models_reject_invalid_body_before_dispatch(api, extra):
+    response = await post(api, '/models', {'agent': 'demo', 'account_id': 'account-one', **extra})
+    assert response.status_code == 422 and not api.service.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('principal', ['api', 'session', 'agent', 'external', 'missing'])
+async def test_models_require_human_cookie_before_discovery(api, principal):
+    api.user[0] = {
+        'api': replace(api.user[0], is_api_key=True),
+        'session': replace(api.user[0], session_id='session'),
+        'agent': replace(api.user[0], agent='agent'),
+        'external': replace(api.user[0], external_claim='phone:caller'),
+        'missing': None,
+    }[principal]
+    response = await post(api, '/models', {'agent': 'demo', 'account_id': 'account-one'})
+    assert response.status_code in {401, 403} and not api.service.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('headers', [{}, {'Origin': 'https://foreign.invalid'},
+                                    {'Origin': 'http://testserver', 'Authorization': ''},
+                                    {'Origin': 'http://testserver', 'Content-Type': 'text/plain'}])
+async def test_models_require_same_origin_and_json_without_authorization_header(api, headers):
+    response = await api.client.post(BASE + '/models', json={'agent': 'demo', 'account_id': 'account-one'}, headers=headers)
+    assert response.status_code in {403, 415, 422} and not api.service.calls
+
+
+@pytest.mark.asyncio
+async def test_models_missing_service_and_private_errors_are_sanitized(api):
+    api.app.state.copilot_chat = None
+    assert (await post(api, '/models', {'agent': 'demo', 'account_id': 'account-one'})).status_code == 503
+    assert not api.service.calls
+    api.app.state.copilot_chat = api.service
+    api.service.error = RuntimeError(SECRET)
+    response = await post(api, '/models', {'agent': 'demo', 'account_id': 'account-one'})
+    assert response.status_code == 503 and SECRET not in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('disconnect', [False, True])
+async def test_models_disconnect_and_repeated_cancel_join_late_owned_cleanup(api, disconnect):
+    entered, cancelled, release, disconnected = (asyncio.Event() for _ in range(4))
+
+    async def late():
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+    api.service.create_hook = late
+    pending = asyncio.create_task(asgi_request(api, '/models', body={'agent': 'demo', 'account_id': 'account-one'}, disconnected=disconnected))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        if disconnect:
+            disconnected.set()
+        else:
+            pending.cancel()
+        await asyncio.wait_for(cancelled.wait(), 1)
+        assert not pending.done() and not api.service.closed.is_set()
+        if not disconnect:
+            pending.cancel()
+            await asyncio.sleep(0)
+            assert not api.service.closed.is_set()
+        release.set()
+        if disconnect:
+            messages = await asyncio.wait_for(pending, 1)
+            assert next(message for message in messages if message['type'] == 'http.response.start')['status'] == 499
+        else:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(pending, 1)
+        assert api.service.closed.is_set()
+        assert [call[0] for call in api.service.calls] == ['models']
+    finally:
+        release.set()
+        await asyncio.gather(pending, return_exceptions=True)
