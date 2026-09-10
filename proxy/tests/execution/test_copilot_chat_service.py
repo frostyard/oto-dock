@@ -28,8 +28,10 @@ class Layer:
         self.started, self.closed, self.messages = [], [], []
         self.program = self.start_hook = self.close_hook = None
         self.usage_observers = {}
+        self.delegate_handlers = {}
 
-    async def start_session(self, sid, config, *, usage_observer=None):
+    async def start_session(self, sid, config, *, usage_observer=None, delegate_handler=None):
+        self.delegate_handlers[sid] = delegate_handler
         self.usage_observers[sid] = usage_observer
         self.started.append((sid, config))
         self.sessions[sid] = asyncio.Lock()
@@ -87,6 +89,8 @@ async def fixture(monkeypatch):
         reads.append(values)
         if current["denied"]:
             raise RuntimeError("credential-bearing fixture error")
+        if values.get("delegation_enabled"):
+            values["delegation_targets"] = ("repo", "qa")
         return SimpleNamespace(revision=current["revision"], **values)
 
     async def acquire(sid, **values):
@@ -1386,3 +1390,219 @@ async def test_cancelled_close_waits_for_accepted_usage_write(fixture, monkeypat
     saved = await service.get_conversation(fixture.user, entry.cid)
     assert [event['event_id'] for event in saved['events'] if event['type'] == 'usage'] == [report['event_id']]
     assert saved['conversation']['can_resume']
+
+
+@pytest_asyncio.fixture
+async def delegation(fixture, monkeypatch):
+    workers = []
+    control = SimpleNamespace(hold=None, close_hold=None, close_error=False)
+
+    class Worker:
+        def __init__(self, **options):
+            self.options = options
+            self.closed = False
+            self.identity = dict(task_id="task-1", run_id="run-1", chat_id="chat-1",
+                                 agent=options["target_agent"])
+            workers.append(self)
+
+        async def run(self):
+            await self.options["authorize_parent"]()
+            await self.options["publish"]({**self.identity, "type": "delegate_spawn",
+                                           "name": self.options["name"], "tool_id": self.options["tool_call_id"]})
+            if control.hold:
+                await control.hold.wait()
+            return {**self.identity, "status": "completed", "output": "Reviewed repository"}
+
+        async def close(self):
+            if control.close_hold:
+                await control.close_hold.wait()
+            if control.close_error:
+                raise RuntimeError("private child cleanup detail")
+            self.closed = True
+            if control.hold:
+                control.hold.set()
+
+    monkeypatch.setitem(sys.modules, "services.delegation.copilot_worker", SimpleNamespace(OwnedCopilotWorker=Worker))
+    service = fixture.service()
+    sid = await service.create(fixture.user, "agent", "account", "model", delegation_enabled=True)
+    return SimpleNamespace(service=service, sid=sid, workers=workers, control=control,
+                           args={"agent": "repo", "name": "Review repo", "prompt": "Review the repository."})
+
+
+@pytest.mark.asyncio
+async def test_owned_delegation_persists_before_stream_and_resume_never_replays(fixture, delegation):
+    d = delegation
+    async def program(sid):
+        result = await fixture.layer.delegate_handlers[sid]("native-call", d.args)
+        assert "Reviewed repository" in result
+        assert d.workers[0].closed
+        yield CommonEvent("text", {"content": "Review complete"})
+        yield CommonEvent("done", {})
+    fixture.layer.program = program
+    turn = await d.service.prepare_turn(fixture.user, d.sid, "Delegate review")
+    frames = []
+    async for frame in turn:
+        if frame["type"].startswith("delegate_"):
+            saved = d.service.store.events(d.service.conversation_id(fixture.user, d.sid), fixture.user.sub)
+            assert any({k: v for k, v in row.items() if k != "seq"} == frame for row in saved)
+        frames.append(frame)
+    await turn.aclose()
+    assert [frame["type"] for frame in frames] == ["delegate_spawn", "delegate_result", "text", "turn_complete"]
+    cid = d.service.conversation_id(fixture.user, d.sid)
+    assert not d.service._entries[d.sid].workers
+    await d.service.close(fixture.user, d.sid)
+    row = d.service.store.get(cid, fixture.user.sub)
+    resumed = await d.service.resume(fixture.user, cid, row["revision"])
+    assert d.service._entry(fixture.user, resumed).delegation_enabled is True
+    async def replay(sid):
+        with pytest.raises(CopilotChatError, match="already requested"):
+            await fixture.layer.delegate_handlers[sid]("native-call", d.args)
+        yield CommonEvent("done", {})
+    fixture.layer.program = replay
+    assert [frame async for frame in await d.service.prepare_turn(fixture.user, resumed, "Continue")] == [{"type": "turn_complete"}]
+    assert len(d.workers) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["roster", "reservation", "revoked"])
+async def test_delegation_denial_precedes_worker_construction(fixture, delegation, monkeypatch, failure):
+    d = delegation
+    if failure == "roster":
+        d.args["agent"] = "unauthorized"
+    if failure == "reservation":
+        monkeypatch.setattr(d.service.store, "reserve_delegation", lambda *args: False)
+    async def program(sid):
+        if failure == "revoked":
+            fixture.current["revision"] += 1
+        with pytest.raises(CopilotChatError):
+            await fixture.layer.delegate_handlers[sid]("native-call", d.args)
+        yield CommonEvent("done", {})
+    fixture.layer.program = program
+    turn = await d.service.prepare_turn(fixture.user, d.sid, "Delegate")
+    _ = [frame async for frame in turn]
+    await turn.aclose()
+    assert d.workers == []
+
+
+@pytest.mark.asyncio
+async def test_parent_close_waits_for_owned_worker_cleanup(fixture, delegation):
+    d = delegation
+    d.control.hold, d.control.close_hold = asyncio.Event(), asyncio.Event()
+    async def program(sid):
+        await fixture.layer.delegate_handlers[sid]("native-call", d.args)
+        yield CommonEvent("done", {})
+    fixture.layer.program = program
+    turn = await d.service.prepare_turn(fixture.user, d.sid, "Delegate")
+    assert (await anext(turn))["type"] == "delegate_spawn"
+    closing = asyncio.create_task(d.service.close(fixture.user, d.sid))
+    await asyncio.sleep(0.01)
+    assert not closing.done() and d.sid in d.service._entries and d.sid in fixture.slots
+    d.control.close_hold.set()
+    await asyncio.wait_for(closing, 1)
+    assert d.workers[0].closed and d.sid not in d.service._entries
+
+
+@pytest.mark.asyncio
+async def test_parent_delegation_cap_is_reserved_before_async_storage(fixture, delegation, monkeypatch):
+    d = delegation
+    d.control.hold = asyncio.Event()
+    entered, release = threading.Event(), threading.Event()
+    reserve = d.service.store.reserve_delegation
+    def held(*args):
+        entered.set()
+        assert release.wait(2)
+        return reserve(*args)
+    monkeypatch.setattr(d.service.store, "reserve_delegation", held)
+    async def program(sid):
+        calls = [asyncio.create_task(fixture.layer.delegate_handlers[sid](f"call-{i}", d.args)) for i in range(4)]
+        try:
+            while not entered.is_set():
+                await asyncio.sleep(0.001)
+            with pytest.raises(CopilotChatError, match="unavailable"):
+                await fixture.layer.delegate_handlers[sid]("overflow", d.args)
+            assert not d.workers
+        finally:
+            release.set()
+            d.control.hold.set()
+        await asyncio.gather(*calls)
+        yield CommonEvent("done", {})
+    fixture.layer.program = program
+    frames = [frame async for frame in await d.service.prepare_turn(fixture.user, d.sid, "Four tasks")]
+    assert sum(frame["type"] == "delegate_result" for frame in frames) == 4
+    assert len(d.workers) == 4 and all(worker.closed for worker in d.workers)
+
+
+@pytest.mark.asyncio
+async def test_result_storage_failure_joins_worker_without_publishing_result(fixture, delegation, monkeypatch):
+    d = delegation
+    append = d.service.store.append_event
+    def fail_result(cid, owner, generation, frame):
+        if frame["type"] == "delegate_result":
+            raise RuntimeError("private database detail")
+        return append(cid, owner, generation, frame)
+    monkeypatch.setattr(d.service.store, "append_event", fail_result)
+    async def program(sid):
+        await fixture.layer.delegate_handlers[sid]("call", d.args)
+        yield CommonEvent("done", {})
+    fixture.layer.program = program
+    cid = d.service.conversation_id(fixture.user, d.sid)
+    frames = [frame async for frame in await d.service.prepare_turn(fixture.user, d.sid, "Review")]
+    assert not any(frame["type"] in {"delegate_result", "turn_complete"} for frame in frames)
+    assert d.workers[0].closed
+    assert not any(frame["type"] == "delegate_result" for frame in d.service.store.events(cid, fixture.user.sub))
+
+
+@pytest.mark.asyncio
+async def test_unproven_worker_cleanup_retains_parent_and_quarantines_completion(fixture, delegation):
+    d = delegation
+    d.control.close_error = True
+    async def program(sid):
+        await fixture.layer.delegate_handlers[sid]("call", d.args)
+        yield CommonEvent("done", {})
+    fixture.layer.program = program
+    turn = await d.service.prepare_turn(fixture.user, d.sid, "Review")
+    frames = [frame async for frame in turn]
+    assert not any(frame["type"] in {"delegate_result", "turn_complete"} for frame in frames)
+    entry = d.service._entries[d.sid]
+    assert entry.workers["call"] is d.workers[0]
+    assert d.sid in fixture.slots
+    with pytest.raises(CopilotChatError, match="cleanup is incomplete"):
+        await d.service.close(fixture.user, d.sid)
+    assert "private" not in str(frames)
+    d.control.close_error = False
+
+
+
+@pytest.mark.asyncio
+async def test_parent_close_unblocks_worker_publication_when_stream_queue_is_full(fixture, delegation, monkeypatch):
+    d = delegation
+    module = sys.modules["services.delegation.copilot_worker"]
+    class StartupOwner(module.OwnedCopilotWorker):
+        async def run(self):
+            self.startup = asyncio.create_task(super().run())
+            return await asyncio.shield(self.startup)
+        async def close(self):
+            # Like the real scheduler owner, join startup instead of cancelling
+            # a coroutine that may own an uncancellable database mutation.
+            await asyncio.gather(self.startup, return_exceptions=True)
+            self.closed = True
+    monkeypatch.setattr(module, "OwnedCopilotWorker", StartupOwner)
+    ready = asyncio.Event()
+    async def program(sid):
+        entry = d.service._entries[sid]
+        # A slow/lost reader has filled the bounded stream before the child
+        # startup publisher can return. The producer waits for that child.
+        for _ in range(128):
+            entry.turn._queue.put_nowait({"type": "text", "content": "buffered"})
+        ready.set()
+        await fixture.layer.delegate_handlers[sid]("call", d.args)
+        yield CommonEvent("done", {})
+    fixture.layer.program = program
+    turn = await d.service.prepare_turn(fixture.user, d.sid, "Review")
+    await ready.wait()
+    async with asyncio.timeout(1):
+        while not d.workers:
+            await asyncio.sleep(0.001)
+    await asyncio.wait_for(d.service.close(fixture.user, d.sid), 2)
+    assert d.workers[0].closed and d.sid not in d.service._entries
+    assert turn._producer.done()

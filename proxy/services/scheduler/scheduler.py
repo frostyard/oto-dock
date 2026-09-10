@@ -2104,7 +2104,7 @@ def _create_task_chat_row(chat_id: str, run_id: str, task: TaskDefinition) -> No
 async def _execute_task(task: TaskDefinition, trigger_type: str = "scheduled",
                         trigger_source: str | None = None,
                         prompt_override: str | None = None, attempt: int = 1,
-                        trigger_payload: dict | None = None) -> str:
+                        trigger_payload: dict | None = None, *, owned_worker=None) -> str:
     from core.session import session_state as _state
 
     # Continuations are wake deliveries, not LLM task runs — no run row, no
@@ -2134,6 +2134,10 @@ async def _execute_task(task: TaskDefinition, trigger_type: str = "scheduled",
             )
         session_id = str(uuid.uuid4())
     final_prompt = prompt_override or task.prompt
+    # Trusted, in-process ownership seam. Never populated from task rows or
+    # request fields. Capture before state, database or subprocess allocation.
+    if owned_worker is not None:
+        owned_worker.capture_ids(run_id, session_id, f"task-{run_id}")
 
     # Mark as task session so /v1/session/current excludes it.
     # Without this, task sessions (which share the agent name and have more recent
@@ -2230,10 +2234,16 @@ async def _execute_task(task: TaskDefinition, trigger_type: str = "scheduled",
                 _create_task_chat_row, f"task-{run_id}", run_id, task,
             )
 
+        if owned_worker is not None:
+            await owned_worker.rows_created()
+
         t = asyncio.create_task(
             _run_task(run_id, session_id, task, final_prompt, trigger_type,
-                      trigger_source, attempt, trigger_payload)
+                      trigger_source, attempt, trigger_payload,
+                      **({"owned_worker": owned_worker} if owned_worker is not None else {}))
         )
+        if owned_worker is not None:
+            owned_worker.capture_runner(t)
         _running_tasks[run_id] = t
         t.add_done_callback(lambda _: _running_tasks.pop(run_id, None))
     except Exception:
@@ -2351,7 +2361,7 @@ async def _admitted_slot(session_id: str, target: str, run_id: str):
 
 async def _run_task(run_id: str, session_id: str, task: TaskDefinition, prompt: str,
                     trigger_type: str, trigger_source: str | None, attempt: int,
-                    trigger_payload: dict | None = None) -> None:
+                    trigger_payload: dict | None = None, *, owned_worker=None) -> None:
     from core.session import session_state as _state
     from core.session.session_manager import get_execution_layer
     from core.config.task_config_builder import (
@@ -2361,6 +2371,9 @@ async def _run_task(run_id: str, session_id: str, task: TaskDefinition, prompt: 
     from core.events.stream_pump import ChatStreamPump, _active_pumps
     from core.session.session_state import get_permission_queue
     from storage import remote_store
+
+    if owned_worker is not None:
+        await owned_worker.before_config()
 
     # Resolve the execution target BEFORE entering the task slot so a REMOTE task
     # doesn't take a local-G slot or block on the local queue (it's bounded by its
@@ -2460,10 +2473,16 @@ async def _run_task(run_id: str, session_id: str, task: TaskDefinition, prompt: 
             #    security context, task suffix, env vars). trigger_payload
             #    threads through so manifest agent_context blocks resolve
             #    ${trigger.*} tokens for webhook-fired tasks.
-            agent_cfg = await build_task_agent_config(
-                task.agent, task, session_id,
-                trigger_payload=trigger_payload,
-            )
+            if owned_worker is None:
+                agent_cfg = await build_task_agent_config(
+                    task.agent, task, session_id, trigger_payload=trigger_payload,
+                )
+            else:
+                agent_cfg = await owned_worker.build_config(
+                    lambda: build_task_agent_config(
+                        task.agent, task, session_id, trigger_payload=trigger_payload,
+                    )
+                )
 
             # Hard-fail if the resolved target is the offline sentinel from
             # the resolver. Without this, agent-level remote targets silently
@@ -2505,6 +2524,8 @@ async def _run_task(run_id: str, session_id: str, task: TaskDefinition, prompt: 
                 role=_ident.role,
                 execution_target=agent_cfg.execution_target,
             )
+            if owned_worker is not None:
+                owned_worker.capture_layer(layer, session_id)
 
             # Pin the task chat to the target it actually runs on
             # — same affinity as dashboard chats (ws/dashboard.py warmup pin).
@@ -2648,7 +2669,11 @@ async def _run_task(run_id: str, session_id: str, task: TaskDefinition, prompt: 
             # 3. Start session via execution layer (skipped when the round
             #    rides an already-warm session — see _try_reuse_warm_session)
             if not reused_warm:
-                await layer.start_session(session_id, agent_cfg)
+                if owned_worker is not None:
+                    await owned_worker.before_start(agent_cfg)
+                    await owned_worker.start_engine(layer, session_id, agent_cfg)
+                else:
+                    await layer.start_session(session_id, agent_cfg)
 
             # 4. Mark as task session so /v1/session/current excludes it.
             _state._sessions.setdefault(session_id, {"created": True, "message_count": 0})
@@ -2681,6 +2706,8 @@ async def _run_task(run_id: str, session_id: str, task: TaskDefinition, prompt: 
                         broadcast_fn=_broadcast, settle_timeout=30.0,
                     )
                 )
+                if owned_worker is not None:
+                    owned_worker.capture_producer(producer)
 
                 # 6. Create pump, register in _active_pumps, and run to completion.
                 # Registration allows dashboard WS to attach for live streaming.
@@ -2696,6 +2723,8 @@ async def _run_task(run_id: str, session_id: str, task: TaskDefinition, prompt: 
                 )
                 _active_pumps[chat_id] = pump
                 pump.start()
+                if owned_worker is not None:
+                    owned_worker.capture_pump(pump)
                 # Run to completion under the stall watchdog (reaps a wedged
                 # turn instead of holding the run "generating" forever).
                 await _watch_task_pump(layer, pump, run_id, chat_id, session_id)

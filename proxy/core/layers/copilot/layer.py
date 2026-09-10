@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field
+import inspect
 from pathlib import Path
 
 from auth.path_policy import SecurityContext
@@ -37,6 +38,7 @@ class CopilotAgentConfig(AgentConfig):
     account_id: str = ""
     account_scope: CopilotAccountScope | None = None
     enabled_tools: frozenset[str] = frozenset()
+    delegation_targets: tuple[str, ...] = ()
 
 
 @dataclass
@@ -47,6 +49,7 @@ class _Entry:
     owner: CopilotLocalSession | CopilotCatalogOwner | None = None
     catalog: bool = False
     usage_observer: object = None
+    delegate_handler: object = None
     context: object = None
     registration_started: bool = False
     startup: asyncio.Task | None = None
@@ -129,11 +132,11 @@ class CopilotExecutionLayer(ExecutionLayer):
             raise CopilotLayerError("Unsupported Copilot local session configuration")
         return CopilotLocalSessionConfig(
             session_id, config.account_id, config.account_scope, config.user_sub,
-            config.model, config.enabled_tools, config.system_prompt, config.effort or None,
+            config.model, config.enabled_tools, config.system_prompt, config.effort or None, config.delegation_targets,
         )
 
-    async def start_session(self, session_id, config, *, usage_observer=None):
-        await self._open_entry(session_id, config, usage_observer=usage_observer)
+    async def start_session(self, session_id, config, *, usage_observer=None, delegate_handler=None):
+        await self._open_entry(session_id, config, usage_observer=usage_observer, delegate_handler=delegate_handler)
 
     async def list_models(self, session_id, config):
         """One selected-account inventory, returned only after owned disposal."""
@@ -144,13 +147,19 @@ class CopilotExecutionLayer(ExecutionLayer):
             await self._close_entry(entry)
         return rows
 
-    async def _open_entry(self, session_id, config, *, catalog=False, usage_observer=None):
+    async def _open_entry(self, session_id, config, *, catalog=False, usage_observer=None, delegate_handler=None):
         if self._closing is not None:
             raise CopilotLayerError("Copilot execution layer is closed")
         failed = False
         try:
             config = deepcopy(config)
             local = self._validate(session_id, config)
+            if bool(local.delegation_targets) != (delegate_handler is not None):
+                raise CopilotLayerError("Delegation handler must match configured targets")
+            if delegate_handler is not None and not inspect.iscoroutinefunction(delegate_handler):
+                raise CopilotLayerError("Delegation handler must be asynchronous")
+            if catalog and config.delegation_targets:
+                raise CopilotLayerError("Catalog requests cannot configure delegation")
             if catalog and config.resume:
                 raise CopilotLayerError("Catalog requests cannot resume native history")
         except Exception:
@@ -162,7 +171,7 @@ class CopilotExecutionLayer(ExecutionLayer):
         if (session_id in _claims or state.get_session_security(session_id) is not None
                 or has_legacy_session(session_id)):
             raise CopilotLayerError("Copilot platform session is already owned")
-        entry = _Entry(session_id, config, catalog=catalog, usage_observer=usage_observer)
+        entry = _Entry(session_id, config, catalog=catalog, usage_observer=usage_observer, delegate_handler=delegate_handler)
         entry.claim = register_owned_session(
             session_id=session_id, engine="copilot-cli", agent=config.agent_name,
             user_sub=config.user_sub, username=config.security_context.mount_username,
@@ -232,6 +241,7 @@ class CopilotExecutionLayer(ExecutionLayer):
                 local, builder=builder, runtime_path=self._runtime_path,
                 records=self._records, resume=config.resume,
                 on_owner=lambda owner: setattr(entry, "owner", owner),
+                **({"delegate_handler": entry.delegate_handler} if entry.delegate_handler is not None else {}),
                 **({"usage_observer": entry.usage_observer} if entry.usage_observer is not None else {}),
             )
         if asyncio.current_task().cancelling():

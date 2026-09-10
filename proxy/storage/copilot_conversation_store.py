@@ -8,6 +8,7 @@ No generic chat rows, credentials, engine routing, or inference are created.
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from functools import wraps
+import hashlib
 import json
 import math
 import uuid
@@ -24,7 +25,7 @@ MAX_FRAME_BYTES = 256 * 1024
 _DB_TIMEOUT_MS = 5000
 _UNSET = object()
 _EVENT_TYPES = frozenset({"text", "tool_use", "tool_input", "tool_result",
-                          "permission_prompt", "question_prompt", "error"})
+                          "permission_prompt", "question_prompt", "error", "delegate_spawn", "delegate_result"})
 
 
 class CopilotConversationError(RuntimeError):
@@ -177,20 +178,21 @@ def _update(conn, row, **fields):
 
 @_safe
 def create(conversation_id, owner_sub, *, agent, account_id, model, permission_mode,
-           platform_session_id, generation, reasoning_effort=None):
+           platform_session_id, generation, reasoning_effort=None, delegation_enabled=False):
     _identity(conversation_id, owner_sub, generation)
     if (not _text(agent) or not config.is_safe_agent_name(agent) or not _uuid(account_id)
             or not _text(model) or permission_mode not in {"default", "acceptEdits", "plan", "dontAsk"}
-            or not _uuid(platform_session_id) or not valid_reasoning_effort(reasoning_effort)):
+            or not _uuid(platform_session_id) or not valid_reasoning_effort(reasoning_effort)
+            or type(delegation_enabled) is not bool):
         raise CopilotConversationError()
     with _connection() as conn:
         now = _now()
         row = conn.execute(
             """INSERT INTO copilot_conversations
-               (id,user_sub,agent,account_id,model,permission_mode,platform_session_id,generation,created_at,updated_at,reasoning_effort)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING *""",
+               (id,user_sub,agent,account_id,model,permission_mode,platform_session_id,generation,created_at,updated_at,reasoning_effort,delegation_enabled)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING *""",
             (conversation_id, owner_sub, agent, account_id, model, permission_mode,
-             platform_session_id, generation, now, now, reasoning_effort),
+             platform_session_id, generation, now, now, reasoning_effort, delegation_enabled),
         ).fetchone()
         if row is None:
             raise CopilotConversationConflict()
@@ -259,6 +261,43 @@ def append_event(cid, owner, generation, event):
         row = _row(conn, cid, owner, generation)
         _open(row, active=True)
         return _update(conn, row, **_append(conn, row, event))
+
+
+def delegation_request(tool_id, args):
+    from core.layers.copilot.host_tools import valid_delegate_args
+
+    if (not _text(tool_id) or type(args) is not dict
+            or not valid_delegate_args(args, (args.get("agent"),))):
+        raise CopilotConversationError()
+    digest = hashlib.sha256(json.dumps(args, sort_keys=True, ensure_ascii=False,
+                                       separators=(",", ":")).encode("utf-8")).hexdigest()
+    return {"type": "delegation_request", "tool_id": tool_id, "agent": args["agent"],
+            "name": args["name"], "prompt_digest": digest}
+
+
+@_safe
+def reserve_delegation(cid, owner, generation, tool_id, args):
+    """Consume a native invocation durably before dispatch, including on resume.
+
+    An uncertain reservation is never retried. A duplicate ID cannot start a
+    second worker even if the first result was lost before it was published.
+    """
+    _identity(cid, owner, generation)
+    event = delegation_request(tool_id, args)
+    with _connection() as conn:
+        row = _row(conn, cid, owner, generation)
+        _open(row, active=True)
+        if row.get("delegation_enabled") is not True:
+            raise CopilotConversationConflict()
+        previous = conn.execute(
+            """SELECT payload FROM copilot_conversation_events
+               WHERE conversation_id=%s AND payload::jsonb->>'type'='delegation_request'
+               AND payload::jsonb->>'tool_id'=%s""", (cid, tool_id),
+        ).fetchone()
+        if previous is not None:
+            return False
+        _update(conn, row, **_append(conn, row, event))
+        return True
 
 
 @_safe

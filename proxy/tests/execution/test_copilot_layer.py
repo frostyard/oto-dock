@@ -1179,3 +1179,25 @@ async def test_failed_factory_startup_preserves_captured_owner_until_confirmed_r
         assert get_owned_session(sid) is None
         assert await layer.is_session_process_dead(sid) is True
         assert await layer.is_usage_source_closed(sid) is True
+
+
+@pytest.mark.asyncio
+async def test_layer_delegation_handler_is_trusted_owner_option_and_targets_are_profile(harness):
+    async def handler(call_id, arguments):
+        return "result"
+
+    layer, sid = harness.layer(), harness.identity()
+    await layer.start_session(sid, config(delegation_targets=("repo",)), delegate_handler=handler)
+    local, options = harness.opens[-1]
+    assert local.delegation_targets == ("repo",) and options["delegate_handler"] is handler
+    assert not hasattr(local, "delegate_handler")
+    await layer.close_session(sid)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("targets,handler", [(("repo",), None), ((), "invalid"), (("repo",), "invalid")])
+async def test_layer_delegation_mismatch_rejected_before_registration(harness, targets, handler):
+    layer, sid = harness.layer(), harness.identity()
+    with pytest.raises(module.CopilotLayerError):
+        await layer.start_session(sid, config(delegation_targets=targets), delegate_handler=handler)
+    assert harness.opens == [] and state.get_session_security(sid) is None and sid not in module._claims

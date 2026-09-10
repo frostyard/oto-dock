@@ -1816,6 +1816,10 @@ class ChatController:
                     raw = await asyncio.wait_for(self.websocket.receive_text(), timeout=0.05)
                     client_msg = json.loads(raw)
                     cm_type = client_msg.get("type", "")
+                    from ws.dashboard import owned_worker_message_blocked
+                    if owned_worker_message_blocked(pump.chat_id, client_msg):
+                        await self._send_error("This delegated worker is still owned by its parent. Wait for cleanup to finish.")
+                        continue
 
                     if cm_type == "permission_response":
                         if await self._may_resolve_permission(client_msg["request_id"]):
@@ -2784,6 +2788,10 @@ class ChatController:
         ``_task_continue_allowed``). No-op (returns False) for non-task chats.
         Called at every entry point that (re)warms or drives a task session.
         """
+        from core.session.worker_ownership import is_owned_worker_chat
+        if is_owned_worker_chat(cid):
+            await self._send_error("This delegated worker is still owned by its parent. Wait for cleanup to finish.")
+            return True
         if not cid or not cid.startswith("task-"):
             return False
         _rid, _sub, _fb = cid.removeprefix("task-"), self.user_sub, self.user

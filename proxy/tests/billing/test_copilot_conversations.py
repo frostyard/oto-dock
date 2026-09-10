@@ -578,3 +578,128 @@ def test_validation_usage_rejects_before_database(monkeypatch, fields):
     monkeypatch.setattr(store, 'get_conn', forbidden)
     with pytest.raises(store.CopilotConversationError):
         store.append_usage(identifier(), OWNER, identifier(), {**usage_report(), **fields})
+
+
+@pytest.fixture
+def delegated_conversation(conversation):
+    return store.create(identifier(), OWNER, agent='copilot-history', account_id=identifier(),
+                        model='fixture-model', permission_mode='default', delegation_enabled=True,
+                        platform_session_id=identifier(), generation=identifier())
+
+
+def delegate_args(**changes):
+    return {'agent': 'repo-agent', 'name': 'Review migration', 'prompt': 'Private instructions for the worker', **changes}
+
+
+def reserve(row, tool_id='native-call', **changes):
+    return store.reserve_delegation(row['id'], OWNER, row['generation'], tool_id, delegate_args(**changes))
+
+
+def test_delegation_reservation_is_durable_without_persisting_raw_prompt(delegated_conversation):
+    row = delegated_conversation
+    assert row['delegation_enabled'] is True
+    begin(row)
+    assert reserve(row) is True
+    saved = store.get(row['id'], OWNER)
+    assert reserve(row) is False
+    # Reuse consumes the invocation even if arguments changed: never run a
+    # second worker after an uncertain first dispatch.
+    assert reserve(row, prompt='Changed private instructions') is False
+    assert store.get(row['id'], OWNER) == saved
+    event = store.events(row['id'], OWNER)[-1]
+    assert event['type'] == 'delegation_request' and event['tool_id'] == 'native-call'
+    assert len(event['prompt_digest']) == 64
+    assert 'prompt' not in event and 'Private instructions' not in json.dumps(event)
+    assert saved['turn_active'] and not saved['last_turn_complete']
+
+
+def test_delegation_reservation_replay_survives_new_writer_generation(delegated_conversation):
+    row = delegated_conversation
+    begin(row)
+    assert reserve(row)
+    finish(row)
+    closed = store.finish_close(row['id'], OWNER, row['generation'], True)
+    resumed = store.claim_resume(row['id'], OWNER, closed['revision'], identifier())
+    assert resumed['delegation_enabled'] is True
+    begin(resumed, 'Continue')
+    assert reserve(resumed) is False
+    assert reserve(resumed, tool_id='fresh-call') is True
+    with pytest.raises(store.CopilotConversationConflict):
+        reserve(row, tool_id='stale-writer')
+    assert len([event for event in store.events(row['id'], OWNER) if event['type'] == 'delegation_request']) == 2
+
+
+def test_delegation_requires_exact_owner_open_active_turn_and_opt_in(conversation, delegated_conversation):
+    assert conversation['delegation_enabled'] is False
+    begin(conversation)
+    with pytest.raises(store.CopilotConversationConflict):
+        reserve(conversation)
+    row = delegated_conversation
+    with pytest.raises(store.CopilotConversationConflict):
+        reserve(row)
+    begin(row)
+    with pytest.raises(store.CopilotConversationNotFound):
+        store.reserve_delegation(row['id'], OTHER, row['generation'], 'call', delegate_args())
+    with pytest.raises(store.CopilotConversationConflict):
+        store.reserve_delegation(row['id'], OWNER, identifier(), 'call', delegate_args())
+    finish(row)
+    with pytest.raises(store.CopilotConversationConflict):
+        reserve(row)
+    store.finish_close(row['id'], OWNER, row['generation'], True)
+    with pytest.raises(store.CopilotConversationConflict):
+        reserve(row)
+
+
+def test_delegation_reservation_has_one_concurrent_winner(delegated_conversation):
+    row = delegated_conversation
+    begin(row)
+    barrier = threading.Barrier(2)
+
+    def writer():
+        barrier.wait(timeout=3)
+        return reserve(row)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: writer(), range(2)))
+    assert sorted(results) == [False, True]
+    assert len([event for event in store.events(row['id'], OWNER) if event['type'] == 'delegation_request']) == 1
+
+
+def test_delegation_history_limit_is_atomic_and_replay_does_not_consume_capacity(delegated_conversation, monkeypatch):
+    row = delegated_conversation
+    begin(row)
+    monkeypatch.setattr(store, 'MAX_EVENTS', 2)
+    assert reserve(row)
+    saved = store.get(row['id'], OWNER)
+    assert reserve(row) is False
+    with pytest.raises(store.CopilotConversationLimit):
+        reserve(row, tool_id='other-call')
+    assert store.get(row['id'], OWNER) == saved
+
+
+@pytest.mark.parametrize('flag', [None, 0, 1, 'true', [], {}])
+def test_validation_delegation_flag_rejects_before_database(monkeypatch, flag):
+    monkeypatch.setattr(store, 'get_conn', lambda: pytest.fail('Invalid flag reached database'))
+    with pytest.raises(store.CopilotConversationError):
+        store.create(identifier(), OWNER, agent='agent', account_id=identifier(), model='model',
+                     permission_mode='default', platform_session_id=identifier(), generation=identifier(),
+                     delegation_enabled=flag)
+
+
+@pytest.mark.parametrize('tool_id,changes', [
+    ('', {}), (' call', {}), ('x' * 257, {}), ('native', {'agent': '../other'}),
+    ('native', {'name': 'x' * 101}), ('native', {'name': '\n'}), ('native', {'prompt': ''}),
+    ('native', {'prompt': 'é' * 8193}), ('native', {'prompt': 'hidden\0suffix'}),
+    ('native', {'account_id': 'injected'}),
+])
+def test_validation_delegation_request_rejects_before_database(monkeypatch, tool_id, changes):
+    monkeypatch.setattr(store, 'get_conn', lambda: pytest.fail('Invalid invocation reached database'))
+    with pytest.raises(store.CopilotConversationError):
+        store.reserve_delegation(identifier(), OWNER, identifier(), tool_id, delegate_args(**changes))
+
+
+def test_validation_delegation_digest_is_key_order_independent_and_prompt_bounded():
+    args = delegate_args(prompt='é' * 8192)
+    request = store.delegation_request('native', args)
+    assert store.delegation_request('native', dict(reversed(list(args.items())))) == request
+    assert request['prompt_digest'] != store.delegation_request('native', delegate_args())['prompt_digest']

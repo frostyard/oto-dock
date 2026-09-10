@@ -4,7 +4,8 @@ Status: implementation started. C0 is complete; C1 is in progress. An opt-in
 local chat preview with saved transcripts and explicit clean resume is available
 in agent chat navigation and AI Engines settings for personal accounts, with
 explicit account-bound model discovery, per-conversation reasoning effort and
-observed usage reporting.
+observed usage reporting. Conversations can also opt into bounded local delegation
+to existing Claude Code/Codex repository and QA agents.
 The engine remains unregistered in general chat/task routing; full parity is
 incomplete.
 
@@ -33,7 +34,9 @@ Progress: [C0 baseline](copilot-ci-baseline.md),
 [reasoning effort results](copilot-reasoning-results.md)
 ([reasoning contract](copilot-reasoning-contract.md)), and
 [observed usage results](copilot-usage-results.md)
-([usage contract](copilot-usage-contract.md)).
+([usage contract](copilot-usage-contract.md)), and
+[owned delegation results](copilot-delegation-results.md)
+([delegation contract](copilot-delegation-contract.md)).
 
 Tracking issue: [Copilot: full Claude Code and Codex parity](https://github.com/frostyard/oto-dock/issues/1).
 

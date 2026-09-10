@@ -45,6 +45,7 @@ class MemoryConversations:
                 raise contract.CopilotConversationConflict()
             now = datetime.now(timezone.utc).isoformat()
             fields.setdefault('reasoning_effort', None)
+            fields.setdefault('delegation_enabled', False)
             row = dict(id=conversation_id, user_sub=owner_sub, **fields, revision=1,
                        state='open', title='New conversation', created_at=now, updated_at=now,
                        turn_active=False, last_turn_complete=False, event_count=0, event_bytes=0)
@@ -84,6 +85,19 @@ class MemoryConversations:
                 raise contract.CopilotConversationConflict()
             self._append(row, event)
             self._update(row)
+
+    def reserve_delegation(self, cid, owner, generation, tool_id, args):
+        event = contract.delegation_request(tool_id, args)
+        with self.lock:
+            row = self._row(cid, owner, generation)
+            if row['state'] != 'open' or not row['turn_active'] or row.get('delegation_enabled') is not True:
+                raise contract.CopilotConversationConflict()
+            if any(frame['type'] == 'delegation_request' and frame['tool_id'] == tool_id
+                   for frame in self.frames[cid]):
+                return False
+            self._append(row, event)
+            self._update(row)
+            return True
 
     def append_usage(self, cid, owner, generation, event):
         contract.validate_usage_frame(event)

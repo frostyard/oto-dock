@@ -125,6 +125,7 @@ def authorize_spawn(
     source_agent: str | None = None,
     surface: str = "task",
     x_agent_name: str | None = None,
+    reserved_run_id: str | None = None,
 ) -> SpawnAuthz:
     """Authorize one delegated-worker spawn; raises HTTPException on denial.
 
@@ -132,6 +133,9 @@ def authorize_spawn(
     then scope clamping to the target's mode, then identity + role for the
     FINAL scope, and the per-creator cap last — all before any row exists.
     """
+    from core.session.worker_ownership import is_owned_worker
+    if user.session_id and is_owned_worker(user.session_id):
+        raise HTTPException(403, "Nested delegation is unavailable for this worker.")
     # 0. External principals (phone callers who are not platform users) never
     #    delegate — a worker would run with the agent's full rights. The
     #    delegation MCP is not even attached to their sessions; this is the
@@ -243,7 +247,21 @@ def authorize_spawn(
     #    before any task/chat/run row exists.
     cap = _max_parallel_spawns()
     active = task_store.count_active_delegate_runs(created_by)
-    if active + 1 > cap:
+    additional = 1
+    # Trusted in-process dispatch revalidation may already own an admitted
+    # run. Never grant revalidation credit for an unrelated reservation.
+    if reserved_run_id is not None:
+        reserved = task_store.get_run(reserved_run_id)
+        if (not reserved or reserved.get("created_by") != created_by
+                or reserved.get("agent") != target_agent
+                or reserved.get("task_type") != "delegate"
+                or reserved.get("status") not in {"pending", "running", "completed", "failed", "cancelled", "limit_exceeded"}):
+            raise HTTPException(403, "Worker reservation is unavailable.")
+        # Revalidating a known worker never admits an additional run. This
+        # includes a terminal worker returning its result while another run
+        # legitimately occupies its released slot.
+        additional = 0
+    if active + additional > cap:
         raise HTTPException(
             status_code=403,
             detail=f"Delegation limit reached: {active} worker(s) already "

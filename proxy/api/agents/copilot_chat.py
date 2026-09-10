@@ -46,6 +46,7 @@ class CreateRequest(_Body):
     model: Identifier
     permission_mode: Literal["default", "acceptEdits", "plan", "dontAsk"] = "default"
     reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
+    delegation_enabled: StrictBool = False
 
 
 class ModelsRequest(_Body):
@@ -220,6 +221,8 @@ async def create(req: CreateRequest, request: Request, user: UserContext | None 
     _mutation(request)
     service = _service(request)
     options = {"reasoning_effort": req.reasoning_effort} if req.reasoning_effort is not None else {}
+    if req.delegation_enabled:
+        options["delegation_enabled"] = True
     return await _open_session(request, user, service, service.create(
         user, req.agent, req.account_id, req.model, permission_mode=req.permission_mode, **options,
     ))

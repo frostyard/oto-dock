@@ -1040,6 +1040,8 @@ async def create_codex_session(
     # Spawn the daemon outside the pool lock (slow — MCP init). On failure,
     # don't leave a dead entry behind for warmup to trip over.
     try:
+        from core.session.worker_ownership import capture_session
+        capture_session(session)
         await session.start()
     except Exception:
         async with _codex_sessions_lock:

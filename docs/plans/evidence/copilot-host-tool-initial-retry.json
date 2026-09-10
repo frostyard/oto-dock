@@ -1,0 +1,42 @@
+{
+  "result": "failed",
+  "sdk_version": "1.0.13",
+  "runtime_version": "1.0.83",
+  "sandboxed": true,
+  "model_turn_limit": 4,
+  "deadline_seconds": 180,
+  "authority": "controlled answers with real owner-context and lease checks",
+  "worker": "controlled async host callback; no scheduler child",
+  "credential_store": "in-memory scoped fixture; explicit existing GitHub token",
+  "phase": "deny",
+  "native_model_tool_success": true,
+  "counts": {
+    "credential_reads": 671,
+    "model_turns": 2,
+    "allow_native_hooks": 1,
+    "allow_host_authority": 1,
+    "allow_worker_calls": 1,
+    "deny_native_hooks": 5,
+    "deny_host_authority": 5
+  },
+  "callback_sequence": [
+    "allow:native_hook",
+    "allow:host_authority",
+    "allow:worker",
+    "deny:native_hook",
+    "deny:host_authority",
+    "deny:native_hook",
+    "deny:host_authority",
+    "deny:native_hook",
+    "deny:host_authority",
+    "deny:native_hook",
+    "deny:host_authority",
+    "deny:native_hook",
+    "deny:host_authority"
+  ],
+  "runtime_count": 1,
+  "normal_cleanup": true,
+  "credential_observers_closed": true,
+  "error_type": "CopilotLocalSessionError",
+  "elapsed_seconds": 68.96
+}

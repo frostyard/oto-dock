@@ -1,5 +1,6 @@
 import { apiFetch } from './auth'
 import { CopilotUsageError, parseCopilotUsage } from '../lib/copilotUsage'
+import { CopilotDelegationError, parseCopilotDelegate } from '../lib/copilotDelegation'
 
 const root = '/v1/copilot/chat'
 const failure = 'Copilot chat is unavailable. Close this chat and try again.'
@@ -12,6 +13,7 @@ const isReasoningEffort = (value: unknown): value is ReasoningEffort => typeof v
 export interface CopilotConversation {
   id: string; agent: string; account_id: string; model: string; permission_mode: ChatMode
   reasoning_effort: ReasoningEffort | null
+  delegation_enabled: boolean
   title: string; created_at: string | number; updated_at: string | number
   state: 'open' | 'closed' | 'incomplete'; revision: number; can_resume: boolean; reason: string
 }
@@ -33,8 +35,9 @@ function conversation(value: unknown): CopilotConversation {
       || typeof row.title !== 'string' || row.title.length > 512 || !timestamp(row.created_at) || !timestamp(row.updated_at)
       || !['open', 'closed', 'incomplete'].includes(row.state) || !Number.isSafeInteger(row.revision) || row.revision < 1
       || typeof row.can_resume !== 'boolean' || typeof row.reason !== 'string' || row.reason.length > 1024
+      || (row.delegation_enabled !== undefined && typeof row.delegation_enabled !== 'boolean')
       || (row.reasoning_effort !== undefined && row.reasoning_effort !== null && !isReasoningEffort(row.reasoning_effort))) throw new CopilotChatError(failure)
-  return { ...row, reasoning_effort: row.reasoning_effort ?? null }
+  return { ...row, reasoning_effort: row.reasoning_effort ?? null, delegation_enabled: row.delegation_enabled ?? false }
 }
 async function owner(response: Response): Promise<CopilotChatOwner> {
   let sessionId: string | undefined
@@ -86,7 +89,8 @@ export async function loadCopilotModels(body: { agent: string; account_id: strin
     })
   } catch { throw new CopilotChatError('Available models could not be loaded. Try loading them again.') }
 }
-export async function createCopilotChat(body: { agent: string; account_id: string; model: string; permission_mode: ChatMode; reasoning_effort?: ReasoningEffort | null }) {
+export async function createCopilotChat(body: { agent: string; account_id: string; model: string; permission_mode: ChatMode; reasoning_effort?: ReasoningEffort | null; delegation_enabled?: boolean }) {
+  if (body.delegation_enabled !== undefined && typeof body.delegation_enabled !== 'boolean') throw new CopilotChatError(failure)
   if (body.reasoning_effort !== undefined && body.reasoning_effort !== null && !isReasoningEffort(body.reasoning_effort)) throw new CopilotChatError('Select a supported reasoning effort.')
   const response = await request('/sessions', { method: 'POST', body: JSON.stringify(body) })
   return owner(response)
@@ -118,12 +122,13 @@ export async function getCopilotConversation(id: string, agent?: string): Promis
       previous = event.seq
       const { seq: _sequence, ...payload } = event
       if (event.type === 'usage') parseCopilotUsage(payload)
+      if (['delegate_spawn', 'delegate_result'].includes(event.type)) parseCopilotDelegate(payload)
       payloadBytes += new TextEncoder().encode(JSON.stringify(payload)).length
       if (payloadBytes > 1048576) throw new Error()
     }
     return { conversation: metadata, events: data.events }
   } catch (error) {
-    if (error instanceof CopilotUsageError) throw error
+    if (error instanceof CopilotUsageError || error instanceof CopilotDelegationError) throw error
     throw new CopilotChatError(failure)
   }
 }

@@ -20,6 +20,7 @@ import math
 from pathlib import Path, PurePosixPath
 import uuid
 
+from core.layers.copilot.host_tools import CopilotDelegationTool, delegation_profile, valid_delegation_targets
 from core.layers.copilot.catalog import read_model_inventory
 from core.layers.copilot.reasoning import valid_reasoning_effort
 from core.layers.copilot.credentials import CopilotAccountScope, AccountScopeKind
@@ -47,6 +48,7 @@ class CopilotLocalSessionConfig:
     enabled_tools: frozenset[str]
     system_prompt: str = ""
     reasoning_effort: str | None = None
+    delegation_targets: tuple[str, ...] = ()
 
     def __post_init__(self):
         if (not all(_text(value, 256) for value in (self.platform_session_id, self.account_id, self.model))
@@ -56,7 +58,8 @@ class CopilotLocalSessionConfig:
                 or not isinstance(self.enabled_tools, frozenset) or not self.enabled_tools
                 or not self.enabled_tools <= SUPPORTED_NATIVE_TOOLS
                 or not isinstance(self.system_prompt, str) or len(self.system_prompt) > 262144
-                or "\x00" in self.system_prompt or not valid_reasoning_effort(self.reasoning_effort)):
+                or "\x00" in self.system_prompt or not valid_reasoning_effort(self.reasoning_effort)
+                or not valid_delegation_targets(self.delegation_targets)):
             raise ValueError("Invalid explicit Copilot local session configuration")
 
 
@@ -85,11 +88,12 @@ class CopilotLocalSession:
     @classmethod
     async def open(cls, config: CopilotLocalSessionConfig, *, builder, runtime_path: Path,
                    records: CopilotSessionRecords, resume: bool = False, turn_timeout: float = 300,
-                   usage_observer=None, on_owner=None):
+                   usage_observer=None, on_owner=None, delegate_handler=None):
         instance = object.__new__(cls)
         instance._config = config
         instance._guard = None
         instance._usage = None
+        instance._delegate_handler = delegate_handler
         instance._usage_failed = False
         instance._usage_source_closed = False
         instance._record = None
@@ -121,6 +125,10 @@ class CopilotLocalSession:
                     if inspect.iscoroutine(result):
                         result.close()
                     raise ValueError("Copilot ownership observer must return synchronously")
+            if bool(config.delegation_targets) != (delegate_handler is not None):
+                raise ValueError("Copilot delegation handler must match configured targets")
+            if delegate_handler is not None and not inspect.iscoroutinefunction(delegate_handler):
+                raise ValueError("Copilot delegation handler must be asynchronous")
             if usage_observer is not None:
                 instance._usage = CopilotUsageObserver(usage_observer)
             async with asyncio.timeout(60):
@@ -278,6 +286,8 @@ class CopilotLocalSession:
         # provider default untouched; explicit levels are immutable provenance.
         if self._config.reasoning_effort is not None:
             digest_fields["reasoning_effort"] = self._config.reasoning_effort
+        if self._config.delegation_targets:
+            digest_fields["delegation"] = delegation_profile(self._config.delegation_targets)
         digest = hashlib.sha256(json.dumps(_canonical(digest_fields), sort_keys=True,
                                           separators=(",", ":"), allow_nan=False).encode()).hexdigest()
         self._check()
@@ -314,7 +324,11 @@ class CopilotLocalSession:
             self._config.platform_session_id, self._supervisor.requests, working_directory=cwd,
             owner_valid=self._authority_valid,
         )
-        policy = CopilotNativeToolPolicy(bridge, enabled_tools=self._config.enabled_tools)
+        delegation = (CopilotDelegationTool(
+            targets=self._config.delegation_targets, handler=self._delegate_handler, bridge=bridge,
+            callbacks=self._supervisor.callbacks, authorize=self._authorize,
+        ) if self._config.delegation_targets else None)
+        policy = CopilotNativeToolPolicy(bridge, enabled_tools=self._config.enabled_tools, delegation=delegation)
         client = await self._runtime.start()
         self._runtime_started = True
         self._check()

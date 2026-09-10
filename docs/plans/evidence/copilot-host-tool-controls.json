@@ -1,0 +1,36 @@
+{
+  "result": "passed",
+  "sdk_version": "1.0.13",
+  "runtime_version": "1.0.83",
+  "sandboxed": true,
+  "model_turn_limit": 2,
+  "qualification_phase": "controls",
+  "deadline_seconds": 180,
+  "authority": "controlled answers with real owner-context and lease checks",
+  "worker": "controlled async host callback; no scheduler child",
+  "credential_store": "in-memory scoped fixture; explicit existing GitHub token",
+  "phase": "cancel",
+  "held_approval_denied_without_dispatch": true,
+  "held_worker_cancelled_and_joined": true,
+  "counts": {
+    "credential_reads": 182,
+    "model_turns": 2,
+    "deny_native_hooks": 1,
+    "deny_host_authority": 1,
+    "cancel_native_hooks": 1,
+    "cancel_host_authority": 1,
+    "cancel_worker_calls": 1
+  },
+  "callback_sequence": [
+    "deny:native_hook",
+    "deny:host_authority",
+    "cancel:native_hook",
+    "cancel:host_authority",
+    "cancel:worker",
+    "cancel:worker_joined"
+  ],
+  "runtime_count": 2,
+  "normal_cleanup": true,
+  "credential_observers_closed": true,
+  "elapsed_seconds": 21.71
+}
