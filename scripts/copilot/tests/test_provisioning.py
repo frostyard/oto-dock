@@ -20,6 +20,13 @@ from core.layers.copilot import provisioning as module  # noqa: E402
 from core.layers.copilot.provisioning import CopilotProvisioningError  # noqa: E402
 
 
+def unchanged_metadata(before, after):
+    # Validation may advance atime; identity, permissions and change times stay.
+    fields = ("st_dev", "st_ino", "st_mode", "st_nlink", "st_uid", "st_gid",
+              "st_size", "st_mtime_ns", "st_ctime_ns")
+    return all(getattr(before, key) == getattr(after, key) for key in fields)
+
+
 @pytest.fixture
 def provision(tmp_path, monkeypatch):
     monkeypatch.setattr(module.platform, "system", lambda: "Linux")
@@ -92,12 +99,7 @@ def test_existing_unqualified_destination_is_never_filled_or_replaced(provision,
     before = provision.root.lstat()
     with pytest.raises(CopilotProvisioningError):
         module.initialize(provision.root, provision.archive)
-    after = provision.root.lstat()
-    # Validation reads directory entries, which may advance atime on the host
-    # filesystem. Identity, permissions and actual change timestamps must stay.
-    preserved = ("st_dev", "st_ino", "st_mode", "st_nlink", "st_uid", "st_gid",
-                 "st_size", "st_mtime_ns", "st_ctime_ns")
-    assert tuple(getattr(after, key) for key in preserved) == tuple(getattr(before, key) for key in preserved)
+    assert unchanged_metadata(before, provision.root.lstat())
     assert not list(provision.root.parent.glob(".copilot-install-*"))
 
 
@@ -136,7 +138,7 @@ def test_load_rejects_tampered_or_partial_installation_without_repair(provision,
     with pytest.raises(CopilotProvisioningError) as caught:
         module.load(provision.root)
     assert caught.value.__context__ is None
-    assert provision.root.lstat() == before
+    assert unchanged_metadata(before, provision.root.lstat())
 
 
 def test_directory_owner_mismatch_rejected(provision, monkeypatch):
