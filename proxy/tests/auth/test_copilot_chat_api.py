@@ -15,8 +15,8 @@ from auth.providers import UserContext, get_current_user
 
 
 BASE = "/v1/copilot/chat"
-SID = str(uuid.uuid4())
 # Parameterized route IDs must be identical across xdist workers.
+SID = "de92eeeb-798e-4d6f-9ab9-077a2d0a992e"
 CID = "7f24f676-c1da-4e16-8bfb-4295f6fa3cbc"
 SECRET = "private-provider-input-must-not-leak"
 

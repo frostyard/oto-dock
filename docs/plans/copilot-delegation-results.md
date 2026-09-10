@@ -60,3 +60,9 @@ The script selects the existing GitHub token in memory and creates disposable pl
 
 Full CI status is recorded in the pull request and tracking issue for its exact
 head commit. These tests do not change the live qualification limits above.
+
+
+The initial CI run stopped at parallel pytest collection because one new route
+parameter included a random session UUID. Both HTTP fixture IDs are now stable;
+all 176 API tests passed with four local xdist workers after the fix. Production
+code was unaffected by this collection failure.
