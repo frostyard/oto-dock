@@ -79,6 +79,10 @@ route in a new tab so navigation does not unmount and cancel the parent.
 
 ## Qualification boundary
 
+The follow-up [recovery contract](copilot-delegation-recovery-contract.md) adds
+pre-dispatch worker identities, independent saved outcomes, archived refresh,
+and restart quarantine. It also caps lifetime reservations at 32 per conversation.
+
 See [results](copilot-delegation-results.md) for exact checks and live evidence.
 This is a bounded coordinator-to-worker capability, not full CTO/repository/QA
 acceptance. Real mixed-provider credentials, a complete multi-repository task,

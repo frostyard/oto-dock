@@ -285,7 +285,7 @@ class CopilotChatTurn:
 class CopilotChatService:
     def __init__(self, layer, *, max_sessions=4, max_per_user=2, idle_timeout=300,
                  turn_timeout=300, watch_interval=5, authorization_timeout=5, store=None, database_timeout=40,
-                 model_timeout=45):
+                 model_timeout=45, delegation_store=None):
         if (type(max_sessions) is not int or not 1 <= max_sessions <= 8
                 or type(max_per_user) is not int or not 1 <= max_per_user <= max_sessions
                 or any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0
@@ -293,8 +293,9 @@ class CopilotChatService:
                 or turn_timeout > 300 or watch_interval > 10 or authorization_timeout > 10 or database_timeout > 60
                 or model_timeout > 60):
             raise ValueError("Invalid Copilot preview limits")
-        from storage import copilot_conversation_store
+        from storage import copilot_conversation_store, copilot_delegation_store
 
+        self.delegations = copilot_delegation_store if delegation_store is None else delegation_store
         self.store = copilot_conversation_store if store is None else store
         self.database_timeout = database_timeout
         self.model_timeout = model_timeout
@@ -346,7 +347,7 @@ class CopilotChatService:
             await self._close_entry(entry)
             raise CopilotChatError(403, "Copilot session access is unavailable")
 
-    async def _db(self, operation, *args, entry=None, success=None, **kwargs):
+    async def _db(self, operation, *args, entry=None, success=None, repository=None, **kwargs):
         """Bound waiting without cancelling a mutation that may still commit.
 
         Timed-out writes remain attached to the exact generation. Cleanup must
@@ -355,10 +356,10 @@ class CopilotChatService:
         from storage import copilot_conversation_store as contract
         from storage.pg import run_db
 
-        mutation = operation not in {"get", "list_conversations", "events"}
+        mutation = operation not in {"get", "list_conversations", "events", "list_outcomes"}
         if mutation and entry is None:
             raise ValueError("Copilot mutation ownership is required")
-        task = asyncio.create_task(run_db(getattr(self.store, operation), *args, **kwargs))
+        task = asyncio.create_task(run_db(getattr(self.store if repository is None else repository, operation), *args, **kwargs))
         if mutation:
             entry.mutations.add(task)
 
@@ -541,6 +542,7 @@ class CopilotChatService:
         # Reserve before any await so simultaneous host callbacks share one cap.
         entry.delegation_pending.add(tool_call_id)
         worker = None
+        receipt = None
 
         def parent_valid():
             return (self._entries.get(entry.sid) is entry and self._closing is None
@@ -579,19 +581,30 @@ class CopilotChatService:
                     await asyncio.gather(emission, return_exceptions=True)
                 await _join(asyncio.create_task(settle()))
 
+        async def record_outcome(result):
+            from services.delegation import recovery
+            if receipt is None:
+                return  # Reservation was refused or its commit outcome is unknown.
+            await self._db("finish", receipt, result, entry=entry, repository=self.delegations)
+            recovery.release(receipt)
+
         try:
-            await authorize_parent()
-            reserved = await self._db("reserve_delegation", entry.cid, entry.user.sub,
-                                      entry.handle, tool_call_id, args, entry=entry)
-            if not reserved:
-                raise CopilotChatError(409, "Copilot delegation was already requested")
             await authorize_parent()
             worker = OwnedCopilotWorker(
                 user=deepcopy(entry.user), source_agent=entry.agent, target_agent=args["agent"],
                 name=args["name"], prompt=args["prompt"], tool_call_id=tool_call_id,
                 parent_valid=parent_valid, authorize_parent=authorize_parent, publish=publish,
+                outcome_observer=record_outcome,
             )
             entry.workers[tool_call_id] = worker
+            receipt = await self._db("reserve", entry.cid, entry.user.sub, entry.handle,
+                                     tool_call_id, args, worker.allocation(), entry=entry,
+                                     repository=self.delegations)
+            if receipt is None:
+                raise CopilotChatError(409, "Copilot delegation was already requested")
+            from services.delegation import recovery
+            recovery.quarantine(receipt)
+            await authorize_parent()
             result = await worker.run()
             await worker.close()
             await authorize_parent()
@@ -737,8 +750,10 @@ class CopilotChatService:
             raise CopilotChatError(404, "Copilot conversation was not found")
         metadata = await self._metadata(user, row)
         events = await self._db("events", cid, user.sub)
+        workers = (await self._db("list_outcomes", cid, user.sub, repository=self.delegations)
+                   if row.get("delegation_enabled") is True else [])
         await self._history_authorize(user, row["agent"])
-        return {"conversation": metadata, "events": events}
+        return {"conversation": metadata, "events": events, "workers": workers}
 
     async def resume(self, user, cid, expected_revision, agent=None):
         _human(user)

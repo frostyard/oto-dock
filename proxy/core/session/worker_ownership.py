@@ -23,11 +23,14 @@ def release_worker(session_id, owner):
 
 def is_owned_worker(session_id):
     """Retained cleanup claims also deny further delegation."""
-    return session_id in _owners
+    from services.delegation.recovery import session_quarantined
+    return session_id in _owners or session_quarantined(session_id)
 
 
 def is_owned_worker_chat(chat_id):
-    return bool(chat_id) and any(getattr(owner, "chat_id", None) == chat_id for owner in tuple(_owners.values()))
+    from services.delegation.recovery import chat_quarantined
+    return chat_quarantined(chat_id) or (bool(chat_id) and any(
+        getattr(owner, "chat_id", None) == chat_id for owner in tuple(_owners.values())))
 
 
 def capture_session(session):

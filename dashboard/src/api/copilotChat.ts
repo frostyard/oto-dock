@@ -1,6 +1,6 @@
 import { apiFetch } from './auth'
 import { CopilotUsageError, parseCopilotUsage } from '../lib/copilotUsage'
-import { CopilotDelegationError, parseCopilotDelegate } from '../lib/copilotDelegation'
+import { CopilotDelegationError, parseCopilotDelegate, parseCopilotWorkerSnapshots, type CopilotWorkerSnapshot } from '../lib/copilotDelegation'
 
 const root = '/v1/copilot/chat'
 const failure = 'Copilot chat is unavailable. Close this chat and try again.'
@@ -106,7 +106,13 @@ export async function listCopilotConversations(offset = 0, agent?: string): Prom
     return { conversations: rows, has_more: data.has_more }
   } catch { throw new CopilotChatError(failure) }
 }
-export async function getCopilotConversation(id: string, agent?: string): Promise<{ conversation: CopilotConversation; events: ChatEvent[] }> {
+export interface CopilotConversationDetail {
+  conversation: CopilotConversation; events: ChatEvent[]
+  workers?: CopilotWorkerSnapshot[]
+  /** Client validation failure: keep the native transcript independently readable. */
+  workersUnavailable?: boolean
+}
+export async function getCopilotConversation(id: string, agent?: string): Promise<CopilotConversationDetail> {
   const response = await request(`/conversations/${encodeURIComponent(id)}${agent ? `?agent=${encodeURIComponent(agent)}` : ''}`)
   try {
     const data = await response.json(), metadata = conversation(data.conversation)
@@ -116,17 +122,22 @@ export async function getCopilotConversation(id: string, agent?: string): Promis
         || new TextEncoder().encode(JSON.stringify(data.events)).length > 1048576 + 65536) throw new Error()
     let previous = 0
     let payloadBytes = 0
+    let workersUnavailable = false
     for (const event of data.events) {
       if (!event || Array.isArray(event) || typeof event.type !== 'string'
           || !Number.isSafeInteger(event.seq) || event.seq <= previous) throw new Error()
       previous = event.seq
       const { seq: _sequence, ...payload } = event
       if (event.type === 'usage') parseCopilotUsage(payload)
-      if (['delegate_spawn', 'delegate_result'].includes(event.type)) parseCopilotDelegate(payload)
+      if (['delegate_spawn', 'delegate_result'].includes(event.type)) {
+        try { parseCopilotDelegate(payload) } catch { workersUnavailable = true }
+      }
       payloadBytes += new TextEncoder().encode(JSON.stringify(payload)).length
       if (payloadBytes > 1048576) throw new Error()
     }
-    return { conversation: metadata, events: data.events }
+    let workers: CopilotWorkerSnapshot[] = []
+    try { workers = parseCopilotWorkerSnapshots(data.workers) } catch { workersUnavailable = true }
+    return { conversation: metadata, events: data.events, workers, ...(workersUnavailable ? { workersUnavailable: true } : {}) }
   } catch (error) {
     if (error instanceof CopilotUsageError || error instanceof CopilotDelegationError) throw error
     throw new CopilotChatError(failure)

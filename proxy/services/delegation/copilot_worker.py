@@ -36,7 +36,7 @@ def _observe(task):
 class OwnedCopilotWorker:
     def __init__(self, user: UserContext, source_agent: str, target_agent: str,
                  name: str, prompt: str, parent_valid, authorize_parent, publish, tool_call_id: str,
-                 *, timeout_seconds: float = 120):
+                 *, timeout_seconds: float = 120, outcome_observer=None):
         if (type(user) is not UserContext or user.is_api_key or user.session_id
                 or user.agent or user.is_external or not user.sub
                 or user.sub == "api-key" or user.sub.startswith("session:")
@@ -46,6 +46,7 @@ class OwnedCopilotWorker:
                 or type(tool_call_id) is not str or not tool_call_id or len(tool_call_id) > 256
                 or tool_call_id != tool_call_id.strip() or not tool_call_id.isprintable()
                 or not callable(parent_valid) or not callable(authorize_parent) or not callable(publish)
+                or (outcome_observer is not None and not callable(outcome_observer))
                 or type(timeout_seconds) not in (int, float)
                 or not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= 120):
             raise CopilotWorkerError("Copilot worker configuration is unavailable")
@@ -55,8 +56,15 @@ class OwnedCopilotWorker:
         self.tool_call_id = tool_call_id
         self._parent_valid, self._authorize_parent, self._publish = parent_valid, authorize_parent, publish
         self._timeout = timeout_seconds
+        self._outcome_observer = outcome_observer
+        self._outcome = None
         self.task_id = f"dyn-{uuid.uuid4().hex}"
-        self.run_id = self.session_id = self.chat_id = ""
+        self.run_id = f"run-{uuid.uuid4().hex[:12]}"
+        self.session_id = str(uuid.uuid4())
+        self.chat_id = f"task-{self.run_id}"
+        self._allocation = (self.task_id, self.run_id, self.session_id, self.chat_id)
+        self._claimed = False
+        self._execution_created = False
         self._driver = self._startup = self._runner = self._builder = None
         self._watcher = None
         self._producer = self._pump = self._layer = self._config = None
@@ -73,6 +81,10 @@ class OwnedCopilotWorker:
     def closed(self) -> bool:
         return (self._closing is not None and self._closing.done()
                 and not self._closing.cancelled() and self._closing.exception() is None)
+
+    def allocation(self) -> dict:
+        """Immutable allocation identity, copied for durable pre-dispatch binding."""
+        return dict(zip(("task_id", "run_id", "session_id", "chat_id"), self._allocation, strict=True))
 
     def _check(self):
         try:
@@ -98,7 +110,7 @@ class OwnedCopilotWorker:
             raise ValueError()
         authz = authorize_spawn(user, target_agent=self.target_agent,
                                 requested_scope="user", surface="task",
-                                reserved_run_id=self.run_id or None)
+                                reserved_run_id=self.run_id if self._execution_created else None)
         agent = agent_store.get_agent(self.target_agent)
         engine = agent.get("execution_path") or "claude-code-cli"
         if engine not in {"claude-code-cli", "codex-cli"}:
@@ -137,7 +149,7 @@ class OwnedCopilotWorker:
         self._driver.add_done_callback(_observe)
         try:
             async with asyncio.timeout(self._timeout):
-                result = await asyncio.shield(self._driver)
+                await asyncio.shield(self._driver)
         except asyncio.CancelledError:
             await self.close()
             if asyncio.current_task().cancelling():
@@ -147,7 +159,7 @@ class OwnedCopilotWorker:
             await self.close()
             raise CopilotWorkerError("Copilot worker did not complete") from None
         await self.close()
-        return result
+        return dict(self._outcome)
 
     async def _run(self):
         self._startup = asyncio.create_task(self._launch())
@@ -164,7 +176,19 @@ class OwnedCopilotWorker:
         await self._authorize()
         row = await asyncio.to_thread(database.get_run, self.run_id)
         self._check()
-        if (not row or row.get("task_id") != self.task_id or row.get("agent") != self.target_agent
+        return self._result(row)
+
+    def _result(self, row):
+        if row is None:
+            if self._execution_created:
+                raise CopilotWorkerError("Copilot worker result is unavailable")
+            return {"task_id": self.task_id, "run_id": self.run_id, "chat_id": self.chat_id,
+                    "agent": self.target_agent, "status": "failed", "name": self.name,
+                    "tool_id": self.tool_call_id, "output": "Worker was not started.",
+                    "execution_created": False}
+        if (row.get("id") != self.run_id or row.get("task_id") != self.task_id
+                or row.get("agent") != self.target_agent or row.get("created_by") != self._user_sub
+                or row.get("task_type") != "delegate"
                 or row.get("session_id", self.session_id) not in (None, self.session_id)
                 or row.get("chat_id") not in (None, "", self.chat_id)):
             raise CopilotWorkerError("Copilot worker result is unavailable")
@@ -176,7 +200,8 @@ class OwnedCopilotWorker:
             output = ""
         return {"task_id": self.task_id, "run_id": self.run_id, "chat_id": self.chat_id,
                 "agent": self.target_agent, "status": status, "name": self.name, "tool_id": self.tool_call_id,
-                "output": output.replace("\0", "").encode("utf-8")[-16384:].decode("utf-8", errors="ignore")}
+                "output": output.replace("\0", "").encode("utf-8")[-16384:].decode("utf-8", errors="ignore"),
+                "execution_created": True}
 
     async def _launch(self):
         async with _ADMISSION_LOCK:
@@ -205,11 +230,17 @@ class OwnedCopilotWorker:
     # Scheduler hooks, captured synchronously before each resource can escape.
     def capture_ids(self, run_id, session_id, chat_id):
         self._check()
-        if self.run_id:
+        if (self._claimed or (self.task_id, run_id, session_id, chat_id) != self._allocation
+                or (self.task_id, self.run_id, self.session_id, self.chat_id) != self._allocation):
             raise CopilotWorkerError("Copilot worker allocation is unavailable")
         from core.session.worker_ownership import claim_worker
         claim_worker(session_id, self)
-        self.run_id, self.session_id, self.chat_id = run_id, session_id, chat_id
+        self._claimed = True
+
+    def run_created(self):
+        if not self._claimed or self._execution_created:
+            raise CopilotWorkerError("Copilot worker allocation is unavailable")
+        self._execution_created = True
 
     async def rows_created(self):
         self._check()
@@ -366,13 +397,26 @@ class OwnedCopilotWorker:
         if not self._subscription_bound and self._config is not None and self._config.subscription_id:
             from storage import subscription_store
             await asyncio.to_thread(subscription_store.decrement_active_sessions, self._config.subscription_id)
-        if self.run_id:
+        row = None
+        if self._claimed:
             row = await asyncio.to_thread(database.get_run, self.run_id)
-            if row and row.get("task_id") == self.task_id and row.get("status") in {"pending", "running"}:
+            # Validate binding before mutating any pending row. A missing row
+            # is 'not started' only when creation was never observed.
+            if row and row.get("status") in {"pending", "running"}:
+                self._result({**row, "status": "failed"})
                 await asyncio.to_thread(database.update_run, self.run_id, status="failed",
                                         error_message="Owned worker stopped before completion",
                                         completed_at=scheduler.now_iso())
-        if self.session_id:
+                row = await asyncio.to_thread(database.get_run, self.run_id)
+        result = self._result(row)
+        if self._outcome_observer is not None:
+            # This persistence authority is the immutable admission receipt,
+            # independent of a disconnected/revoked parent or its SSE queue.
+            # A failed write keeps the ownership claim, even after native
+            # resources have joined; no fresh execution may replace it.
+            await self._outcome_observer(dict(result))
+        self._outcome = result
+        if self._claimed:
             from core.session import session_state
             session_state._sessions.pop(self.session_id, None)
             session_state._save_sessions()

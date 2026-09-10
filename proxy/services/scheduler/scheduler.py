@@ -8,6 +8,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import time
 import uuid
 import zoneinfo
@@ -2110,6 +2111,8 @@ async def _execute_task(task: TaskDefinition, trigger_type: str = "scheduled",
     # Continuations are wake deliveries, not LLM task runs — no run row, no
     # slot, no usage pre-check (the driven turn bills like any chat turn).
     if task.task_type == "continuation":
+        if owned_worker is not None:
+            raise RuntimeError("Owned worker allocation is unavailable")
         return await _fire_continuation(task)
 
     # Scheduled fires only: manual Run-Now has a human waiting and event
@@ -2117,13 +2120,28 @@ async def _execute_task(task: TaskDefinition, trigger_type: str = "scheduled",
     if trigger_type == "scheduled":
         await _spawn_spacing_gate(task.id)
 
-    run_id = f"run-{uuid.uuid4().hex[:12]}"
+    if owned_worker is not None:
+        allocation = owned_worker.allocation()
+        if (type(allocation) is not dict or set(allocation) != {"task_id", "run_id", "session_id", "chat_id"}
+                or any(type(value) is not str for value in allocation.values())
+                or allocation["task_id"] != task.id or task.task_type != "delegate"
+                or task.continue_session or task.target_chat_id or attempt != 1
+                or task.retry.max_attempts != 1 or trigger_type != "manual"
+                or not re.fullmatch(r"run-[0-9a-f]{12}", allocation["run_id"])
+                or not _is_valid_session_uuid(allocation["session_id"])
+                or allocation["chat_id"] != f"task-{allocation['run_id']}"):
+            raise RuntimeError("Owned worker allocation is unavailable")
+        run_id = allocation["run_id"]
+    else:
+        run_id = f"run-{uuid.uuid4().hex[:12]}"
     # Session ID must be a valid UUID — Claude Code validates this for both
     # ``--session-id`` (new session) and ``--resume`` (existing session).
     # If continue_session was stored as something other than a UUID (e.g. a
     # stale row that wrote "false" as a string), fall back to a fresh UUID
     # so the task still fires.
-    if _is_valid_session_uuid(task.continue_session):
+    if owned_worker is not None:
+        session_id = allocation["session_id"]
+    elif _is_valid_session_uuid(task.continue_session):
         session_id = task.continue_session
     else:
         if task.continue_session:
@@ -2169,6 +2187,8 @@ async def _execute_task(task: TaskDefinition, trigger_type: str = "scheduled",
                     trigger_type, trigger_source, final_prompt, task_type,
                     task.scope, task.created_by,
                 )
+                if owned_worker is not None:
+                    owned_worker.run_created()
                 await asyncio.to_thread(
                     task_store.update_run, run_id,
                     status="limit_exceeded",
@@ -2188,6 +2208,8 @@ async def _execute_task(task: TaskDefinition, trigger_type: str = "scheduled",
                     trigger_type, trigger_source, final_prompt, task_type,
                     task.scope, task.created_by,
                 )
+                if owned_worker is not None:
+                    owned_worker.run_created()
                 await asyncio.to_thread(
                     task_store.update_run, run_id,
                     status="limit_exceeded",
@@ -2196,6 +2218,10 @@ async def _execute_task(task: TaskDefinition, trigger_type: str = "scheduled",
                 )
                 return run_id
     except Exception as e:
+        if owned_worker is not None:
+            # Creation may already have committed. Never retry an owned run
+            # after an uncertain database result or overwrite its reserved row.
+            raise RuntimeError("Owned worker admission is unavailable") from None
         logger.error(f"Usage limit check failed for task {task.id}: {e}")
 
     task_type = _determine_task_type(task, trigger_type)
@@ -2210,6 +2236,8 @@ async def _execute_task(task: TaskDefinition, trigger_type: str = "scheduled",
     # delegate_task mints a distinct task_id — so this targets scheduled+manual
     # collisions / standalone-retry double-fires.)
     if attempt == 1 and task.id in _active_task_ids:
+        if owned_worker is not None:
+            raise RuntimeError("Owned worker allocation is unavailable")
         logger.warning(
             f"Skipping duplicate concurrent run for task {task.id}: "
             f"run {_active_task_ids[task.id]} still active"
@@ -2223,6 +2251,8 @@ async def _execute_task(task: TaskDefinition, trigger_type: str = "scheduled",
             run_id, task.id, task.agent, trigger_type, trigger_source, final_prompt,
             task_type, task.scope, task.created_by,
         )
+        if owned_worker is not None:
+            owned_worker.run_created()
 
         # Create the run's chat row BEFORE the admission slot: a parked run
         # ("pending", waiting on host memory) must be visible — the dashboard
