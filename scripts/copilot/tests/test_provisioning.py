@@ -92,7 +92,12 @@ def test_existing_unqualified_destination_is_never_filled_or_replaced(provision,
     before = provision.root.lstat()
     with pytest.raises(CopilotProvisioningError):
         module.initialize(provision.root, provision.archive)
-    assert provision.root.lstat() == before
+    after = provision.root.lstat()
+    # Validation reads directory entries, which may advance atime on the host
+    # filesystem. Identity, permissions and actual change timestamps must stay.
+    preserved = ("st_dev", "st_ino", "st_mode", "st_nlink", "st_uid", "st_gid",
+                 "st_size", "st_mtime_ns", "st_ctime_ns")
+    assert tuple(getattr(after, key) for key in preserved) == tuple(getattr(before, key) for key in preserved)
     assert not list(provision.root.parent.glob(".copilot-install-*"))
 
 
