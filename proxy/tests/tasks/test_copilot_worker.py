@@ -483,7 +483,7 @@ async def test_result_identity_mismatch_is_rejected(harness, monkeypatch):
     worker = h.owner()
     with pytest.raises(workers.CopilotWorkerError):
         await worker.run()
-    assert worker.closed and not h.alive
+    assert not worker.closed and not h.alive
 
 
 def test_completed_worker_does_not_reserve_another_slot_to_return_result(harness):
@@ -541,3 +541,302 @@ async def test_actual_scheduler_queued_cancel_returns_terminal_result(harness, m
     result = await task
     assert result["status"] == "cancelled" and result["chat_id"] == worker.chat_id
     assert worker.closed and not h.alive and not h.configs
+
+
+def test_allocation_is_complete_stable_and_constructor_has_no_side_effects(harness):
+    from uuid import UUID
+    from core.session.worker_ownership import is_owned_worker
+    h = harness
+    worker = h.owner()
+    allocation = worker.allocation()
+    assert set(allocation) == {"task_id", "run_id", "session_id", "chat_id"}
+    assert allocation["task_id"] == worker.task_id
+    assert allocation["chat_id"] == f"task-{allocation['run_id']}"
+    assert str(UUID(allocation["session_id"])) == allocation["session_id"]
+    allocation["run_id"] = "changed"
+    assert worker.allocation()["run_id"] == worker.run_id != "changed"
+    assert not is_owned_worker(worker.session_id)
+    assert not h.runs and not h.chats and not session_state._sessions
+
+
+@pytest.mark.asyncio
+async def test_unstarted_close_does_not_read_database_or_mutate_session_index(harness, monkeypatch):
+    from core.session.worker_ownership import is_owned_worker
+    h = harness
+    outcomes = []
+    async def observe(result):
+        outcomes.append(result)
+    worker = h.owner(outcome_observer=observe)
+    def forbidden(*a, **kw):
+        pytest.fail("Unstarted worker must not inspect or mutate database/session state")
+    monkeypatch.setattr(database, "get_run", forbidden)
+    monkeypatch.setattr(session_state, "_save_sessions", forbidden)
+    h.parent = False
+    await worker.close()
+    await worker.close()
+    assert worker.closed and len(outcomes) == 1
+    assert outcomes[0]["execution_created"] is False
+    assert outcomes[0]["status"] == "failed" and outcomes[0]["output"] == "Worker was not started."
+    assert not is_owned_worker(worker.session_id)
+    assert not h.runs and not h.chats and not h.order
+
+
+@pytest.mark.asyncio
+async def test_outcome_persisted_after_join_and_before_claim_release(harness):
+    from core.session.worker_ownership import is_owned_worker
+    h = harness
+    entered, persist = asyncio.Event(), asyncio.Event()
+    outcomes = []
+    async def observe(result):
+        assert not h.alive and h.native.proc.returncode == 0
+        assert worker._runner.done() and worker._builder.done() and worker._producer.done()
+        assert worker._pump._task.done()
+        assert is_owned_worker(worker.session_id)
+        outcomes.append(dict(result))
+        entered.set()
+        await persist.wait()
+        result["output"] = "observer mutation must not change public result"
+    worker = h.owner(outcome_observer=observe)
+    allocation = worker.allocation()
+    task = asyncio.create_task(worker.run())
+    await asyncio.wait_for(entered.wait(), 2)
+    assert not worker.closed and not task.done()
+    assert h.frames[0]["run_id"] == allocation["run_id"]
+    assert h.frames[0]["chat_id"] == allocation["chat_id"]
+    assert h.runs[allocation["run_id"]]["task_id"] == allocation["task_id"]
+    h.parent = False  # Receipt persistence must not depend on live parent authority.
+    persist.set()
+    result = await task
+    assert result == outcomes[0] and result["execution_created"] is True
+    assert result["output"] == "worker report"
+    assert worker.closed and not is_owned_worker(worker.session_id)
+    await worker.close()
+    assert len(outcomes) == 1
+
+
+@pytest.mark.asyncio
+async def test_outcome_failure_keeps_claim_after_actual_process_join(harness):
+    from core.session.worker_ownership import is_owned_worker
+    h = harness
+    calls = []
+    async def fail(result):
+        calls.append(result)
+        raise RuntimeError("PRIVATE ledger error")
+    worker = h.owner(outcome_observer=fail)
+    with pytest.raises(workers.CopilotWorkerError, match="^Copilot worker cleanup is incomplete$"):
+        await worker.run()
+    assert not worker.closed and not h.alive and h.native.proc.returncode == 0
+    assert is_owned_worker(worker.session_id)
+    with pytest.raises(workers.CopilotWorkerError, match="cleanup is incomplete"):
+        await worker.close()
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_parent_cancel_still_persists_cleaned_child_outcome(harness):
+    from core.session.worker_ownership import is_owned_worker
+    h = harness
+    h.finish.clear()
+    outcomes = []
+    async def observe(result):
+        assert not h.alive and worker._runner.done()
+        outcomes.append(result)
+    worker = h.owner(outcome_observer=observe)
+    task = asyncio.create_task(worker.run())
+    await h.start.wait()
+    h.parent = False
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert worker.closed and not is_owned_worker(worker.session_id)
+    assert len(outcomes) == 1 and outcomes[0]["execution_created"] is True
+    assert outcomes[0]["status"] == h.runs[worker.run_id]["status"]
+    assert outcomes[0]["status"] in {"failed", "cancelled"}
+
+
+@pytest.mark.asyncio
+async def test_close_waiter_cancel_during_outcome_write_does_not_cancel_write(harness):
+    h = harness
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = []
+    async def observe(result):
+        calls.append(result)
+        entered.set()
+        await release.wait()
+    worker = h.owner(outcome_observer=observe)
+    task = asyncio.create_task(worker.run())
+    await asyncio.wait_for(entered.wait(), 2)
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not worker.closed and not worker._closing.cancelled()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert worker.closed and len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_native_cleanup_failure_does_not_publish_outcome(harness):
+    h = harness
+    h.close_failure = True
+    outcomes = []
+    async def observe(result):
+        outcomes.append(result)
+    worker = h.owner(outcome_observer=observe)
+    with pytest.raises(workers.CopilotWorkerError, match="cleanup is incomplete"):
+        await worker.run()
+    assert not worker.closed and not outcomes
+
+
+@pytest.mark.asyncio
+async def test_creation_failure_without_row_records_not_started(harness, monkeypatch):
+    h = harness
+    outcomes = []
+    async def observe(result):
+        outcomes.append(result)
+    def fail(*a):
+        raise RuntimeError("PRIVATE database error")
+    monkeypatch.setattr(database, "create_run", fail)
+    worker = h.owner(outcome_observer=observe)
+    with pytest.raises(workers.CopilotWorkerError):
+        await worker.run()
+    assert worker.closed and not h.runs and not h.order
+    assert len(outcomes) == 1 and outcomes[0]["execution_created"] is False
+
+
+@pytest.mark.asyncio
+async def test_commit_then_error_is_created_and_terminalized_without_redispatch(harness, monkeypatch):
+    from services.billing import usage_service
+    h = harness
+    outcomes, creations = [], []
+    original = database.create_run
+    async def observe(result):
+        outcomes.append(result)
+    def committed_then_failed(*a):
+        creations.append(a[0])
+        original(*a)
+        raise RuntimeError("PRIVATE ambiguous commit")
+    # This catches the generic scheduler's usage-check exception fallback:
+    # owned work must never try a second create after an uncertain first write.
+    monkeypatch.setattr(usage_service, "check_user_limit", lambda *a: {"allowed": False})
+    monkeypatch.setattr(database, "create_run", committed_then_failed)
+    worker = h.owner(outcome_observer=observe)
+    with pytest.raises(workers.CopilotWorkerError):
+        await worker.run()
+    assert worker.closed and creations == [worker.run_id] and not h.order
+    assert h.runs[worker.run_id]["status"] == "failed"
+    assert len(outcomes) == 1 and outcomes[0]["execution_created"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [None, {"id": "foreign"}, {"task_id": "foreign"},
+                                  {"agent": "foreign"}, {"created_by": "foreign"},
+                                  {"task_type": "scheduled"}, {"session_id": "foreign"},
+                                  {"chat_id": "foreign"}, {"status": "unknown"}])
+async def test_unverifiable_created_execution_cannot_publish_cleanup_outcome(harness, monkeypatch, change):
+    from core.session.worker_ownership import is_owned_worker
+    h = harness
+    outcomes = []
+    original = database.get_run
+    async def observe(result):
+        outcomes.append(result)
+    def get(rid):
+        row = original(rid)
+        if row and row.get("status") == "completed":
+            return None if change is None else {**row, **change}
+        return row
+    monkeypatch.setattr(database, "get_run", get)
+    worker = h.owner(outcome_observer=observe)
+    with pytest.raises(workers.CopilotWorkerError, match="cleanup is incomplete"):
+        await worker.run()
+    assert not worker.closed and not h.alive and not outcomes
+    assert is_owned_worker(worker.session_id)
+
+
+@pytest.mark.asyncio
+async def test_scheduler_rejects_changed_preallocated_binding_before_allocation(harness, monkeypatch):
+    h = harness
+    worker = h.owner()
+    original = worker.allocation()
+    monkeypatch.setattr(worker, "allocation", lambda: {**original, "task_id": "foreign"})
+    with pytest.raises(workers.CopilotWorkerError):
+        await worker.run()
+    assert worker.closed and not h.runs and not h.chats and not session_state._sessions
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_run_creation_waits_for_commit_before_outcome(harness, monkeypatch):
+    import threading
+    h = harness
+    entered, release = asyncio.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+    original = database.create_run
+    outcomes = []
+    def held_create(*args):
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(3)
+        original(*args)
+    async def observe(result):
+        assert worker._startup.done()
+        outcomes.append(result)
+    monkeypatch.setattr(database, "create_run", held_create)
+    worker = h.owner(outcome_observer=observe)
+    task = asyncio.create_task(worker.run())
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        task.cancel()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not worker.closed and not outcomes and not h.runs
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert worker.closed and not h.order
+    assert len(outcomes) == 1 and outcomes[0]["execution_created"] is True
+    assert outcomes[0]["status"] == h.runs[worker.run_id]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_outcome_is_not_published_until_unbound_subscription_is_released(harness, monkeypatch):
+    from core.config import task_config_builder
+    from services.engines import subscription_pool
+    from storage import subscription_store
+    h = harness
+    h.start_failure = True
+    original = task_config_builder.build_task_agent_config
+    seats, outcomes = [], []
+    async def build(*a, **kw):
+        cfg = await original(*a, **kw)
+        cfg.subscription_id = "acquired-seat"
+        return cfg
+    async def observe(result):
+        assert seats == ["acquired-seat"]
+        assert h.native.proc.returncode == 0
+        outcomes.append(result)
+    monkeypatch.setattr(task_config_builder, "build_task_agent_config", build)
+    monkeypatch.setattr(subscription_pool, "get_session_subscription", lambda sid: None)
+    monkeypatch.setattr(subscription_store, "decrement_active_sessions", seats.append)
+    worker = h.owner(outcome_observer=observe)
+    result = await worker.run()
+    assert result == outcomes[0] and result["status"] == "failed"
+    assert worker.closed and seats == ["acquired-seat"]
+
+
+@pytest.mark.asyncio
+async def test_foreign_pending_row_is_not_terminalized_or_reported(harness):
+    h = harness
+    outcomes = []
+    async def observe(result):
+        outcomes.append(result)
+    async def publish(frame):
+        h.runs[frame["run_id"]]["created_by"] = "foreign"
+        raise RuntimeError("Publication stopped")
+    h.publish = publish
+    worker = h.owner(outcome_observer=observe)
+    with pytest.raises(workers.CopilotWorkerError, match="cleanup is incomplete"):
+        await worker.run()
+    assert not worker.closed and not outcomes and not h.order
+    assert h.runs[worker.run_id]["status"] == "pending"

@@ -2027,6 +2027,43 @@ def init_copilot_conversations(conn) -> None:
     """)
 
 
+def init_copilot_delegations(conn) -> None:
+    """Immutable dispatch receipts; terminal output only after owned cleanup."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS copilot_delegations (
+            receipt_id TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            user_sub TEXT NOT NULL,
+            source_agent TEXT NOT NULL,
+            generation TEXT NOT NULL,
+            tool_id TEXT NOT NULL,
+            prompt_digest TEXT NOT NULL,
+            agent TEXT NOT NULL,
+            name TEXT NOT NULL,
+            task_id TEXT NOT NULL UNIQUE,
+            run_id TEXT NOT NULL UNIQUE,
+            session_id TEXT NOT NULL UNIQUE,
+            chat_id TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            result_payload TEXT CHECK (result_payload IS NULL OR octet_length(result_payload) <= 262144),
+            cleanup_joined BOOLEAN NOT NULL DEFAULT FALSE,
+            finished_at TEXT,
+            UNIQUE(conversation_id,tool_id),
+            CHECK (cleanup_joined = (result_payload IS NOT NULL)),
+            CHECK (cleanup_joined = (finished_at IS NOT NULL))
+        )
+    """)
+    # Recovery identity must survive parent/user/source-agent deletion. Losing
+    # an unresolved receipt would erase the restart quarantine before cleanup
+    # was proved. Public history still requires an owned surviving conversation.
+    # Drop constraints from the original ledger schema without discarding rows.
+    conn.execute("""ALTER TABLE copilot_delegations
+                    DROP CONSTRAINT IF EXISTS copilot_delegations_conversation_id_fkey,
+                    DROP CONSTRAINT IF EXISTS copilot_delegations_user_sub_fkey""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_copilot_delegations_unsettled
+                    ON copilot_delegations(created_at,receipt_id) WHERE cleanup_joined=FALSE""")
+
+
 def init_schema(conn) -> None:
     """Create every table and index if absent (idempotent; safe each boot)."""
     init_tasks(conn)
@@ -2044,6 +2081,7 @@ def init_schema(conn) -> None:
     init_meetings(conn)
     init_execution_layers(conn)
     init_copilot_conversations(conn)
+    init_copilot_delegations(conn)
     init_notifications(conn)
     init_mcp_autoupdate(conn)
     init_push(conn)

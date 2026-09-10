@@ -5,7 +5,8 @@ local chat preview with saved transcripts and explicit clean resume is available
 in agent chat navigation and AI Engines settings for personal accounts, with
 explicit account-bound model discovery, per-conversation reasoning effort and
 observed usage reporting. Conversations can also opt into bounded local delegation
-to existing Claude Code/Codex repository and QA agents.
+to existing Claude Code/Codex repository and QA agents, with durable worker
+outcomes and restart quarantine for unresolved cleanup.
 The engine remains unregistered in general chat/task routing; full parity is
 incomplete.
 
@@ -36,7 +37,9 @@ Progress: [C0 baseline](copilot-ci-baseline.md),
 [observed usage results](copilot-usage-results.md)
 ([usage contract](copilot-usage-contract.md)), and
 [owned delegation results](copilot-delegation-results.md)
-([delegation contract](copilot-delegation-contract.md)).
+([delegation contract](copilot-delegation-contract.md)), and
+[delegation recovery results](copilot-delegation-recovery-results.md)
+([recovery contract](copilot-delegation-recovery-contract.md)).
 
 Tracking issue: [Copilot: full Claude Code and Codex parity](https://github.com/frostyard/oto-dock/issues/1).
 

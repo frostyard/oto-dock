@@ -216,6 +216,11 @@ _KEEP_AFTER_DELETE = {
     # (like ``route_name``), not a live reference — the admin's call history
     # must survive an agent deletion. Rows age out via 30-day retention.
     "phone_call_log",
+    # Immutable worker receipts are cleanup evidence, not live agent bindings.
+    # Deleting them could erase unresolved session quarantine on restart. The
+    # original source/target identities must also survive slug reuse; public
+    # history independently requires its surviving owned source conversation.
+    "copilot_delegations",
 }
 
 

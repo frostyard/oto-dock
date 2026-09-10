@@ -176,6 +176,8 @@ async def lifespan(app: FastAPI):
     # them; every other orphaned run + all orphaned meetings are failed so
     # they don't appear stuck. Must run BEFORE the satellite heartbeat monitor
     # (below) so a run is parked before its satellite can report it.
+    from services.delegation.recovery import restore as restore_worker_quarantine
+    await restore_worker_quarantine()
     from services.scheduler import run_recovery
     parked_runs, orphaned_runs = run_recovery.defer_orphaned_runs()
     orphaned_meetings = task_store.mark_orphaned_meetings_failed()

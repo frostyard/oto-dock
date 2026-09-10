@@ -11,6 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts" / "copilot"))
 from conversation_fixture import MemoryConversations
+from delegation_fixture import MemoryDelegations
 
 import pytest
 import pytest_asyncio
@@ -82,6 +83,9 @@ class Layer:
 
 @pytest_asyncio.fixture
 async def fixture(monkeypatch):
+    from services.delegation import recovery
+    monkeypatch.setattr(recovery, "_by_session", {})
+    monkeypatch.setattr(recovery, "_by_chat", {})
     layer, services, slots, reads = Layer(), [], set(), []
     current = {"revision": 1, "denied": False, "admission": True}
 
@@ -111,6 +115,7 @@ async def fixture(monkeypatch):
     def service(**options):
         options.setdefault("watch_interval", 0.01)
         options.setdefault("store", MemoryConversations())
+        options.setdefault("delegation_store", MemoryDelegations(options["store"]))
         instance = CopilotChatService(layer, **options)
         services.append(instance)
         return instance
@@ -1400,25 +1405,47 @@ async def delegation(fixture, monkeypatch):
     class Worker:
         def __init__(self, **options):
             self.options = options
-            self.closed = False
-            self.identity = dict(task_id="task-1", run_id="run-1", chat_id="chat-1",
-                                 agent=options["target_agent"])
+            self.closed = self.ran = False
+            self._result = None
+            self._closing = None
+            run_id = "run-" + uuid.uuid4().hex[:12]
+            self._allocation = dict(task_id="dyn-" + uuid.uuid4().hex, run_id=run_id,
+                                    chat_id="task-" + run_id, session_id=str(uuid.uuid4()))
+            self.identity = {key: value for key, value in self._allocation.items() if key != "session_id"}
+            self.identity.update(agent=options["target_agent"], name=options["name"], tool_id=options["tool_call_id"])
             workers.append(self)
 
+        def allocation(self):
+            return dict(self._allocation)
+
         async def run(self):
+            # The scheduler must never see an allocation before its durable
+            # parent binding exists, even before delegate_spawn is published.
+            saved = service.delegations.list_unsettled()
+            assert any(all(row[key] == value for key, value in self._allocation.items()) for row in saved)
+            self.ran = True
             await self.options["authorize_parent"]()
             await self.options["publish"]({**self.identity, "type": "delegate_spawn",
                                            "name": self.options["name"], "tool_id": self.options["tool_call_id"]})
             if control.hold:
                 await control.hold.wait()
-            return {**self.identity, "status": "completed", "output": "Reviewed repository"}
+            self._result = {**self.identity, "status": "completed", "output": "Reviewed repository", "execution_created": True}
+            return self._result
 
         async def close(self):
+            if self._closing is None:
+                self._closing = asyncio.create_task(self._finish_close())
+            await asyncio.shield(self._closing)
+
+        async def _finish_close(self):
             if control.close_hold:
                 await control.close_hold.wait()
             if control.close_error:
                 raise RuntimeError("private child cleanup detail")
             self.closed = True
+            result = self._result or {**self.identity, "status": "cancelled" if self.ran else "failed",
+                                      "output": "Worker stopped", "execution_created": self.ran}
+            await self.options["outcome_observer"](result)
             if control.hold:
                 control.hold.set()
 
@@ -1460,7 +1487,7 @@ async def test_owned_delegation_persists_before_stream_and_resume_never_replays(
         yield CommonEvent("done", {})
     fixture.layer.program = replay
     assert [frame async for frame in await d.service.prepare_turn(fixture.user, resumed, "Continue")] == [{"type": "turn_complete"}]
-    assert len(d.workers) == 1
+    assert sum(worker.ran for worker in d.workers) == 1
 
 
 @pytest.mark.asyncio
@@ -1470,7 +1497,7 @@ async def test_delegation_denial_precedes_worker_construction(fixture, delegatio
     if failure == "roster":
         d.args["agent"] = "unauthorized"
     if failure == "reservation":
-        monkeypatch.setattr(d.service.store, "reserve_delegation", lambda *args: False)
+        monkeypatch.setattr(d.service.delegations, "reserve", lambda *args: None)
     async def program(sid):
         if failure == "revoked":
             fixture.current["revision"] += 1
@@ -1481,7 +1508,7 @@ async def test_delegation_denial_precedes_worker_construction(fixture, delegatio
     turn = await d.service.prepare_turn(fixture.user, d.sid, "Delegate")
     _ = [frame async for frame in turn]
     await turn.aclose()
-    assert d.workers == []
+    assert not any(worker.ran for worker in d.workers)
 
 
 @pytest.mark.asyncio
@@ -1497,9 +1524,17 @@ async def test_parent_close_waits_for_owned_worker_cleanup(fixture, delegation):
     closing = asyncio.create_task(d.service.close(fixture.user, d.sid))
     await asyncio.sleep(0.01)
     assert not closing.done() and d.sid in d.service._entries and d.sid in fixture.slots
+    cid = d.service._entries[d.sid].cid
+    pending = d.service.delegations.list_outcomes(cid, fixture.user.sub)
+    assert pending[0]["recovery_state"] == "unverified"
+    assert all(pending[0][key] is None for key in ("status", "output", "execution_created"))
     d.control.close_hold.set()
     await asyncio.wait_for(closing, 1)
     assert d.workers[0].closed and d.sid not in d.service._entries
+    saved = await d.service.get_conversation(fixture.user, cid)
+    assert saved["workers"][0]["recovery_state"] == "settled"
+    assert saved["workers"][0]["status"] == "cancelled"
+    assert not d.service.delegations.list_unsettled()
 
 
 @pytest.mark.asyncio
@@ -1507,12 +1542,12 @@ async def test_parent_delegation_cap_is_reserved_before_async_storage(fixture, d
     d = delegation
     d.control.hold = asyncio.Event()
     entered, release = threading.Event(), threading.Event()
-    reserve = d.service.store.reserve_delegation
+    reserve = d.service.delegations.reserve
     def held(*args):
         entered.set()
         assert release.wait(2)
         return reserve(*args)
-    monkeypatch.setattr(d.service.store, "reserve_delegation", held)
+    monkeypatch.setattr(d.service.delegations, "reserve", held)
     async def program(sid):
         calls = [asyncio.create_task(fixture.layer.delegate_handlers[sid](f"call-{i}", d.args)) for i in range(4)]
         try:
@@ -1520,7 +1555,7 @@ async def test_parent_delegation_cap_is_reserved_before_async_storage(fixture, d
                 await asyncio.sleep(0.001)
             with pytest.raises(CopilotChatError, match="unavailable"):
                 await fixture.layer.delegate_handlers[sid]("overflow", d.args)
-            assert not d.workers
+            assert not any(worker.ran for worker in d.workers)
         finally:
             release.set()
             d.control.hold.set()
@@ -1550,6 +1585,105 @@ async def test_result_storage_failure_joins_worker_without_publishing_result(fix
     assert not any(frame["type"] in {"delegate_result", "turn_complete"} for frame in frames)
     assert d.workers[0].closed
     assert not any(frame["type"] == "delegate_result" for frame in d.service.store.events(cid, fixture.user.sub))
+    # A cold service recovers the independent snapshot without replaying the
+    # missing result frame, reading mutable generic runs, or starting inference.
+    await d.service.close(fixture.user, d.sid)
+    cold = fixture.service(store=d.service.store, delegation_store=d.service.delegations)
+    before = d.service.store.get(cid, fixture.user.sub)
+    reads = len(fixture.reads)
+    saved = await cold.get_conversation(fixture.user, cid, "agent")
+    assert saved["workers"] == [{**d.workers[0]._result, "recovery_state": "settled"}]
+    assert d.service.store.get(cid, fixture.user.sub) == before
+    assert not cold._entries and len(d.workers) == 1 and len(fixture.reads) == reads
+    assert not any(frame["type"] == "delegate_result" for frame in saved["events"])
+
+
+@pytest.mark.asyncio
+async def test_result_receipt_finishes_after_parent_access_is_revoked(fixture, delegation):
+    d = delegation
+    d.control.hold, d.control.close_hold = asyncio.Event(), asyncio.Event()
+    async def program(sid):
+        await fixture.layer.delegate_handlers[sid]("call", d.args)
+        yield CommonEvent("done", {})
+    fixture.layer.program = program
+    turn = await d.service.prepare_turn(fixture.user, d.sid, "Review")
+    assert (await anext(turn))["type"] == "delegate_spawn"
+    cid = d.service._entries[d.sid].cid
+    fixture.current["denied"] = True
+    closing = asyncio.create_task(d.service.close(fixture.user, d.sid))
+    d.control.close_hold.set()
+    await asyncio.wait_for(closing, 1)
+    assert d.service.delegations.list_outcomes(cid, fixture.user.sub)[0]["recovery_state"] == "settled"
+    with pytest.raises(CopilotChatError) as denied:
+        await d.service.get_conversation(fixture.user, cid)
+    assert denied.value.status_code == 403
+    fixture.current["denied"] = False
+    assert (await d.service.get_conversation(fixture.user, cid))["workers"][0]["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_ledger_failure_retains_quarantine_and_hides_uncommitted_success(fixture, delegation, monkeypatch):
+    from services.delegation import recovery
+    d = delegation
+    def fail_finish(*args):
+        raise RuntimeError("private ledger detail")
+    monkeypatch.setattr(d.service.delegations, "finish", fail_finish)
+    async def program(sid):
+        await fixture.layer.delegate_handlers[sid]("call", d.args)
+        yield CommonEvent("done", {})
+    fixture.layer.program = program
+    frames = [frame async for frame in await d.service.prepare_turn(fixture.user, d.sid, "Review")]
+    assert not any(frame["type"] in {"delegate_result", "turn_complete"} for frame in frames)
+    worker = d.workers[0]
+    entry = d.service._entries[d.sid]
+    assert entry.workers["call"] is worker and recovery.session_quarantined(worker.allocation()["session_id"])
+    assert "private" not in str(frames)
+    saved = await d.service.get_conversation(fixture.user, entry.cid)
+    assert saved["workers"][0]["recovery_state"] == "unverified"
+    assert all(saved["workers"][0][key] is None for key in ("status", "output", "execution_created"))
+
+
+@pytest.mark.asyncio
+async def test_worker_history_owner_and_source_authorization_precede_ledger_read(fixture, delegation, monkeypatch):
+    d = delegation
+    cid = d.service._entries[d.sid].cid
+    def forbidden(*args):
+        pytest.fail("Unauthorized history must not read worker snapshots")
+    monkeypatch.setattr(d.service.delegations, "list_outcomes", forbidden)
+    for user, source in [(fixture.other, None), (fixture.user, "another-agent")]:
+        with pytest.raises(CopilotChatError) as denied:
+            await d.service.get_conversation(user, cid, source)
+        assert denied.value.status_code == 404
+    fixture.current["denied"] = True
+    with pytest.raises(CopilotChatError) as denied:
+        await d.service.get_conversation(fixture.user, cid)
+    assert denied.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_uncertain_reservation_never_dispatches_and_restores_unverified_receipt(fixture, delegation, monkeypatch):
+    from services.delegation import recovery
+    d = delegation
+    reserve = d.service.delegations.reserve
+    def commit_then_fail(*args):
+        reserve(*args)
+        raise RuntimeError("connection lost after commit")
+    monkeypatch.setattr(d.service.delegations, "reserve", commit_then_fail)
+    async def program(sid):
+        await fixture.layer.delegate_handlers[sid]("call", d.args)
+        yield CommonEvent("done", {})
+    fixture.layer.program = program
+    cid = d.service._entries[d.sid].cid
+    frames = [frame async for frame in await d.service.prepare_turn(fixture.user, d.sid, "Review")]
+    await d.service.close(fixture.user, d.sid)
+    assert len(d.workers) == 1 and d.workers[0].closed and not d.workers[0].ran
+    assert not any(frame["type"].startswith("delegate_") for frame in frames)
+    saved = await d.service.get_conversation(fixture.user, cid)
+    assert saved["workers"][0]["recovery_state"] == "unverified"
+    assert all(saved["workers"][0][key] is None for key in ("status", "output", "execution_created"))
+    await recovery.restore(store=d.service.delegations)
+    assert recovery.session_quarantined(d.workers[0].allocation()["session_id"])
+    assert len(d.workers) == 1
 
 
 @pytest.mark.asyncio
@@ -1585,7 +1719,7 @@ async def test_parent_close_unblocks_worker_publication_when_stream_queue_is_ful
             # Like the real scheduler owner, join startup instead of cancelling
             # a coroutine that may own an uncancellable database mutation.
             await asyncio.gather(self.startup, return_exceptions=True)
-            self.closed = True
+            await super().close()
     monkeypatch.setattr(module, "OwnedCopilotWorker", StartupOwner)
     ready = asyncio.Event()
     async def program(sid):
@@ -1601,7 +1735,7 @@ async def test_parent_close_unblocks_worker_publication_when_stream_queue_is_ful
     turn = await d.service.prepare_turn(fixture.user, d.sid, "Review")
     await ready.wait()
     async with asyncio.timeout(1):
-        while not d.workers:
+        while not d.workers or not d.workers[0].ran:
             await asyncio.sleep(0.001)
     await asyncio.wait_for(d.service.close(fixture.user, d.sid), 2)
     assert d.workers[0].closed and d.sid not in d.service._entries

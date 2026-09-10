@@ -7,7 +7,6 @@ vi.mock('@/api/auth', () => ({ apiFetch }))
 vi.mock('@/contexts/AuthContext', () => ({ useAuth: () => auth }))
 import * as chat from '@/api/copilotChat'
 import { CopilotUsageError } from '@/lib/copilotUsage'
-import { CopilotDelegationError } from '@/lib/copilotDelegation'
 import { CopilotChatPreview } from '@/pages/UserSettings.copilotChat'
 class ObserverStub { observe() {} unobserve() {} disconnect() {} }
 vi.stubGlobal('ResizeObserver', ObserverStub)
@@ -409,7 +408,7 @@ it('loads the exact bounded history API shape and paged URL', async () => {
   expect(await chat.listCopilotConversations(20)).toEqual({ conversations: [row], has_more: true })
   expect(apiFetch.mock.calls[0][0]).toBe('/v1/copilot/chat/conversations?limit=20&offset=20')
   apiFetch.mockResolvedValueOnce(json({ conversation: row, events }))
-  expect(await chat.getCopilotConversation(row.id)).toEqual({ conversation: row, events })
+  expect(await chat.getCopilotConversation(row.id)).toEqual({ conversation: row, events, workers: [] })
 })
 it('reads and displays a full stored payload budget with added sequence and array framing', async () => {
   const row = savedConversation()
@@ -641,18 +640,19 @@ it('merges live worker progress and late saved results once without replacing pa
   expect(screen.getByText('Parent waits for QA')).toBeInTheDocument()
   expect(screen.getAllByText('Check migration')).toHaveLength(1)
 })
-it('rejects malformed history delegation through the typed parser', async () => {
+it('isolates malformed history delegation from the native transcript', async () => {
   const row = savedConversation()
   apiFetch.mockResolvedValueOnce(json({ conversation: row, events: [{ seq: 1, ...delegatedSpawn, agent: '../other' }] }))
-  await expect(chat.getCopilotConversation(row.id)).rejects.toThrow(CopilotDelegationError)
+  expect(await chat.getCopilotConversation(row.id)).toMatchObject({ conversation: row, workers: [], workersUnavailable: true })
 })
-it('closes on conflicting worker evidence and does not show an invented result', async () => {
+it('isolates conflicting worker evidence without inventing a result or dropping parent text', async () => {
   vi.spyOn(chat, 'streamCopilotTurn').mockImplementation(async (_sid, _text, _signal, emit) => {
-    emit(delegatedSpawn); emit({ ...delegatedResult, run_id: 'unrelated-run' })
+    emit(delegatedSpawn); emit({ ...delegatedResult, run_id: 'unrelated-run' }); emit({ type: 'text', content: 'Parent remains readable' })
   })
   mount(); await send()
   expect(await screen.findByText('Delegated task status is unavailable.')).toBeInTheDocument()
-  await waitFor(() => expect(apiFetch.mock.calls.some(([url, options]) => url.endsWith('/session-1') && options.method === 'DELETE')).toBe(true))
+  expect(await screen.findByText('Parent remains readable')).toBeInTheDocument()
+  expect(apiFetch.mock.calls.some(([url, options]) => url.endsWith('/session-1') && options.method === 'DELETE')).toBe(false)
   expect(screen.queryByText('Completed')).not.toBeInTheDocument()
 })
 it('does not merge a late worker result into a new conversation', async () => {
@@ -679,4 +679,98 @@ it('unavailable usage cannot suppress a valid delegated result from close histor
   expect(await screen.findByText('Completed')).toBeInTheDocument()
   expect(screen.getByText('QA found no regressions.')).toBeInTheDocument()
   expect(screen.queryByText('Input tokens')).not.toBeInTheDocument()
+})
+const { type: _delegateType, ...workerIdentity } = delegatedSpawn
+const workerUnverified = { ...workerIdentity, recovery_state: 'unverified' as const, status: null, output: null, execution_created: null }
+const workerSettled = { ...workerIdentity, recovery_state: 'settled' as const, status: 'completed' as const, output: 'Recovered QA report', execution_created: true }
+it('reads and explicitly refreshes durable outcomes on an incomplete parent without inference or transcript replacement', async () => {
+  const row = savedFixture(savedConversation({ delegation_enabled: true, state: 'incomplete', can_resume: false }))
+  vi.mocked(chat.getCopilotConversation).mockResolvedValue({ conversation: row,
+    events: [{ seq: 1, ...delegatedSpawn }, { seq: 2, type: 'text', content: 'Partial parent transcript' }], workers: [workerUnverified] })
+  mount(); await selectSaved()
+  expect(screen.getByText('Interrupted or still running; cleanup not verified')).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Resume conversation' })).toBeDisabled()
+  const read = deferred<chat.CopilotConversationDetail>()
+  vi.mocked(chat.getCopilotConversation).mockReturnValue(read.promise)
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh worker results' }))
+  expect(screen.getByRole('button', { name: 'Refreshing worker results…' })).toBeDisabled()
+  await act(async () => read.resolve({ conversation: row, events: [{ seq: 1, ...delegatedSpawn }, { seq: 2, type: 'text', content: 'Do not replace parent text' }], workers: [workerSettled] }))
+  expect(await screen.findByText('Recovered QA report')).toBeInTheDocument()
+  expect(screen.getByText('Completed')).toBeInTheDocument()
+  expect(screen.getByText('Partial parent transcript')).toBeInTheDocument()
+  expect(screen.queryByText('Do not replace parent text')).not.toBeInTheDocument()
+  expect(apiFetch.mock.calls.some(([url]) => url.endsWith('/sessions') || url.endsWith('/resume') || url.endsWith('/turn'))).toBe(false)
+})
+it('keeps malformed worker snapshots out of the API projection while preserving native history', async () => {
+  const row = savedConversation(), events = [{ seq: 1, type: 'text', content: 'Readable native history' }]
+  apiFetch.mockResolvedValueOnce(json({ conversation: row, events, workers: [{ ...workerUnverified, output: 'private premature result' }] }))
+  expect(await chat.getCopilotConversation(row.id)).toEqual({ conversation: row, events, workers: [], workersUnavailable: true })
+  apiFetch.mockResolvedValueOnce(json({ conversation: row, events, workers: [workerSettled] }))
+  expect((await chat.getCopilotConversation(row.id)).workers).toEqual([workerSettled])
+})
+it('renders native archived text even when recovery evidence is malformed or conflicts', async () => {
+  const row = savedFixture(savedConversation({ delegation_enabled: true }))
+  vi.mocked(chat.getCopilotConversation).mockResolvedValue({ conversation: row,
+    events: [{ seq: 1, ...delegatedSpawn }, { seq: 2, ...delegatedResult }, { seq: 3, type: 'text', content: 'Readable parent response' }], workers: [workerSettled] })
+  mount(); await selectSaved()
+  expect(screen.getByText('Delegated task status is unavailable.')).toBeInTheDocument()
+  expect(screen.getByText('Readable parent response')).toBeInTheDocument()
+  expect(screen.queryByText('Recovered QA report')).not.toBeInTheDocument()
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+})
+it('lets another conversation refresh independently without stale completion clearing its pending request', async () => {
+  const first = savedConversation({ delegation_enabled: true }), second = savedConversation({ id: 'second-conversation', title: 'Second conversation', delegation_enabled: true })
+  vi.spyOn(chat, 'listCopilotConversations').mockResolvedValue({ conversations: [first, second], has_more: false })
+  const delayed = deferred<chat.CopilotConversationDetail>()
+  const detail = vi.spyOn(chat, 'getCopilotConversation').mockImplementation(async id => ({ conversation: id === first.id ? first : second, events: [], workers: [] }))
+  mount(); await selectSaved()
+  detail.mockImplementation(id => id === first.id ? delayed.promise : Promise.resolve({ conversation: second, events: [{ seq: 1, type: 'text', content: 'Second parent response' }], workers: [] }))
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh worker results' }))
+  fireEvent.click(screen.getByRole('button', { name: /Second conversation —/ }))
+  expect(await screen.findByText('Second parent response')).toBeInTheDocument()
+  const secondRefresh = deferred<chat.CopilotConversationDetail>()
+  detail.mockImplementation(id => id === first.id ? delayed.promise : secondRefresh.promise)
+  const refreshButton = screen.getByRole('button', { name: 'Refresh worker results' })
+  expect(refreshButton).toBeEnabled()
+  fireEvent.click(refreshButton)
+  expect(detail.mock.calls.filter(([id]) => id === second.id)).toHaveLength(2)
+  await act(async () => delayed.resolve({ conversation: first, events: [], workers: [workerSettled] }))
+  expect(screen.getByRole('button', { name: 'Refreshing worker results…' })).toBeDisabled()
+  fireEvent.click(screen.getByRole('button', { name: 'Refreshing worker results…' }))
+  expect(detail.mock.calls.filter(([id]) => id === second.id)).toHaveLength(2)
+  expect(screen.queryByRole('region', { name: 'Delegated tasks' })).not.toBeInTheDocument()
+  expect(screen.queryByText('Recovered QA report')).not.toBeInTheDocument()
+  await act(async () => secondRefresh.resolve({ conversation: second, events: [], workers: [workerSettled] }))
+  expect(screen.getByRole('button', { name: 'Refresh worker results' })).toBeEnabled()
+  expect(screen.getByText('Recovered QA report')).toBeInTheDocument()
+  expect(screen.getByText('Second parent response')).toBeInTheDocument()
+})
+it('ignores a stale unverified refresh after settled worker proof was observed', async () => {
+  const row = savedFixture(savedConversation({ delegation_enabled: true }))
+  vi.mocked(chat.getCopilotConversation).mockResolvedValue({ conversation: row, events: [], workers: [workerSettled] })
+  mount(); await selectSaved()
+  expect(screen.getByText('Recovered QA report')).toBeInTheDocument()
+  vi.mocked(chat.getCopilotConversation).mockResolvedValue({ conversation: row, events: [], workers: [workerUnverified] })
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh worker results' }))
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Refresh worker results' })).toBeEnabled())
+  expect(screen.getByText('Completed')).toBeInTheDocument()
+  expect(screen.queryByText('Interrupted or still running; cleanup not verified')).not.toBeInTheDocument()
+})
+it('preserves recovered worker outcomes across explicit parent resume without redispatch', async () => {
+  const row = savedFixture(savedConversation({ delegation_enabled: true }))
+  vi.mocked(chat.getCopilotConversation).mockResolvedValue({ conversation: row, events: [{ seq: 1, ...delegatedSpawn }], workers: [workerSettled] })
+  vi.spyOn(chat, 'resumeCopilotConversation').mockResolvedValue({ session_id: 'fresh-parent', conversation_id: row.id })
+  const turn = vi.spyOn(chat, 'streamCopilotTurn').mockImplementation(async (_sid, _text, _signal, emit) => {
+    emit({ type: 'text', content: 'Parent considered the recovered result' })
+  })
+  mount(); await selectSaved()
+  expect(screen.getByText('Recovered QA report')).toBeInTheDocument()
+  expect(turn).not.toHaveBeenCalled()
+  fireEvent.click(screen.getByRole('button', { name: 'Resume conversation' }))
+  await waitFor(() => expect(screen.getByLabelText('Message')).toBeEnabled())
+  await send('Review the saved result')
+  expect(await screen.findByText('Parent considered the recovered result')).toBeInTheDocument()
+  expect(turn.mock.calls[0].slice(0, 2)).toEqual(['fresh-parent', 'Review the saved result'])
+  expect(screen.getAllByText('Recovered QA report')).toHaveLength(1)
+  expect(apiFetch.mock.calls.some(([url]) => url.endsWith('/sessions'))).toBe(false)
 })
