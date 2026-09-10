@@ -7,6 +7,7 @@ runtime restart. Retain the same object to resume, then explicitly discard it.
 """
 
 from contextlib import suppress
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import shutil
@@ -42,6 +43,26 @@ def _identity(info: os.stat_result) -> tuple[int, int]:
 def _private_owner(info: os.stat_result) -> bool:
     return (stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
             and not info.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+
+
+@dataclass(frozen=True)
+class SessionStateAllocation:
+    """Host-only inode identity; store outside the mounted history directory."""
+
+    name: str
+    root_device: int
+    root_inode: int
+    state_device: int
+    state_inode: int
+
+    def __post_init__(self):
+        if (not isinstance(self.name, str) or not self.name.startswith("session-")
+                or not self.name.isascii() or not all(c.isalnum() or c in "-_" for c in self.name)
+                or len(self.name) > 128
+                or any(type(value) is not int or value < 0 for value in (
+                    self.root_device, self.root_inode, self.state_device, self.state_inode))
+                or self.root_inode == 0 or self.state_inode == 0):
+            raise SessionStateError("Invalid Copilot private state allocation")
 
 
 class PrivateCopilotSessionState:
@@ -85,6 +106,7 @@ class PrivateCopilotSessionState:
             instance._name = name
             instance._state_identity = _identity(state_info)
             instance._discarded = False
+            instance._detached = False
             instance._validate()
             return instance
         except Exception:
@@ -96,9 +118,54 @@ class PrivateCopilotSessionState:
                 os.close(descriptor)
             raise SessionStateError("Copilot private state creation failed") from None
 
+    @classmethod
+    def reopen(cls, root: Path, allocation: SessionStateAllocation) -> "PrivateCopilotSessionState":
+        """Reattach a recorded exact allocation; never allocate or repair on mismatch."""
+        descriptor = None
+        try:
+            root = Path(root)
+            if (not root.is_absolute() or ".." in root.parts
+                    or not isinstance(allocation, SessionStateAllocation)):
+                raise SessionStateError("Invalid Copilot private state allocation")
+            descriptor = _open_directory(root)
+            instance = object.__new__(cls)
+            instance._root = root
+            instance._root_fd = descriptor
+            instance._root_identity = (allocation.root_device, allocation.root_inode)
+            instance._name = allocation.name
+            instance._state_identity = (allocation.state_device, allocation.state_inode)
+            instance._discarded = False
+            instance._detached = False
+            instance._validate()
+            return instance
+        except Exception:
+            if descriptor is not None:
+                os.close(descriptor)
+        raise SessionStateError("Copilot private state could not be reopened")
+
+    @property
+    def allocation(self) -> SessionStateAllocation:
+        """Validated metadata for a trusted host-only session record, never a token."""
+        try:
+            self._validate()
+            return SessionStateAllocation(self._name, *self._root_identity, *self._state_identity)
+        except Exception:
+            pass
+        raise SessionStateError("Copilot private state allocation is unavailable")
+
+    def detach(self) -> None:
+        """Release this host handle while retaining history for a verified reopen.
+
+        The runtime must be stopped first. This neither deletes the allocation
+        nor proves a future caller's authorization to use it.
+        """
+        if not self._discarded and not self._detached:
+            self._detached = True
+            os.close(self._root_fd)
+
     def _validate(self) -> None:
-        if self._discarded:
-            raise SessionStateError("Copilot private state was discarded")
+        if self._discarded or self._detached:
+            raise SessionStateError("Copilot private state handle is unavailable")
         current_fd = _open_directory(self._root)
         try:
             root_info = os.fstat(current_fd)
