@@ -1,0 +1,6 @@
+# Optional incremental dependencies for the unregistered local Copilot preview.
+# Install the normal proxy requirements first. Shared dependencies are supplied
+# by that lock (pydantic 2.11.3 / httpx 0.28.1), not upgraded by this supplement.
+github-copilot-sdk==1.0.13
+python-dateutil==2.9.0.post0
+six==1.17.0
