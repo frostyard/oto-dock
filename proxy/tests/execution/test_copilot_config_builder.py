@@ -417,3 +417,20 @@ async def test_saved_history_rejects_nonhuman_authority_before_storage(facts, ch
     with pytest.raises(builder.CopilotConfigError):
         await builder.authorize_copilot_history(replace(facts.human, **changes), 'demo')
     assert facts.authority_reads == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("effort", [None, "low", "medium", "high", "xhigh", "max"])
+async def test_reasoning_effort_is_explicitly_mapped_into_layer_config(facts, effort):
+    result = await build(facts, reasoning_effort=effort)
+    assert result.effort == (effort or "")
+    selected = CopilotExecutionLayer._validate(str(uuid.uuid4()), result)
+    assert selected.reasoning_effort == effort
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("effort", ["", "minimal", "HIGH", True, 1, ["high"], {}])
+async def test_invalid_reasoning_effort_fails_before_account_lookup(facts, effort):
+    with pytest.raises(builder.CopilotConfigError):
+        await build(facts, reasoning_effort=effort)
+    assert not facts.reads

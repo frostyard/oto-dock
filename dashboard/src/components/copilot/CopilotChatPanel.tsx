@@ -8,7 +8,7 @@ import {
   CopilotChatError, CopilotChatCleanupError, copilotChatAvailable, createCopilotChat, closeCopilotChat,
   streamCopilotTurn, respondCopilotPermission, respondCopilotQuestion, type ChatEvent, type ChatMode,
   listCopilotConversations, getCopilotConversation, resumeCopilotConversation, type CopilotConversation,
-  loadCopilotModels, type CopilotModel,
+  loadCopilotModels, type CopilotModel, type ReasoningEffort,
 } from '../../api/copilotChat'
 import CopilotMessages, { type CopilotMessageItem as Item } from './CopilotMessages'
 
@@ -35,6 +35,7 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
   const accounts = useCopilotAccounts(userSub)
   const [agent, setAgent] = useState(''), [account, setAccount] = useState('')
   const [model, setModel] = useState(''), [mode, setMode] = useState<ChatMode>('default')
+  const [effort, setEffort] = useState('')
   const [catalog, setCatalog] = useState<{ scope: string; models: CopilotModel[] } | null>(null)
   const [modelsLoading, setModelsLoading] = useState(false), [modelsError, setModelsError] = useState('')
   const catalogRequest = useRef<{ scope: string; controller: AbortController } | null>(null)
@@ -63,6 +64,8 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
   catalogScope.current = scope
   const currentModels = catalog?.scope === scope ? catalog.models : null
   const chosenModel = accountUsable() && agentAccessible ? currentModels?.find(value => value.id === model && value.available)?.id ?? '' : ''
+  const reasoningEfforts = currentModels?.find(value => value.id === chosenModel)?.reasoning_efforts ?? []
+  const effortValid = effort === '' || reasoningEfforts.includes(effort as ReasoningEffort)
   const savedAccountAvailable = !!selected && eligible.some(a => a.id === selected.account_id)
   const savedAgentAvailable = !!selected && !!agents.data?.some(a => a.name === selected.agent)
   const agentChatPath = `/chat/${encodeURIComponent(selectedAgent)}/copilot${selected ? `/${encodeURIComponent(selected.id)}` : ''}`
@@ -78,6 +81,7 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
   useEffect(() => {
     setCatalog(null); setModel(''); setModelsError('')
   }, [scope])
+  useEffect(() => { setEffort('') }, [chosenModel, currentModels])
   useEffect(() => {
     if (status.data !== true) return
     const target = conversationId ?? null
@@ -265,7 +269,7 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
   async function send(event: React.FormEvent) {
     event.preventDefault()
     const current = life.current
-    if (catalogRequest.current || (!current.sid && (!chosenModel || !accountUsable() || !agentAccessible)) || current.loading || (current.cid && !current.sid) || current.busy || current.closing || current.cleanupFailed || !prompt.trim() || !selectedAgent || !selectedAccount) return
+    if (catalogRequest.current || (!current.sid && (!chosenModel || !effortValid || !accountUsable() || !agentAccessible)) || current.loading || (current.cid && !current.sid) || current.busy || current.closing || current.cleanupFailed || !prompt.trim() || !selectedAgent || !selectedAccount) return
     const text = prompt.trim(), epoch = current.epoch
     current.busy = true; setBusy(true); setError(''); setPrompt('')
     const valid = () => current.mounted && current.epoch === epoch
@@ -277,14 +281,14 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
         // Do not cancel creation and lose its owner ID. Dispose late results.
         current.creating = true
         let owner
-        try { owner = await createCopilotChat({ agent: selectedAgent, account_id: selectedAccount, model: chosenModel, permission_mode: mode }); sid = owner.session_id }
+        try { owner = await createCopilotChat({ agent: selectedAgent, account_id: selectedAccount, model: chosenModel, permission_mode: mode, ...(effort ? { reasoning_effort: effort as ReasoningEffort } : {}) }); sid = owner.session_id }
         finally { current.creating = false }
         if (!valid()) {
           try { await closeCopilotChat(sid) } catch (e) { current.cleanupFailed = true; if (current.mounted) setError(message(e)) }
           return
         }
         current.cid = owner.conversation_id
-        setSelected({ id: owner.conversation_id, agent: selectedAgent, account_id: selectedAccount, model: chosenModel, permission_mode: mode, title: text.slice(0, 100), created_at: '', updated_at: '', state: 'open', revision: 1, can_resume: false, reason: '' })
+        setSelected({ id: owner.conversation_id, agent: selectedAgent, account_id: selectedAccount, model: chosenModel, permission_mode: mode, reasoning_effort: effort ? effort as ReasoningEffort : null, title: text.slice(0, 100), created_at: '', updated_at: '', state: 'open', revision: 1, can_resume: false, reason: '' })
         current.sid = sid; setSession(sid)
         onConversationChange?.(owner.conversation_id, { replace: true })
       }
@@ -332,10 +336,15 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
       <fieldset disabled={busy || loading || !!session || !!selected} className="grid gap-2 sm:grid-cols-2 text-sm text-p-text">
         <label>Agent<select disabled={!!agentName} className={input} value={selectedAgent} onChange={e => setAgent(e.target.value)}><option value="">Select an agent</option>{selected && !savedAgentAvailable && <option value={selected.agent}>Saved agent unavailable</option>}{(agents.data ?? []).map(a => <option key={a.name} value={a.name}>{a.display_name || a.name}</option>)}</select></label>
         <label>Personal Copilot account<select className={input} value={selectedAccount} onChange={e => setAccount(e.target.value)}><option value="">Select an account</option>{selected && !savedAccountAvailable && <option value={selected.account_id}>Saved account unavailable</option>}{eligible.map(a => <option key={a.id} value={a.id}>{a.label || a.principal_id}</option>)}</select></label>
-        {selected ? <label>Model<input className={input} readOnly value={selected.model} /></label> : <label>Model<select className={input} value={chosenModel} disabled={modelsLoading || !currentModels} onChange={e => setModel(e.target.value)}>
+        {selected ? <label>Model<input className={input} readOnly value={selected.model} /></label> : <label>Model<select className={input} value={chosenModel} disabled={modelsLoading || !currentModels} onChange={e => { setModel(e.target.value); setEffort('') }}>
           <option value="">Select a model</option>
           {(currentModels ?? []).map(row => <option key={row.id} value={row.id} disabled={!row.available}>{row.name} ({row.id}){row.available ? '' : ` — ${row.policy === 'disabled' ? 'Disabled by policy' : row.policy === 'unknown' ? 'Unknown policy' : 'Unavailable'}`}{row.multiplier === null ? '' : ` · ${row.multiplier}× reported multiplier`}</option>)}
         </select></label>}
+        {selected ? <label>Reasoning effort<input className={input} readOnly value={selected.reasoning_effort ?? 'Model default'} /></label>
+          : reasoningEfforts.length > 0 && <label>Reasoning effort<select className={input} value={effort} onChange={e => setEffort(e.target.value)}>
+            <option value="">Model default</option>
+            {reasoningEfforts.map(value => <option key={value} value={value}>{value}</option>)}
+          </select></label>}
         <label>Permission mode<select className={input} value={selected?.permission_mode ?? mode} onChange={e => setMode(e.target.value as ChatMode)}><option value="default">Ask when needed</option><option value="acceptEdits">Accept edits</option><option value="plan">Plan only</option><option value="dontAsk">Deny actions needing approval</option></select></label>
       </fieldset>
       {!selected && <div className="space-y-1 text-sm">
@@ -353,7 +362,7 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
       <CopilotMessages items={items} activeSession={session} answering={answering} onAnswer={(item, approved, answers) => void answer(item, approved, answers)} streaming={busy && !!session} agentDisplayName={agents.data?.find(a => a.name === selectedAgent)?.display_name || selectedAgent} />
       <form onSubmit={send} className="space-y-2">
         <label className="block text-sm text-p-text">Message<textarea className={input} maxLength={32768} rows={3} value={prompt} disabled={busy || loading || (!!life.current.cid && !session)} onChange={e => setPrompt(e.target.value)} /></label>
-        <div className="flex gap-2"><button className={button} disabled={modelsLoading || busy || loading || (!!life.current.cid && !session) || !prompt.trim() || !selectedAgent || !selectedAccount || (!session && !chosenModel) || life.current.cleanupFailed}>Send</button>
+        <div className="flex gap-2"><button className={button} disabled={modelsLoading || busy || loading || (!!life.current.cid && !session) || !prompt.trim() || !selectedAgent || !selectedAccount || (!session && (!chosenModel || !effortValid)) || life.current.cleanupFailed}>Send</button>
           <button className={button} type="button" disabled={!busy && !session} onClick={() => void close()}>{busy ? 'Stop and close' : 'Close chat'}</button>
           <button className={button} type="button" disabled={modelsLoading || busy || life.current.cleanupFailed} onClick={() => void newChat()}>New chat</button></div>
       </form>

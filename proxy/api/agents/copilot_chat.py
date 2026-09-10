@@ -45,6 +45,7 @@ class CreateRequest(_Body):
     account_id: Identifier
     model: Identifier
     permission_mode: Literal["default", "acceptEdits", "plan", "dontAsk"] = "default"
+    reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
 
 
 class ModelsRequest(_Body):
@@ -218,8 +219,9 @@ async def create(req: CreateRequest, request: Request, user: UserContext | None 
     user = _human(request, user)
     _mutation(request)
     service = _service(request)
+    options = {"reasoning_effort": req.reasoning_effort} if req.reasoning_effort is not None else {}
     return await _open_session(request, user, service, service.create(
-        user, req.agent, req.account_id, req.model, permission_mode=req.permission_mode,
+        user, req.agent, req.account_id, req.model, permission_mode=req.permission_mode, **options,
     ))
 
 

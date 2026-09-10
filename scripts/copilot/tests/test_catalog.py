@@ -27,7 +27,7 @@ def test_normalized_policy_is_not_an_entitlement_claim(policy, expected, availab
     rows = module.normalize_models({"models": [model(policy=policy, billing={"multiplier": 0.5},
                                                       private_token="must not project")]})
     assert rows == [{"id": "fixture-model", "name": "Fixture model", "policy": expected,
-                     "available": available, "multiplier": 0.5}]
+                     "available": available, "multiplier": 0.5, "reasoning_efforts": [], "default_reasoning_effort": None}]
 
 
 @pytest.mark.parametrize("response", [None, [], {}, {"models": None}, {"models": {}},

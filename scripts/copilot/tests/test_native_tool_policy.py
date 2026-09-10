@@ -281,3 +281,18 @@ async def test_native_hook_preprocessing_exception_cannot_become_sdk_fail_open()
     result = await invoke(gate, Uncopyable(native()))
     assert_denied(result)
     assert "private-native-payload" not in repr(result) and calls == []
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
+def test_reviewed_reasoning_effort_is_a_guarded_sdk_option(effort):
+    gate, _, _ = setup()
+    options = gate.session_options(reasoning_effort=effort)
+    assert options["reasoning_effort"] == effort and options["tools"] == []
+    assert options["hooks"] == {"on_pre_tool_use": gate.on_pre_tool_use}
+
+
+@pytest.mark.parametrize("effort", [None, "", "minimal", "HIGH", True, 1, ["high"], {}])
+def test_invalid_reasoning_effort_cannot_reach_guarded_sdk(effort):
+    gate, _, _ = setup()
+    with pytest.raises(ValueError, match="reasoning effort is invalid"):
+        gate.session_options(reasoning_effort=effort)

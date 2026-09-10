@@ -19,6 +19,8 @@ import math
 from pathlib import Path, PurePosixPath
 import uuid
 
+from core.layers.copilot.catalog import read_model_inventory
+from core.layers.copilot.reasoning import valid_reasoning_effort
 from core.layers.copilot.credentials import CopilotAccountScope, AccountScopeKind
 from core.layers.copilot.lease import CopilotLeaseGuard
 from core.layers.copilot.native_shells import CopilotNativeShellSession
@@ -42,6 +44,7 @@ class CopilotLocalSessionConfig:
     model: str
     enabled_tools: frozenset[str]
     system_prompt: str = ""
+    reasoning_effort: str | None = None
 
     def __post_init__(self):
         if (not all(_text(value, 256) for value in (self.platform_session_id, self.account_id, self.model))
@@ -51,7 +54,7 @@ class CopilotLocalSessionConfig:
                 or not isinstance(self.enabled_tools, frozenset) or not self.enabled_tools
                 or not self.enabled_tools <= SUPPORTED_NATIVE_TOOLS
                 or not isinstance(self.system_prompt, str) or len(self.system_prompt) > 262144
-                or "\x00" in self.system_prompt):
+                or "\x00" in self.system_prompt or not valid_reasoning_effort(self.reasoning_effort)):
             raise ValueError("Invalid explicit Copilot local session configuration")
 
 
@@ -234,11 +237,17 @@ class CopilotLocalSession:
                 for private in (records.root, records.state_root):
                     if private.is_relative_to(source) or source.is_relative_to(private):
                         raise ValueError("Copilot private records overlap sandbox mounts")
-        digest = hashlib.sha256(json.dumps(_canonical({
+        digest_fields = {
             "sandbox": cfg, "context": context, "system_prompt": self._config.system_prompt,
             "runtime_path": runtime_path, "cwd": cwd,
             "permission_mode": get_session_mode(self._config.platform_session_id),
-        }), sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+        }
+        # Preserve the exact legacy profile digest when the caller leaves the
+        # provider default untouched; explicit levels are immutable provenance.
+        if self._config.reasoning_effort is not None:
+            digest_fields["reasoning_effort"] = self._config.reasoning_effort
+        digest = hashlib.sha256(json.dumps(_canonical(digest_fields), sort_keys=True,
+                                          separators=(",", ":"), allow_nan=False).encode()).hexdigest()
         self._check()
         self._guard = await CopilotLeaseGuard.acquire(
             self._config.account_id, self._config.scope, on_invalid=self._invalidate,
@@ -282,20 +291,20 @@ class CopilotLocalSession:
         self._check()
         if getattr(auth, "isAuthenticated", None) is not True:
             raise ValueError("Copilot runtime authentication unavailable")
-        models = await client.list_models()
+        models = await read_model_inventory(client)
         self._check()
-        if not isinstance(models, list):
-            raise ValueError("Invalid Copilot model inventory")
-        matching = [model for model in models if getattr(model, "id", None) == self._config.model]
-        if len(matching) != 1:
+        matching = [model for model in models if model["id"] == self._config.model]
+        if len(matching) != 1 or not matching[0]["available"]:
             raise ValueError("Requested Copilot model unavailable")
-        model_policy = getattr(matching[0], "policy", None)
-        if model_policy is not None and getattr(model_policy, "state", None) not in {"enabled", "unconfigured"}:
-            raise ValueError("Requested Copilot model policy is unavailable")
+        if (self._config.reasoning_effort is not None
+                and self._config.reasoning_effort not in matching[0]["reasoning_efforts"]):
+            raise ValueError("Requested Copilot reasoning effort unavailable")
         # Revalidate the exact payer again immediately before session creation.
         await self._authorize()
         options = dict(model=self._config.model, streaming=True, enable_session_store=True,
                        on_event=self._receive_event, session_limits={"max_ai_credits": 30.0})
+        if self._config.reasoning_effort is not None:
+            options["reasoning_effort"] = self._config.reasoning_effort
         if self._config.system_prompt:
             options["system_message"] = {"mode": "append", "content": self._config.system_prompt}
         if resume:

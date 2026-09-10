@@ -450,3 +450,50 @@ def test_validation_agent_filter_rejects_before_database(monkeypatch, agent):
     monkeypatch.setattr(store, 'get_conn', forbidden)
     with pytest.raises(store.CopilotConversationError):
         store.list_conversations(OWNER, agent=agent)
+
+
+@pytest.mark.parametrize('effort', [None, 'low', 'medium', 'high', 'xhigh', 'max'])
+def test_reasoning_effort_is_immutable_metadata_across_turn_and_resume(conversation, effort):
+    row = store.create(identifier(), OWNER, agent=conversation['agent'], account_id=identifier(),
+                       model='reasoning-model', permission_mode='default',
+                       platform_session_id=identifier(), generation=identifier(), reasoning_effort=effort)
+    assert row['reasoning_effort'] == effort
+    closed = ready(row)
+    claimed = store.claim_resume(row['id'], OWNER, closed['revision'], identifier())
+    assert claimed['reasoning_effort'] == effort
+    assert store.get(row['id'], OWNER)['reasoning_effort'] == effort
+    assert next(item for item in store.list_conversations(OWNER) if item['id'] == row['id'])['reasoning_effort'] == effort
+
+
+def test_reasoning_column_migration_preserves_existing_rows_and_events(conversation):
+    row = ready(conversation)
+    events = store.events(row['id'], OWNER)
+    with get_conn() as conn:
+        # Recreate the pre-effort schema without replacing its saved data.
+        conn.execute('ALTER TABLE copilot_conversations DROP COLUMN reasoning_effort')
+        schema.init_copilot_conversations(conn)
+        schema.init_copilot_conversations(conn)
+        conn.commit()
+    assert store.get(row['id'], OWNER) == {**row, 'reasoning_effort': None}
+    assert store.events(row['id'], OWNER) == events
+
+
+def test_database_rejects_unreviewed_reasoning_level(conversation):
+    from psycopg.errors import CheckViolation
+
+    with pytest.raises(CheckViolation):
+        with get_conn() as conn:
+            conn.execute('UPDATE copilot_conversations SET reasoning_effort=%s WHERE id=%s',
+                         ('unreviewed', conversation['id']))
+    assert store.get(conversation['id'], OWNER)['reasoning_effort'] is None
+
+
+@pytest.mark.parametrize('effort', ['', 'auto', 'minimal', ' high', 'HIGH', True, 1, [], {}])
+def test_validation_reasoning_effort_rejects_before_database(monkeypatch, effort):
+    def forbidden():
+        pytest.fail('Invalid reasoning must not reach the database')
+    monkeypatch.setattr(store, 'get_conn', forbidden)
+    with pytest.raises(store.CopilotConversationError):
+        store.create(identifier(), OWNER, agent='agent', account_id=identifier(), model='model',
+                     permission_mode='default', platform_session_id=identifier(), generation=identifier(),
+                     reasoning_effort=effort)

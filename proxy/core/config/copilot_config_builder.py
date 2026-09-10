@@ -17,6 +17,7 @@ import config
 from auth.path_policy import SecurityContext, build_permission_context
 from auth.providers import UserContext
 from core.layers.copilot.credentials import AccountScopeKind, CopilotAccountScope
+from core.layers.copilot.reasoning import valid_reasoning_effort
 from core.layers.copilot.layer import CopilotAgentConfig, CopilotExecutionLayer
 from core.layers.copilot.native_tool_policy import SUPPORTED_NATIVE_TOOLS
 from core.session.visibility import available_scopes_for
@@ -168,7 +169,7 @@ def _prompt(agent_name, ctx, enabled_tools):
 
 
 def _build(sub, agent_name, account_id, account_scope, model, permission_mode,
-           client_type, resume, enabled_tools):
+           client_type, resume, enabled_tools, reasoning_effort):
     facts = _authority(sub, agent_name)
     user, agent, role, libraries = facts
     if account_scope.kind is AccountScopeKind.PLATFORM and user.get("allow_platform_auth") is not True:
@@ -187,7 +188,7 @@ def _build(sub, agent_name, account_id, account_scope, model, permission_mode,
     result = CopilotAgentConfig(
         agent_name=agent_name, user_sub=sub, account_id=account_id, account_scope=account_scope,
         model=model, permission_mode=permission_mode, client_type=client_type, resume=resume,
-        enabled_tools=enabled_tools, security_context=ctx,
+        enabled_tools=enabled_tools, security_context=ctx, effort=reasoning_effort or "",
         system_prompt=_prompt(agent_name, ctx, enabled_tools),
     )
     # The validator is independent of runtime/root provisioning. Keep one source
@@ -223,7 +224,7 @@ async def authorize_copilot_history(user: UserContext, agent_name: str) -> None:
 async def build_copilot_agent_config(*, user: UserContext, agent_name: str,
                                      account_id: str, account_scope: CopilotAccountScope,
                                      model: str, permission_mode="default", client_type="dashboard",
-                                     resume=False, enabled_tools=frozenset()) -> CopilotAgentConfig:
+                                     resume=False, enabled_tools=frozenset(), reasoning_effort=None) -> CopilotAgentConfig:
     """Build from a current human identity and an explicitly selected payer.
 
     Platform borrowing requires the driver's current Platform Auth toggle and
@@ -244,11 +245,12 @@ async def build_copilot_agent_config(*, user: UserContext, agent_name: str,
                 or permission_mode not in {"default", "acceptEdits", "plan", "dontAsk"}
                 or client_type not in {"dashboard", "sse"} or type(resume) is not bool
                 or type(enabled_tools) is not frozenset or not enabled_tools
-                or not enabled_tools <= SUPPORTED_NATIVE_TOOLS):
+                or not enabled_tools <= SUPPORTED_NATIVE_TOOLS
+                or not valid_reasoning_effort(reasoning_effort)):
             raise ValueError()
         return await asyncio.to_thread(
             _build, user.sub, agent_name, account_id, account_scope, model,
-            permission_mode, client_type, resume, enabled_tools,
+            permission_mode, client_type, resume, enabled_tools, reasoning_effort,
         )
     except Exception:
         failed = True

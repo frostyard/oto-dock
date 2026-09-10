@@ -14,13 +14,14 @@ import math
 from pathlib import Path
 import uuid
 
+from core.layers.copilot.reasoning import valid_reasoning_effort
 from core.layers.copilot.permissions import _path, _text
 
 SUPPORTED_NATIVE_TOOLS = frozenset({"bash", "create", "edit", "view", "glob", "grep"})
 _SCHEMAS = json.loads(Path(__file__).with_name("native_tool_schemas.json").read_text())
 _DENY = {"permissionDecision": "deny", "permissionDecisionReason": "OtoDock did not authorize this native tool"}
 _SESSION_OPTIONS = frozenset({
-    "model", "streaming", "on_event", "enable_session_store", "session_limits", "system_message", "managed_settings",
+    "model", "reasoning_effort", "streaming", "on_event", "enable_session_store", "session_limits", "system_message", "managed_settings",
 })
 
 
@@ -169,6 +170,9 @@ class CopilotNativeToolPolicy:
         """
         if options.keys() - _SESSION_OPTIONS:
             raise ValueError("Copilot native session policy options cannot be overridden")
+        if "reasoning_effort" in options and (options["reasoning_effort"] is None
+                or not valid_reasoning_effort(options["reasoning_effort"])):
+            raise ValueError("Copilot reasoning effort is invalid")
         return {
             **options,
             "available_tools": [f"builtin:{name}" for name in sorted(self.enabled_tools)],

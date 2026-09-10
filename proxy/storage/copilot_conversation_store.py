@@ -13,6 +13,7 @@ import math
 import uuid
 
 import config
+from core.layers.copilot.reasoning import valid_reasoning_effort
 from storage.pg import get_conn
 
 
@@ -175,20 +176,20 @@ def _update(conn, row, **fields):
 
 @_safe
 def create(conversation_id, owner_sub, *, agent, account_id, model, permission_mode,
-           platform_session_id, generation):
+           platform_session_id, generation, reasoning_effort=None):
     _identity(conversation_id, owner_sub, generation)
     if (not _text(agent) or not config.is_safe_agent_name(agent) or not _uuid(account_id)
             or not _text(model) or permission_mode not in {"default", "acceptEdits", "plan", "dontAsk"}
-            or not _uuid(platform_session_id)):
+            or not _uuid(platform_session_id) or not valid_reasoning_effort(reasoning_effort)):
         raise CopilotConversationError()
     with _connection() as conn:
         now = _now()
         row = conn.execute(
             """INSERT INTO copilot_conversations
-               (id,user_sub,agent,account_id,model,permission_mode,platform_session_id,generation,created_at,updated_at)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING *""",
+               (id,user_sub,agent,account_id,model,permission_mode,platform_session_id,generation,created_at,updated_at,reasoning_effort)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING RETURNING *""",
             (conversation_id, owner_sub, agent, account_id, model, permission_mode,
-             platform_session_id, generation, now, now),
+             platform_session_id, generation, now, now, reasoning_effort),
         ).fetchone()
         if row is None:
             raise CopilotConversationConflict()

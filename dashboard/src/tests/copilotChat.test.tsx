@@ -228,7 +228,7 @@ it('closing an unanswered question never labels it answered', async () => {
 })
 
 const savedConversation = (overrides: Partial<chat.CopilotConversation> = {}): chat.CopilotConversation => ({
-  id: 'conversation-a', agent: 'demo', account_id: 'account-1', model: 'saved-model', permission_mode: 'plan',
+  id: 'conversation-a', agent: 'demo', account_id: 'account-1', model: 'saved-model', permission_mode: 'plan', reasoning_effort: null,
   title: 'Saved work', created_at: 100, updated_at: 200, state: 'closed', revision: 7, can_resume: true, reason: '', ...overrides,
 })
 function savedFixture(row = savedConversation(), events: chat.ChatEvent[] = [{ seq: 1, type: 'text', content: 'Saved response' }]) {
@@ -455,4 +455,23 @@ it('settings navigation waits for idle owner close before opening its saved rout
   await act(async () => disposed.resolve())
   expect(await screen.findByText('Routed conversation destination')).toBeInTheDocument()
   expect(closeOwner).toHaveBeenCalledOnce()
+})
+it.each(['high', null] as const)('saved effort %s is read-only and explicit resume never sends an override', async effort => {
+  const row = savedFixture(savedConversation({ reasoning_effort: effort }))
+  const base = apiFetch.getMockImplementation()!
+  apiFetch.mockImplementation((url, options) => url.endsWith('/resume') ? Promise.resolve(json({ session_id: 'fresh-owner', conversation_id: row.id })) : base(url, options))
+  mount(); await selectSaved()
+  expect(screen.getByLabelText('Reasoning effort')).toHaveValue(effort ?? 'Model default')
+  expect(screen.getByLabelText('Reasoning effort')).toBeDisabled()
+  expect(screen.queryByRole('button', { name: 'Load available models' })).not.toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: 'Resume conversation' }))
+  await waitFor(() => expect(apiFetch.mock.calls.some(([url]) => url.endsWith('/resume'))).toBe(true))
+  expect(JSON.parse(apiFetch.mock.calls.find(([url]) => url.endsWith('/resume'))![1].body)).toEqual({ revision: row.revision })
+})
+it('normalizes omitted saved effort to model default and rejects unknown persisted values', async () => {
+  const { reasoning_effort: _effort, ...legacy } = savedConversation()
+  apiFetch.mockResolvedValueOnce(json({ conversation: legacy, events: [] }))
+  expect((await chat.getCopilotConversation(legacy.id)).conversation.reasoning_effort).toBeNull()
+  apiFetch.mockResolvedValueOnce(json({ conversation: { ...legacy, reasoning_effort: 'ultra' }, events: [] }))
+  await expect(chat.getCopilotConversation(legacy.id)).rejects.toThrow(chat.CopilotChatError)
 })

@@ -6,8 +6,11 @@ export class CopilotChatError extends Error {}
 export class CopilotChatCleanupError extends CopilotChatError {}
 export type ChatEvent = Record<string, unknown> & { type: string }
 export type ChatMode = 'default' | 'acceptEdits' | 'plan' | 'dontAsk'
+export type ReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+const isReasoningEffort = (value: unknown): value is ReasoningEffort => typeof value === 'string' && ['low', 'medium', 'high', 'xhigh', 'max'].includes(value)
 export interface CopilotConversation {
   id: string; agent: string; account_id: string; model: string; permission_mode: ChatMode
+  reasoning_effort: ReasoningEffort | null
   title: string; created_at: string | number; updated_at: string | number
   state: 'open' | 'closed' | 'incomplete'; revision: number; can_resume: boolean; reason: string
 }
@@ -16,6 +19,8 @@ export interface CopilotModel {
   id: string; name: string; available: boolean
   policy: 'enabled' | 'unconfigured' | 'disabled' | 'unknown'
   multiplier: number | null
+  reasoning_efforts: ReasoningEffort[]
+  default_reasoning_effort: ReasoningEffort | null
 }
 const identifier = (value: unknown): value is string => typeof value === 'string' && /^[a-zA-Z0-9-]{1,128}$/.test(value)
 const bounded = (value: unknown, limit = 256): value is string => typeof value === 'string' && value.length > 0 && value.length <= limit
@@ -26,8 +31,9 @@ function conversation(value: unknown): CopilotConversation {
       || !bounded(row.model) || !['default', 'acceptEdits', 'plan', 'dontAsk'].includes(row.permission_mode)
       || typeof row.title !== 'string' || row.title.length > 512 || !timestamp(row.created_at) || !timestamp(row.updated_at)
       || !['open', 'closed', 'incomplete'].includes(row.state) || !Number.isSafeInteger(row.revision) || row.revision < 1
-      || typeof row.can_resume !== 'boolean' || typeof row.reason !== 'string' || row.reason.length > 1024) throw new CopilotChatError(failure)
-  return row
+      || typeof row.can_resume !== 'boolean' || typeof row.reason !== 'string' || row.reason.length > 1024
+      || (row.reasoning_effort !== undefined && row.reasoning_effort !== null && !isReasoningEffort(row.reasoning_effort))) throw new CopilotChatError(failure)
+  return { ...row, reasoning_effort: row.reasoning_effort ?? null }
 }
 async function owner(response: Response): Promise<CopilotChatOwner> {
   let sessionId: string | undefined
@@ -69,11 +75,18 @@ export async function loadCopilotModels(body: { agent: string; account_id: strin
           || typeof row.available !== 'boolean' || !['enabled', 'unconfigured', 'disabled', 'unknown'].includes(row.policy)
           || (row.multiplier !== null && (typeof row.multiplier !== 'number' || !Number.isFinite(row.multiplier) || row.multiplier < 0 || row.multiplier > 1000))) throw new Error()
       ids.add(row.id)
-      return { id: row.id, name: row.name, available: row.available && (row.policy === 'enabled' || row.policy === 'unconfigured'), policy: row.policy, multiplier: row.multiplier }
+      const legacy = !Object.prototype.hasOwnProperty.call(row, 'reasoning_efforts') && !Object.prototype.hasOwnProperty.call(row, 'default_reasoning_effort')
+      const efforts = legacy ? [] : row.reasoning_efforts, defaultEffort = legacy ? null : row.default_reasoning_effort
+      if (!Array.isArray(efforts) || efforts.length > 5 || efforts.some(value => !isReasoningEffort(value))
+          || new Set(efforts).size !== efforts.length
+          || (defaultEffort !== null && (!isReasoningEffort(defaultEffort) || !efforts.includes(defaultEffort)))) throw new Error()
+      return { id: row.id, name: row.name, available: row.available && (row.policy === 'enabled' || row.policy === 'unconfigured'), policy: row.policy, multiplier: row.multiplier,
+        reasoning_efforts: [...efforts], default_reasoning_effort: defaultEffort }
     })
   } catch { throw new CopilotChatError('Available models could not be loaded. Try loading them again.') }
 }
-export async function createCopilotChat(body: { agent: string; account_id: string; model: string; permission_mode: ChatMode }) {
+export async function createCopilotChat(body: { agent: string; account_id: string; model: string; permission_mode: ChatMode; reasoning_effort?: ReasoningEffort | null }) {
+  if (body.reasoning_effort !== undefined && body.reasoning_effort !== null && !isReasoningEffort(body.reasoning_effort)) throw new CopilotChatError('Select a supported reasoning effort.')
   const response = await request('/sessions', { method: 'POST', body: JSON.stringify(body) })
   return owner(response)
 }

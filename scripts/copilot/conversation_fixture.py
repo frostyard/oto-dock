@@ -44,6 +44,7 @@ class MemoryConversations:
             if conversation_id in self.rows:
                 raise contract.CopilotConversationConflict()
             now = datetime.now(timezone.utc).isoformat()
+            fields.setdefault('reasoning_effort', None)
             row = dict(id=conversation_id, user_sub=owner_sub, **fields, revision=1,
                        state='open', title='New conversation', created_at=now, updated_at=now,
                        turn_active=False, last_turn_complete=False, event_count=0, event_bytes=0)

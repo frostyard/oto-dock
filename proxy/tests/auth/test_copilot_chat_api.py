@@ -73,8 +73,10 @@ class Service:
         finally:
             self.closed.set()
 
-    async def create(self, user, agent, account_id, model, permission_mode="default"):
+    async def create(self, user, agent, account_id, model, permission_mode="default", reasoning_effort=None):
         options = {"agent": agent, "account_id": account_id, "model": model, "permission_mode": permission_mode}
+        if reasoning_effort is not None:
+            options["reasoning_effort"] = reasoning_effort
         self.calls.append(("create", user, options))
         if self.error:
             raise self.error
@@ -766,3 +768,31 @@ async def test_models_disconnect_and_repeated_cancel_join_late_owned_cleanup(api
     finally:
         release.set()
         await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('effort', [None, 'low', 'medium', 'high', 'xhigh', 'max'])
+async def test_create_accepts_only_explicit_reasoning_selection_or_model_default(api, effort):
+    response = await post(api, body=create_body(reasoning_effort=effort))
+    assert response.status_code == 201
+    expected = create_body(permission_mode='default')
+    if effort is not None:
+        expected['reasoning_effort'] = effort
+    assert api.service.calls == [('create', api.user[0], expected)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('effort', ['', 'auto', 'minimal', 'HIGH', True, 1, [], {}])
+async def test_create_rejects_invalid_reasoning_before_dispatch(api, effort):
+    response = await post(api, body=create_body(reasoning_effort=effort))
+    assert response.status_code == 422 and not api.service.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('path,body', [
+    (f'/conversations/{CID}/resume', {'revision': 1, 'reasoning_effort': 'high'}),
+    ('/models', {'agent': 'demo', 'account_id': 'account-one', 'reasoning_effort': 'high'}),
+])
+async def test_reasoning_cannot_override_resume_or_catalog_options(api, path, body):
+    response = await post(api, path, body)
+    assert response.status_code == 422 and not api.service.calls

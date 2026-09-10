@@ -80,6 +80,7 @@ class FakeClient:
     def __init__(self, scenario):
         self.scenario = scenario
         self._sessions = {}
+        self._client = SimpleNamespace(request=self.raw_request)
         self.opened = []
         self.rpc = SimpleNamespace(tools=SimpleNamespace(list=self.catalog))
 
@@ -109,9 +110,20 @@ class FakeClient:
         await self.scenario.checkpoint("auth")
         return SimpleNamespace(isAuthenticated=getattr(self.scenario, "authenticated", True), login="fixture-login")
 
-    async def list_models(self):
+    async def raw_request(self, method, params, *, timeout):
+        assert method == "models.list" and params == {} and timeout == 10
         await self.scenario.checkpoint("models")
-        return getattr(self.scenario, "models", [SimpleNamespace(id="gpt-5-mini", policy=None)])
+        if hasattr(self.scenario, "raw_models"):
+            return {"models": self.scenario.raw_models}
+        models = getattr(self.scenario, "models", [SimpleNamespace(id="gpt-5-mini", policy=None)])
+        if not isinstance(models, list):
+            return {"models": models}
+        return {"models": [{"id": item.id, "name": "Fixture model", "capabilities": {},
+                            "policy": vars(item.policy) if isinstance(item.policy, SimpleNamespace) else item.policy}
+                           for item in models]}
+
+    async def list_models(self):
+        raise AssertionError("Lossy SDK model conversion must not run")
 
 
 class FakeRuntime:
@@ -685,7 +697,7 @@ async def test_stream_failure_is_sanitized_and_prevents_prior_success_marking_re
     pytest.param(SimpleNamespace(state="future-unknown-state"), id="unknown-state"),
     pytest.param(SimpleNamespace(), id="missing-state"),
     pytest.param(SimpleNamespace(state=["enabled"]), id="malformed-state"),
-    pytest.param({"state": "enabled"}, id="untyped-policy"),
+    pytest.param("enabled", id="malformed-policy"),
 ])
 async def test_unknown_or_malformed_model_policy_never_opens_native_session(harness, policy):
     harness.models = [SimpleNamespace(id="gpt-5-mini", policy=policy)]
@@ -761,5 +773,99 @@ async def test_resume_permission_mode_change_rejects_before_new_runtime(harness)
         with pytest.raises(harness.module.CopilotLocalSessionError):
             await open_session(harness, resume=True)
         assert len(harness.runtimes) == count
+    finally:
+        await clean(harness)
+
+
+def reasoning_model(levels=None):
+    return {"id": "gpt-5-mini", "name": "Fixture model", "capabilities": {"supports": {"reasoningEffort": True}},
+            "supportedReasoningEfforts": levels if levels is not None else ["low", "high"],
+            "defaultReasoningEffort": "low"}
+
+
+@pytest.mark.asyncio
+async def test_explicit_reasoning_effort_reaches_guarded_create_and_cold_resume(harness):
+    harness.raw_models = [reasoning_model()]
+    selected = config(harness, reasoning_effort="high")
+    first = await open_session(harness, selected)
+    _ = [event async for event in first.stream("complete")]
+    await first.close()
+    resumed = await open_session(harness, selected, resume=True)
+    try:
+        assert harness.runtimes[0].client.opened[0].options["reasoning_effort"] == "high"
+        assert harness.runtimes[1].client.opened[0].options["reasoning_effort"] == "high"
+    finally:
+        await resumed.close()
+        await clean(harness)
+
+
+@pytest.mark.asyncio
+async def test_provider_default_preserves_old_reference_digest_and_omits_sdk_option(harness):
+    import hashlib
+    import json
+
+    selected = config(harness)
+    owner = await open_session(harness, selected)
+    try:
+        old_reference = {
+            "sandbox": harness.builder.cfg, "context": harness.contexts["platform-a"],
+            "system_prompt": selected.system_prompt, "runtime_path": harness.runtime_path.resolve(),
+            "cwd": harness.builder.get_cwd(), "permission_mode": "default",
+        }
+        old_bytes = json.dumps(harness.module._canonical(old_reference), sort_keys=True,
+                               separators=(",", ":"), allow_nan=False).encode()
+        assert documents(harness)[0]["profile"]["config_digest"] == hashlib.sha256(old_bytes).hexdigest()
+        assert "reasoning_effort" not in harness.runtimes[0].client.opened[0].options
+    finally:
+        await owner.close()
+        await clean(harness)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("before,after", [(None, "high"), ("high", None), ("high", "low")])
+async def test_resume_effort_change_rejects_before_starting_another_runtime(harness, before, after):
+    harness.raw_models = [reasoning_model()]
+    first = await open_session(harness, config(harness, reasoning_effort=before))
+    _ = [event async for event in first.stream("complete")]
+    await first.close()
+    count = len(harness.runtimes)
+    try:
+        with pytest.raises(harness.module.CopilotLocalSessionError):
+            await open_session(harness, config(harness, reasoning_effort=after), resume=True)
+        assert len(harness.runtimes) == count
+    finally:
+        await clean(harness)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", [
+    reasoning_model(["low"]),
+    {"id": "gpt-5-mini", "name": "Fixture", "capabilities": {}},
+    {**reasoning_model(), "supportedReasoningEfforts": ["low", True]},
+])
+async def test_unadvertised_or_malformed_effort_never_creates_native_session(harness, model):
+    harness.raw_models = [model]
+    try:
+        with pytest.raises(harness.module.CopilotLocalSessionError):
+            await open_session(harness, config(harness, reasoning_effort="high"))
+        assert harness.runtimes[0].closed and not harness.runtimes[0].client.opened
+        assert documents(harness)[0]["status"] == "active"
+    finally:
+        await clean(harness)
+
+
+@pytest.mark.asyncio
+async def test_resume_rechecks_current_model_effort_advertisement(harness):
+    harness.raw_models = [reasoning_model()]
+    selected = config(harness, reasoning_effort="high")
+    first = await open_session(harness, selected)
+    _ = [event async for event in first.stream("complete")]
+    await first.close()
+    harness.raw_models = [reasoning_model(["low"])]
+    try:
+        with pytest.raises(harness.module.CopilotLocalSessionError):
+            await open_session(harness, selected, resume=True)
+        assert harness.runtimes[1].closed and not harness.runtimes[1].client.opened
+        assert documents(harness)[0]["status"] == "active"
     finally:
         await clean(harness)
