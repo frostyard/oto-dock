@@ -58,8 +58,15 @@ class FakeClient:
         self.spawned.set()
         if self.hang_start:
             await asyncio.Event().wait()
-        while not self.runtime._handshake.exists():
-            await asyncio.sleep(0.005)
+        # Real SDK readiness follows launcher exec, which happens only after
+        # the ownership record is fully written. Path existence alone races
+        # that write and announces fake readiness too early.
+        while True:
+            try:
+                json.loads(self.runtime._handshake.read_text())
+                break
+            except (FileNotFoundError, json.JSONDecodeError):
+                await asyncio.sleep(0.005)
         self._state = 'connected'
 
     async def get_status(self):

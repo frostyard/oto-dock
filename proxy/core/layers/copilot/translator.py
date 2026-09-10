@@ -292,7 +292,23 @@ class CopilotEventTranslator:
         Validate the entire batch before mutation; never invent an unknown tool
         or report successful execution for a cancelled operation.
         """
-        if not isinstance(tool_ids, frozenset) or any(
+        return self.reconcile_stopped_tools(tool_ids, frozenset())
+
+    def reconcile_stopped_tools(
+        self, cancelled_tool_ids: frozenset[str], cancelled_permission_tool_ids: frozenset[str],
+    ) -> list[CommonEvent]:
+        """Close tool displays only after coordinator control/settlement proof.
+
+        Permission cancellation is correlated native evidence, separate from a
+        cancelled/joined host callback. Neither proves absence of earlier side
+        effects or history preservation. Validate both batches before mutation.
+        """
+        if (not isinstance(cancelled_tool_ids, frozenset)
+                or not isinstance(cancelled_permission_tool_ids, frozenset)
+                or cancelled_tool_ids & cancelled_permission_tool_ids):
+            raise ValueError("Invalid Copilot tool stop evidence")
+        tool_ids = cancelled_tool_ids | cancelled_permission_tool_ids
+        if any(
             tool_id not in self._tools or tool_id in self._completed_tools
             for tool_id in tool_ids
         ):
@@ -300,7 +316,10 @@ class CopilotEventTranslator:
         events = []
         for tool_id in sorted(tool_ids):
             events.extend(self._tool_result(tool_id, {
-                "success": False, "error": {"message": "Tool execution cancelled."},
+                "success": False, "error": {"message": (
+                    "Tool stopped while its permission request was cancelled."
+                    if tool_id in cancelled_permission_tool_ids else "Tool execution cancelled."
+                )},
             }))
         return events
 
@@ -321,6 +340,7 @@ class CopilotEventTranslator:
 
     def reconcile_interrupted(
         self, boundary: InterruptBoundary, *, cancelled_tool_ids: frozenset[str] = frozenset(),
+        cancelled_permission_tool_ids: frozenset[str] = frozenset(),
     ) -> list[CommonEvent]:
         """Finish explicitly interrupted work after coordinator verification.
 
@@ -335,11 +355,15 @@ class CopilotEventTranslator:
                 or self._settled_generation == self._generation):
             return []
         open_tools = self._tools.keys() - self._completed_tools
-        if not isinstance(cancelled_tool_ids, frozenset) or cancelled_tool_ids - open_tools:
+        if (not isinstance(cancelled_tool_ids, frozenset)
+                or not isinstance(cancelled_permission_tool_ids, frozenset)):
+            raise ValueError("Invalid Copilot tool stop evidence")
+        stopped = cancelled_tool_ids | cancelled_permission_tool_ids
+        if stopped - open_tools or cancelled_tool_ids & cancelled_permission_tool_ids:
             raise ValueError("Cancellation proof must identify known open Copilot tools")
-        if self._early_results or open_tools - cancelled_tool_ids:
+        if self._early_results or open_tools - stopped:
             return []
-        events = self.reconcile_cancelled_tools(cancelled_tool_ids)
+        events = self.reconcile_stopped_tools(cancelled_tool_ids, cancelled_permission_tool_ids)
         self._idle_id = None
         self._interrupt_boundary = None
         self._settled_generation = self._generation

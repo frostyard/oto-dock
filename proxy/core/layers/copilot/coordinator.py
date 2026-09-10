@@ -64,6 +64,10 @@ class SettlementObservation:
     history_preserved: bool | None = None
     pending_messages: frozenset[str] | None = None
     cancelled_tool_ids: frozenset[str] = frozenset()
+    # Exact native permission.requested -> permission.completed(kind=cancelled)
+    # correlation. Valid only with a matching accepted control and settlement;
+    # never inferred from host waiter cancellation or a returned reject decision.
+    cancelled_permission_tool_ids: frozenset[str] = frozenset()
 
     def is_settled(self) -> bool:
         if (self.processing is not False or not isinstance(self.tasks, tuple)
@@ -322,11 +326,13 @@ class CopilotTurnCoordinator:
                 or not self._stream_intact or checkpoint != self.begin_reconciliation()
                 or not observation.is_settled()):
             return []
-        if observation.cancelled_tool_ids:
-            if (self._abort_ticket is None or self._abort_state == AbortState.REJECTED
+        if observation.cancelled_tool_ids or observation.cancelled_permission_tool_ids:
+            if (self._abort_ticket is None or self._abort_state != AbortState.ACKNOWLEDGED
                     or not self._idle_aborted or self._idle_abort_ticket != self._abort_ticket):
                 return []
-        events = self._translator.reconcile_cancelled_tools(observation.cancelled_tool_ids)
+        events = self._translator.reconcile_stopped_tools(
+            observation.cancelled_tool_ids, observation.cancelled_permission_tool_ids,
+        )
         events.extend(self._translator.settle_idle(checkpoint.event_id, background_settled=True))
         completed = any(event.type == DONE for event in events)
         if completed:
@@ -438,10 +444,12 @@ class CopilotTurnCoordinator:
         first_tasks = {(task.task_id, task.state) for task in first.tasks}
         second_tasks = {(task.task_id, task.state) for task in second.tasks}
         if (first_tasks != second_tasks
-                or first.cancelled_tool_ids != second.cancelled_tool_ids):
+                or first.cancelled_tool_ids != second.cancelled_tool_ids
+                or first.cancelled_permission_tool_ids != second.cancelled_permission_tool_ids):
             return []
         events = self._translator.reconcile_interrupted(
             checkpoint.boundary, cancelled_tool_ids=second.cancelled_tool_ids,
+            cancelled_permission_tool_ids=second.cancelled_permission_tool_ids,
         )
         if any(event.type == DONE for event in events):
             self._turn_open = False

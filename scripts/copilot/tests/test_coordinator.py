@@ -308,7 +308,8 @@ class CoordinatorTests(unittest.TestCase):
     def test_mismatched_cancellation_batch_does_not_clear_known_tool(self):
         self.start()
         self.receive("tool.execution_start", {"toolCallId": "tool", "toolName": "hold"})
-        self.coordinator.request_abort()
+        ticket = self.coordinator.request_abort()
+        self.coordinator.acknowledge_abort(ticket, accepted=True)
         checkpoint = self.idle(aborted=True)
         invalid = replace(SETTLED, cancelled_tool_ids=frozenset({"tool", "unknown"}))
         with self.assertRaises(ValueError):
