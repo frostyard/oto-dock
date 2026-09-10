@@ -7,10 +7,38 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "proxy"))
 
-from core.layers.copilot.callbacks import CallbackExecutionError, CallbackRegistry, DuplicateCallbackError
+from core.layers.copilot.callbacks import (
+    CallbackAdmissionError, CallbackExecutionError, CallbackRegistry, DuplicateCallbackError,
+)
 
 
 class CallbackRegistryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pause_rejects_factory_and_refused_id_cannot_replay_after_resume(self):
+        registry = CallbackRegistry(lambda: None)
+        calls = []
+
+        async def callback():
+            calls.append("performed")
+
+        registry.pause_admissions()
+        with self.assertRaises(CallbackAdmissionError):
+            await registry.run("old-turn", callback)
+        registry.resume_admissions()
+        with self.assertRaises(DuplicateCallbackError):
+            await registry.run("old-turn", callback)
+        await registry.run("new-turn", callback)
+        self.assertEqual(calls, ["performed"])
+
+    async def test_permanent_close_cannot_resume_or_invoke_factory(self):
+        registry = CallbackRegistry(lambda: None)
+        registry.close_admissions()
+        registry.close_admissions()
+        with self.assertRaises(CallbackAdmissionError):
+            registry.resume_admissions()
+        with self.assertRaises(CallbackAdmissionError):
+            await registry.run("closed", lambda: self.fail("Factory ran after close"))
+        self.assertEqual(registry.pending_ids, frozenset())
+
     async def test_success_and_invalidation_before_mutations(self):
         snapshots = []
         registry = CallbackRegistry(lambda: snapshots.append(registry.pending_ids))

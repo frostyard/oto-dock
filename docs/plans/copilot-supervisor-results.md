@@ -35,7 +35,12 @@ keep owned inference running past timeout. Invalid frames, queue overflow and
 uncertain acknowledgements start cleanup even when no consumer is draining
 events. Repeated caller cancellation cannot cancel shared cleanup. After an
 accepted stop/interrupt, new steering must wait for settlement; it cannot erase
-the control proof needed to resolve an interrupted tool.
+the control proof needed to resolve an interrupted tool. Callback admission is
+paused before accepted-control cancellation and reopens only for the next
+settled independent stream. Shutdown closes admission permanently before taking
+its cancellation snapshot, so a late SDK request cannot start host work while
+disconnect or runtime cleanup is awaiting completion. Refused callback IDs
+remain consumed and cannot execute if replayed after reopening.
 
 ## Interrupt completion without a new native idle
 
@@ -91,7 +96,7 @@ three-turn run passed in 43.994 seconds:
 | Session shutdown | No owned runtime processes or callbacks remain; no SIGKILL required. |
 | Multiple user inputs | Model iteration IDs reused across all three inputs without suppressing the later turn boundaries. |
 
-The complete offline Copilot suite passes 215 tests plus 67 subtests. Regression
+The complete offline Copilot suite passes 218 tests plus 67 subtests. Regression
 coverage includes stale observations, rejected controls, repeated
 cancellation, paused consumers, deadline expiry, bounded queues, unknown request
 state, exact process ownership and startup/shutdown failures. Full repository CI

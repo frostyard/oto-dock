@@ -15,6 +15,12 @@ asyncio task for each SDK-hosted tool call. Its API is:
 - `await run(tool_call_id, async_factory)`: reserves an ID once, starts an owned
   task, and shields it from cancellation of the SDK's waiter. Reusing an ID
   always fails before invoking the factory, including after completion/error.
+- `pause_admissions()` / `resume_admissions()`: reject new factories during an
+  accepted control and reopen only after the controlled turn settles. Refused
+  IDs remain consumed so replay cannot execute them after reopening.
+- `close_admissions()`: permanently stop new factories before shutdown takes its
+  cancellation snapshot. Later SDK requests cannot create host work during
+  disconnect/runtime cleanup.
 - `pending_ids`: immutable snapshot of callbacks still owned. Ownership remains
   until actual task settlement, even when the runtime reports idle or its own
   task list is empty.
@@ -68,7 +74,7 @@ tools, propagates through MCP servers, or handles remote workers.
 
 ## Verification and reproduction
 
-Ten offline tests plus seven parameterized subtests pass. They cover actual
+Twelve offline tests plus seven parameterized subtests pass. They cover actual
 asyncio task ownership, SDK-waiter cancellation, resistant callbacks and
 deadline behavior, late cancellation proof, cancellation of the shutdown waiter,
 duplicate-ID suppression, sanitized failures, and invalidation ordering.

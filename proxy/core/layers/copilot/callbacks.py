@@ -19,6 +19,10 @@ class DuplicateCallbackError(ValueError):
     """A tool call ID has already been consumed by this session registry."""
 
 
+class CallbackAdmissionError(RuntimeError):
+    """Callback execution is suspended or the session is permanently closed."""
+
+
 class CallbackExecutionError(RuntimeError):
     """Sanitized callback failure; never includes the original exception message."""
 
@@ -43,6 +47,28 @@ class CallbackRegistry:
         self._seen: set[str] = set()
         self._cancel_requested: set[str] = set()
         self._cancelled: set[str] = set()
+        self._paused = False
+        self._closed = False
+
+    def pause_admissions(self) -> None:
+        """Stop new factories before taking a cancellation snapshot."""
+        if not self._paused:
+            self._on_change()
+            self._paused = True
+
+    def resume_admissions(self) -> None:
+        """Resume only after the controlled turn has authoritatively settled."""
+        if self._closed:
+            raise CallbackAdmissionError("Copilot callback registry is closed")
+        if self._paused:
+            self._on_change()
+            self._paused = False
+
+    def close_admissions(self) -> None:
+        """Permanently reject new work; synchronous with shutdown admission."""
+        if not self._closed:
+            self._on_change()
+            self._closed = True
 
     @property
     def pending_ids(self) -> frozenset[str]:
@@ -55,6 +81,12 @@ class CallbackRegistry:
             raise ValueError("A nonempty tool call ID is required")
         if tool_call_id in self._seen:
             raise DuplicateCallbackError("Tool call ID already consumed")
+        if self._closed or self._paused:
+            # Consume refused IDs too: replay after reopening must not execute
+            # an action that belonged to the controlled, already settled turn.
+            self._on_change()
+            self._seen.add(tool_call_id)
+            raise CallbackAdmissionError("Copilot callback execution is unavailable")
         self._on_change()
         self._seen.add(tool_call_id)
         task = asyncio.create_task(self._invoke(factory), name="copilot-owned-callback")

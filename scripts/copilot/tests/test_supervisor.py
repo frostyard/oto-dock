@@ -12,6 +12,7 @@ from core.layers.copilot.supervisor import (  # noqa: E402
     CopilotSessionSupervisor, RuntimeSnapshot, SessionSupervisorError,
 )
 from core.layers.copilot.coordinator import TaskObservation, TaskState  # noqa: E402
+from core.layers.copilot.callbacks import CallbackAdmissionError  # noqa: E402
 
 EMPTY = RuntimeSnapshot(False, (), frozenset(), frozenset())
 
@@ -262,6 +263,30 @@ async def test_close_stops_runtime_even_if_disconnect_raises_private_error():
     with pytest.raises(SessionSupervisorError, match="cleanup is incomplete"):
         await supervisor.close()
     assert closed == [True]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_rejects_callback_arriving_after_cancellation_snapshot():
+    supervisor, backend, closed = make()
+    invoked = []
+    rejected = []
+
+    async def callback():
+        invoked.append(True)
+        await asyncio.Event().wait()
+
+    async def disconnect():
+        # An SDK request handler can arrive while disconnect awaits its ACK,
+        # after the supervisor has already drained the cancellation snapshot.
+        try:
+            await supervisor.callbacks.run("late-during-disconnect", callback)
+        except CallbackAdmissionError:
+            rejected.append(True)
+
+    backend.disconnect = disconnect
+    await supervisor.close()
+    assert rejected == [True] and invoked == []
+    assert not supervisor.callbacks.pending_ids and closed == [True]
 
 
 @pytest.mark.asyncio
@@ -532,6 +557,8 @@ async def test_accepted_control_blocks_steering_and_repeated_control_until_settl
     try:
         assert (await getattr(supervisor, control)()).accepted
         await asyncio.wait_for(snapshot_entered.wait(), 1)
+        with pytest.raises(CallbackAdmissionError):
+            await supervisor.callbacks.run("late-controlled-turn", lambda: pytest.fail("Late callback ran"))
         with pytest.raises(SessionSupervisorError, match="control awaiting settlement"):
             await supervisor.steer("would erase control proof")
         for repeated in (supervisor.abort, supervisor.interrupt):

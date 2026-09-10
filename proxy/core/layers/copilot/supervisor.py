@@ -250,6 +250,7 @@ class CopilotSessionSupervisor:
         if self._active:
             raise SessionSupervisorError("A Copilot stream already owns this session")
         self._check()
+        self.callbacks.resume_admissions()
         self._active = True
         self._stream_generation += 1
         self._finishing = False
@@ -334,6 +335,7 @@ class CopilotSessionSupervisor:
                     # A new submission would discard the coordinator's control
                     # ticket before it can settle cancelled, still-open tools.
                     self._control_awaiting_settlement = True
+                    self.callbacks.pause_admissions()
                     self._cancelled_tools = await self.callbacks.cancel_all(timeout=self._rpc_timeout)
                 return ControlAcknowledgement(accepted, not self.callbacks.pending_ids)
             except asyncio.CancelledError:
@@ -375,6 +377,7 @@ class CopilotSessionSupervisor:
 
     def _begin_close(self) -> asyncio.Task:
         self._cancel_deadline()
+        self.callbacks.close_admissions()
         if self._close_task is None:
             self._close_task = asyncio.create_task(self._close())
             self._close_task.add_done_callback(self._observe_close_result)
