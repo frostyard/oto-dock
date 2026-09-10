@@ -256,3 +256,248 @@ async def test_store_backed_guard_pins_generation_and_observes_owner_revocation(
             _ = guard.credential
     finally:
         await guard.close()
+
+
+def connect(owner="user-admin", principal="github:user:123", **kwargs):
+    return store.connect_user_account(owner, principal, TOKEN, time.time() + 3600, **kwargs)
+
+
+def test_managed_projection_is_allowlisted_and_expired_accounts_remain_visible(monkeypatch):
+    row = connect(label="Personal GitHub")
+    expected = {"id", "label", "principal_id", "revision", "status", "use_personal",
+                "contribute_platform", "expires_at", "auth_kind"}
+    assert set(row) == expected
+    assert row["use_personal"] is True and row["contribute_platform"] is False
+    assert TOKEN not in repr(row)
+    assert row["auth_kind"] == "user_token"
+    monkeypatch.setattr(store.time, "time", lambda: row["expires_at"] + 1)
+    assert store.get_owned_account(row["id"], "user-admin") == row
+    assert store.list_owned_accounts("user-admin") == [row]
+    denied(row["id"], Scope.personal("user-admin"))
+
+
+@pytest.mark.parametrize("operation", ["get", "update", "delete", "replace"])
+def test_management_cannot_access_another_owners_account(operation):
+    row = connect()
+    with pytest.raises(store.CopilotAccountNotFoundError):
+        if operation == "get":
+            store.get_owned_account(row["id"], "user-viewer")
+        elif operation == "update":
+            store.update_owned_account(row["id"], "user-viewer", status="disabled")
+        elif operation == "delete":
+            store.delete_owned_account(row["id"], "user-viewer")
+        else:
+            connect("user-viewer", account_id=row["id"], expected_revision=row["revision"])
+    assert store.get_owned_account(row["id"], "user-admin") == row
+    assert store.list_owned_accounts("user-viewer") == []
+
+
+@pytest.mark.parametrize("field", ["layer", "provider", "auth_type"])
+def test_management_rejects_other_engine_rows_even_if_owned(field):
+    row = connect()
+    with get_conn() as conn:
+        conn.execute(f"UPDATE execution_layer_subscriptions SET {field} = %s WHERE id = %s",
+                     ("other", row["id"]))
+        conn.commit()
+    assert store.list_owned_accounts("user-admin") == []
+    for operation in [store.get_owned_account, store.update_owned_account, store.delete_owned_account]:
+        with pytest.raises(store.CopilotAccountNotFoundError):
+            operation(row["id"], "user-admin")
+
+
+def test_duplicate_connect_requires_explicit_replacement_even_when_disabled():
+    row = connect()
+    store.update_owned_account(row["id"], "user-admin", status="disabled")
+    with pytest.raises(store.CopilotAccountConflictError) as failure:
+        connect()
+    assert failure.value.__context__ is None
+    assert TOKEN not in str(failure.value)
+    assert len(store.list_owned_accounts("user-admin")) == 1
+    assert raw(row["id"])["status"] == "disabled"
+
+
+def test_concurrent_connects_create_one_account_without_implicit_replacement():
+    barrier = threading.Barrier(2)
+
+    def contender():
+        barrier.wait(timeout=5)
+        try:
+            return connect()
+        except store.CopilotAccountConflictError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: contender(), range(2)))
+    winners = [result for result in results if result is not None]
+    assert len(winners) == 1
+    assert store.list_owned_accounts("user-admin") == winners
+
+
+def test_verified_replacement_preserves_flags_and_disabled_status_and_uses_cas():
+    row = connect()
+    store.update_owned_account(row["id"], "user-admin", status="disabled",
+                               use_personal=False, contribute_platform=True)
+    refreshed = store.connect_user_account(
+        "user-admin", "github:user:123", "ghu_reconnect_fixture", time.time() + 7200,
+        label="Reconnected", account_id=row["id"], expected_revision=row["revision"],
+    )
+    assert refreshed["id"] == row["id"] and refreshed["revision"] != row["revision"]
+    assert refreshed["status"] == "disabled" and refreshed["use_personal"] is False
+    assert refreshed["contribute_platform"] is True and refreshed["label"] == "Reconnected"
+    with pytest.raises(store.CopilotAccountConflictError):
+        connect(account_id=row["id"], expected_revision=row["revision"])
+    with pytest.raises(store.CopilotAccountConflictError):
+        connect(principal="github:user:999", account_id=row["id"], expected_revision=refreshed["revision"])
+    assert store.get_owned_account(row["id"], "user-admin") == refreshed
+
+
+def test_reconnect_preserves_custom_label_unless_explicit_label_is_supplied():
+    row = connect(label="Frostyard payer")
+    refreshed = connect(account_id=row["id"], expected_revision=row["revision"])
+    assert refreshed["label"] == "Frostyard payer"
+    cleared = connect(account_id=row["id"], expected_revision=refreshed["revision"], label="")
+    assert cleared["label"] == ""
+
+
+def test_concurrent_explicit_replacements_only_one_wins():
+    row = connect()
+    barrier = threading.Barrier(2)
+
+    def contender():
+        barrier.wait(timeout=5)
+        try:
+            return connect(account_id=row["id"], expected_revision=row["revision"])
+        except store.CopilotAccountConflictError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: contender(), range(2)))
+    winners = [result for result in results if result is not None]
+    assert len(winners) == 1
+    assert store.get_owned_account(row["id"], "user-admin") == winners[0]
+
+
+def test_replace_deleted_target_never_creates_ghost_account():
+    row = connect()
+    assert store.delete_owned_account(row["id"], "user-admin") is True
+    with pytest.raises(store.CopilotAccountNotFoundError):
+        connect(account_id=row["id"], expected_revision=row["revision"])
+    assert store.list_owned_accounts("user-admin") == []
+    with pytest.raises(store.CopilotAccountNotFoundError):
+        store.delete_owned_account(row["id"], "user-admin")
+
+
+def test_delete_racing_explicit_replace_never_recreates_deleted_identity():
+    row = connect()
+    barrier = threading.Barrier(2)
+
+    def delete():
+        barrier.wait(timeout=5)
+        return store.delete_owned_account(row["id"], "user-admin")
+
+    def refresh():
+        barrier.wait(timeout=5)
+        try:
+            return connect(account_id=row["id"], expected_revision=row["revision"])
+        except store.CopilotAccountNotFoundError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        deleting = executor.submit(delete)
+        refreshing = executor.submit(refresh)
+        assert deleting.result(timeout=10) is True
+        result = refreshing.result(timeout=10)
+    assert result is None or result["id"] == row["id"]
+    assert store.list_owned_accounts("user-admin") == []
+
+
+def test_current_admin_is_required_to_enable_shared_payer():
+    row = connect()
+    store.update_owned_account(row["id"], "user-admin", contribute_platform=True)
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET role = 'member' WHERE sub = 'user-admin'")
+        conn.commit()
+    with pytest.raises(store.CopilotAccountInvalidError):
+        store.update_owned_account(row["id"], "user-admin", contribute_platform=True)
+    updated = store.update_owned_account(row["id"], "user-admin", contribute_platform=False,
+                                         use_personal=False, label="Private", status="disabled")
+    assert updated["contribute_platform"] is False and updated["use_personal"] is False
+    assert updated["label"] == "Private" and updated["status"] == "disabled"
+
+
+@pytest.mark.parametrize("changes", [
+    {"label": "bad\nlabel"}, {"label": "x" * 201}, {"label": 3},
+    {"use_personal": 1}, {"contribute_platform": "true"}, {"status": "invented"},
+])
+def test_management_validation_is_typed_and_atomic(changes):
+    row = connect()
+    with pytest.raises(store.CopilotAccountInvalidError):
+        store.update_owned_account(row["id"], "user-admin", **changes)
+    assert store.get_owned_account(row["id"], "user-admin") == row
+
+
+@pytest.mark.parametrize("changes", [
+    {"principal_id": "github:user:0"}, {"principal_id": "github:installation:7"},
+    {"token": "ghs_installation_fixture"}, {"expires_at": 0},
+    {"account_id": "target"}, {"expected_revision": "revision"},
+])
+def test_connect_rejects_invalid_or_ambiguous_input(changes):
+    args = dict(owner_sub="user-admin", principal_id="github:user:123", token=TOKEN,
+                expires_at=time.time() + 3600)
+    args.update(changes)
+    with pytest.raises(store.CopilotAccountInvalidError):
+        store.connect_user_account(**args)
+    assert store.list_owned_accounts("user-admin") == []
+
+
+def test_user_connect_cannot_overwrite_installation_identity():
+    row = store.create_account("user-admin", "github:user:123", Kind.INSTALLATION_TOKEN,
+                               "ghs_fixture", time.time() + 3600)
+    managed = store.get_owned_account(row["id"], "user-admin")
+    with pytest.raises(store.CopilotAccountConflictError):
+        connect(account_id=row["id"], expected_revision=managed["revision"])
+    assert store.get_owned_account(row["id"], "user-admin") == managed
+
+
+def test_owner_can_remove_malformed_account_without_decrypting_it():
+    row = connect()
+    with get_conn() as conn:
+        conn.execute("UPDATE execution_layer_subscriptions SET credential_data_enc = %s WHERE id = %s",
+                     ("malformed", row["id"]))
+        conn.commit()
+    assert store.delete_owned_account(row["id"], "user-admin") is True
+    assert store.list_owned_accounts("user-admin") == []
+
+
+@pytest.mark.parametrize("operation", [
+    lambda: store.list_owned_accounts("user-admin"),
+    lambda: store.get_owned_account("account", "user-admin"),
+    lambda: store.update_owned_account("account", "user-admin", status="disabled"),
+    lambda: store.delete_owned_account("account", "user-admin"),
+    connect,
+])
+def test_management_database_errors_never_expose_parameters_or_exception_context(monkeypatch, operation):
+    def unavailable():
+        raise RuntimeError(TOKEN)
+
+    monkeypatch.setattr(store, "get_conn", unavailable)
+    with pytest.raises(CredentialUnavailableError) as error:
+        operation()
+    assert type(error.value) is CredentialUnavailableError
+    assert error.value.__context__ is None and TOKEN not in str(error.value)
+
+
+def test_invalid_management_input_fails_before_opening_database(monkeypatch):
+    def unexpected():
+        pytest.fail("invalid request opened a database connection")
+
+    monkeypatch.setattr(store, "get_conn", unexpected)
+    for operation in [
+        lambda: store.list_owned_accounts(""),
+        lambda: store.connect_user_account("user-admin", "github:user:1", "ghs_wrongkind", None),
+        lambda: store.update_owned_account("account", "user-admin", label="bad\nlabel"),
+        lambda: store.update_owned_account("account", "user-admin", contribute_platform="true"),
+    ]:
+        with pytest.raises(store.CopilotAccountInvalidError) as error:
+            operation()
+        assert error.value.__context__ is None

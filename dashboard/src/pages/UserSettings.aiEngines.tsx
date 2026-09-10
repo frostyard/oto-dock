@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import { fetchCurrentUser } from '../api/auth'
 import { setNativeAuthInProgress } from '../lib/nativeBridge'
+import { CopilotAccountsPreview } from './UserSettings.copilotAccounts'
 import {
   useUserExecutionLayers,
   useUserDeleteSubscription,
@@ -435,23 +436,20 @@ function UserLayerCard({ layer }: { layer: UserLayerInfo }) {
 export function ExecutionLayersSection() {
   const { data: layers, isLoading } = useUserExecutionLayers()
 
-  if (isLoading) return null
-  if (!layers || layers.length === 0) return null
-
   // Only show layers that support OAuth (claude-code-cli for now)
-  const oauthLayers = layers.filter(l => l.name === 'claude-code-cli' || l.name === 'codex-cli')
-  if (oauthLayers.length === 0) return null
+  const oauthLayers = isLoading ? [] : (layers ?? []).filter(l => l.name === 'claude-code-cli' || l.name === 'codex-cli')
 
   return (
     <div className="mb-8">
       <h2 className="text-lg font-medium text-p-text mb-3">AI Engines</h2>
       <p className="text-sm text-p-text-secondary mb-4">
-        Connect your subscriptions. They’ll be used to run your own chats and agents.
+        Connect your supported subscriptions for chats and agents. Preview account setup is listed separately below.
       </p>
       <div className="space-y-3">
         {oauthLayers.map(layer => (
           <UserLayerCard key={layer.name} layer={layer} />
         ))}
+        <CopilotAccountsPreview />
       </div>
     </div>
   )
