@@ -4,6 +4,26 @@ These are development probes for C1 of the
 [parity plan](../../docs/plans/copilot-parity.md). They do not register an engine,
 change an OtoDock installation, or establish full parity.
 
+## Owned permission callbacks
+
+With the proxy dependencies and pinned SDK installed, run the bounded Linux
+sandbox permission probe:
+
+```bash
+python scripts/copilot/permission_probe.py \
+  --runtime-dir /tmp/otodock-copilot-runtime/prebuilds/linux-x64 \
+  --live --use-gh-token --output /tmp/copilot-permission-results.json
+```
+
+It submits three short turns using one inert trusted Python fixture: reject,
+approve once, and abort while approval is held. The policy answers are controlled
+fixtures; no dashboard user is impersonated. Host Python callbacks run outside
+bubblewrap and must be trusted. The probe verifies native request retirement,
+owned callback cleanup and exactly one turn completion, with a 150-second overall
+deadline and the runtime's minimum 30-credit session ceiling. See
+[permission results](../../docs/plans/copilot-permission-results.md) for the
+scope and remaining every-tool policy gate.
+
 ## Isolated SDK environment
 
 Use Python 3.13 for the recorded environment. The dependency lock includes the

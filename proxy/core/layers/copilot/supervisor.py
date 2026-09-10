@@ -17,6 +17,8 @@ import uuid
 
 from core.events.common_events import CommonEvent, DONE, TOOL_RESULT
 from core.layers.copilot.callbacks import CallbackRegistry
+from core.layers.copilot.requests import CopilotRequestRegistry
+from core.layers.copilot.permission_events import CopilotPermissionEvents
 from core.layers.copilot.coordinator import (
     CopilotTurnCoordinator, SettlementObservation, TaskObservation,
 )
@@ -64,6 +66,7 @@ class CopilotSessionSupervisor:
         self.coordinator = CopilotTurnCoordinator()
         self._changed = asyncio.Event()
         self.callbacks = CallbackRegistry(on_change=self.invalidate_observation)
+        self.requests = CopilotRequestRegistry(on_change=self.invalidate_observation)
         self._pending_requests = pending_requests
         self._close_runtime = close_runtime
         self._authorize_submission = authorize_submission
@@ -75,6 +78,9 @@ class CopilotSessionSupervisor:
         self._sequence = 0
         self._delivered: set[str] = set()
         self._pending_inputs: set[str] = set()
+        self._pending_user_inputs: set[str] = set()
+        self._completed_user_inputs: set[str] = set()
+        self._permission_events = CopilotPermissionEvents()
         self._open_tools: set[str] = set()
         self._cancelled_tools: frozenset[str] = frozenset()
         self._interrupt_ticket = None
@@ -124,6 +130,7 @@ class CopilotSessionSupervisor:
                 # A pause on a preceding tool result must not admit new work.
                 self._finishing = True
                 self._cancel_deadline()
+                self.requests.pause_admissions()
             if event.type == TOOL_RESULT:
                 self._open_tools.discard(event.data.get("tool_id"))
             self._events.append(event)
@@ -138,10 +145,20 @@ class CopilotSessionSupervisor:
             self._sequence += 1
             translated = self.coordinator.receive_event(self._sequence, raw)
             kind, data = raw["type"], raw["data"]
+            self._permission_events.observe(kind, data)
             if kind == "user.message" and isinstance(data.get("messageId"), str):
                 message_id = data["messageId"]
                 self._delivered.add(message_id)
                 self._pending_inputs.discard(message_id)
+            if kind in ("user_input.requested", "user_input.completed"):
+                request_id = data.get("requestId")
+                if not isinstance(request_id, str) or not request_id:
+                    raise ValueError("Invalid Copilot user input identity")
+                if kind == "user_input.completed":
+                    self._completed_user_inputs.add(request_id)
+                    self._pending_user_inputs.discard(request_id)
+                elif request_id not in self._completed_user_inputs:
+                    self._pending_user_inputs.add(request_id)
             if kind == "tool.execution_start":
                 # Translated starts exclude replays and child-owned tools.
                 for output in translated:
@@ -233,15 +250,20 @@ class CopilotSessionSupervisor:
                 or any(not isinstance(identity, str) or not identity for identity in identities)
             ):
                 raise ValueError("Invalid Copilot pending request inventory")
-        permissions = (native.pending_permissions | requests
+        permissions = (native.pending_permissions | requests | self.requests.pending_ids
                        if native.pending_permissions is not None and requests is not None else None)
-        messages = (native.pending_messages | frozenset(self._pending_inputs)
+        # A question's host handler can return before its native reply is
+        # acknowledged (or fail without replying). Keep the event request ID
+        # pending until native completion; host callback join is not that proof.
+        messages = (native.pending_messages | frozenset(self._pending_inputs) | frozenset(self._pending_user_inputs)
                     if native.pending_messages is not None else None)
         return SettlementObservation(
             processing=native.processing, tasks=native.tasks,
             pending_permissions=permissions, pending_messages=messages,
             pending_tools=self.callbacks.pending_ids,
             cancelled_tool_ids=self._cancelled_tools & self._open_tools,
+            cancelled_permission_tool_ids=(self._permission_events.cancelled_tool_ids
+                                          & self._open_tools - self._cancelled_tools),
         )
 
     async def _reconcile(self) -> None:
@@ -278,6 +300,7 @@ class CopilotSessionSupervisor:
             raise SessionSupervisorError("A Copilot stream already owns this session")
         self._check()
         self.callbacks.resume_admissions()
+        self.requests.resume_admissions()
         self._active = True
         self._stream_generation += 1
         self._finishing = False
@@ -343,6 +366,9 @@ class CopilotSessionSupervisor:
                 raise SessionSupervisorError("Copilot control awaiting settlement; new control was not submitted")
             self._control_pending = True
             self.invalidate_observation()
+            # Invalidate answers before the control RPC: a dashboard response
+            # arriving while abort/interrupt is in flight must not approve work.
+            self.requests.pause_admissions()
             try:
                 if interrupt:
                     ticket = self.coordinator.request_interrupt()
@@ -363,8 +389,15 @@ class CopilotSessionSupervisor:
                     # ticket before it can settle cancelled, still-open tools.
                     self._control_awaiting_settlement = True
                     self.callbacks.pause_admissions()
-                    self._cancelled_tools = await self.callbacks.cancel_all(timeout=self._rpc_timeout)
-                return ControlAcknowledgement(accepted, not self.callbacks.pending_ids)
+                    self._cancelled_tools, _ = await asyncio.gather(
+                        self.callbacks.cancel_all(timeout=self._rpc_timeout),
+                        self.requests.cancel_all(timeout=self._rpc_timeout),
+                    )
+                else:
+                    self.requests.resume_admissions()
+                return ControlAcknowledgement(
+                    accepted, not self.callbacks.pending_ids and not self.requests.pending_ids,
+                )
             except asyncio.CancelledError:
                 self._fail("Copilot control outcome is uncertain")
                 raise
@@ -388,7 +421,10 @@ class CopilotSessionSupervisor:
         self._changed.set()
         failed = False
         try:
-            await self.callbacks.cancel_all(timeout=self._rpc_timeout)
+            await asyncio.gather(
+                self.callbacks.cancel_all(timeout=self._rpc_timeout),
+                self.requests.cancel_all(timeout=self._rpc_timeout),
+            )
             if self._backend is not None:
                 async with asyncio.timeout(self._rpc_timeout):
                     await self._backend.disconnect()
@@ -399,12 +435,13 @@ class CopilotSessionSupervisor:
                 await self._close_runtime()
             except Exception:
                 failed = True
-        if failed or self.callbacks.pending_ids:
+        if failed or self.callbacks.pending_ids or self.requests.pending_ids:
             raise SessionSupervisorError("Copilot session cleanup is incomplete")
 
     def _begin_close(self) -> asyncio.Task:
         self._cancel_deadline()
         self.callbacks.close_admissions()
+        self.requests.close_admissions()
         if self._close_task is None:
             self._close_task = asyncio.create_task(self._close())
             self._close_task.add_done_callback(self._observe_close_result)
