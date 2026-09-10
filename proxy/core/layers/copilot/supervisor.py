@@ -103,6 +103,11 @@ class CopilotSessionSupervisor:
             raise SessionSupervisorError("Copilot session is already bound or closed")
         self._backend = backend
 
+    @property
+    def failure_detected(self) -> bool:
+        """Sticky failure state, retained after close for durable resume decisions."""
+        return self._failure is not None
+
     def invalidate_observation(self) -> None:
         """Also call this before changing externally owned permission/question state."""
         self.coordinator.invalidate_observation()

@@ -4,6 +4,28 @@ These are development probes for C1 of the
 [parity plan](../../docs/plans/copilot-parity.md). They do not register an engine,
 change an OtoDock installation, or establish full parity.
 
+## Account-bound local sessions
+
+`local_session_probe.py` exercises the composed session factory, durable writer
+records, actual platform security registration and two sequential sandbox runtimes:
+
+```bash
+python scripts/copilot/local_session_probe.py \
+  --runtime-dir /tmp/otodock-copilot-runtime/prebuilds/linux-x64 \
+  --live --use-gh-token --output /tmp/copilot-local-session.json
+```
+
+The two short no-tool turns create and recall a private history marker across a
+clean close and resume with a new credential revision. The probe also rejects a
+concurrent writer and a changed model profile, then revokes the controlled lease
+while idle and verifies that uncertain history cannot resume. It uses the real
+lease guard over an in-memory scoped credential fixture and the current GitHub
+CLI token; it does not exercise PostgreSQL, real OAuth refresh or dashboard entry
+points. Each turn has a 60-second deadline, the overall deadline is 180 seconds,
+and each session has the runtime's minimum 30-credit ceiling. See the
+[results](../../docs/plans/copilot-local-session-results.md) and
+[caller contract](../../docs/plans/copilot-local-session-contract.md).
+
 ## Native tool policy
 
 With proxy dependencies and the pinned SDK installed, run the deterministic

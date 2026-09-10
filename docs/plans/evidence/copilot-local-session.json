@@ -1,0 +1,35 @@
+{
+  "result": "passed",
+  "sdk_version": "1.0.13",
+  "runtime_version": "1.0.83",
+  "live_turn_limit": 2,
+  "sandboxed": true,
+  "credential_store": "controlled scoped fixture",
+  "platform_authority": "actual registered SecurityContext",
+  "oauth_refresh": false,
+  "concurrent_writer_rejected_before_runtime": true,
+  "turns": [
+    {
+      "generation": 1,
+      "resumed": false,
+      "marker_present": true,
+      "done_count": 1,
+      "tool_events": 0
+    },
+    {
+      "generation": 2,
+      "resumed": true,
+      "marker_present": true,
+      "done_count": 1,
+      "tool_events": 0
+    }
+  ],
+  "profile_change_rejected_before_runtime": true,
+  "idle_credential_change_closed_runtime": true,
+  "uncertain_history_rejected_before_runtime": true,
+  "scoped_store_reads": 138,
+  "runtime_count": 2,
+  "normal_cleanup": true,
+  "all_credential_observers_closed": true,
+  "elapsed_seconds": 17.658
+}

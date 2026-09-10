@@ -239,7 +239,8 @@ class CopilotPermissionBridge:
 
 
 def bind_platform_authority(session_id: str, requests, *, working_directory: str,
-                            custom_tools=None, expected_sdk_session_id=None, question_timeout=604800.0):
+                            custom_tools=None, expected_sdk_session_id=None, question_timeout=604800.0,
+                            owner_valid=None):
     """Bind only a host-owned platform session ID; resolve live context and mode.
 
     Caller registers session state before spawn and releases waiters/cleans state
@@ -248,7 +249,7 @@ def bind_platform_authority(session_id: str, requests, *, working_directory: str
     from api.hooks.hooks import ask_user_question, decide_tool_permission, resolve_hook_route
     from core.session.session_state import get_session_security, get_session_mode, get_session_client_type
 
-    if not _text(session_id, 256):
+    if not _text(session_id, 256) or (owner_valid is not None and not callable(owner_valid)):
         raise ValueError("An explicit platform session is required")
 
     def snapshot():
@@ -261,21 +262,22 @@ def bind_platform_authority(session_id: str, requests, *, working_directory: str
                 route.queue_session_id, get_session_mode(route.parent_session_id) if route.is_meeting else None)
 
     def valid():
-        return get_session_security(session_id) is not None
+        return (get_session_security(session_id) is not None
+                and (owner_valid is None or owner_valid() is True))
 
     async def decide(name, args):
         before = snapshot()
-        if before[0] is None:
+        if before[0] is None or not valid():
             return {"decision": "deny"}
         result = await decide_tool_permission(session_id, name, args)
-        return result if snapshot() == before else {"decision": "deny"}
+        return result if valid() and snapshot() == before else {"decision": "deny"}
 
     async def ask(questions):
         before = snapshot()
-        if before[0] is None:
+        if before[0] is None or not valid():
             return {}
         result = await ask_user_question(session_id, questions, timeout=question_timeout)
-        return result if snapshot() == before else {}
+        return result if valid() and snapshot() == before else {}
 
     return CopilotPermissionBridge(
         requests, decide=decide, ask=ask, context_valid=valid, working_directory=working_directory,
