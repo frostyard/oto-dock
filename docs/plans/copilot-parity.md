@@ -1,7 +1,9 @@
 # GitHub Copilot execution engine: full parity plan
 
-Status: implementation started. C0 is complete; C1 is in progress. The engine is
-not registered or available to users yet.
+Status: implementation started. C0 is complete; C1 is in progress. An opt-in
+local chat preview is available in AI Engines settings for personal accounts.
+The engine remains unregistered in general chat/task routing; full parity is
+incomplete.
 
 Progress: [C0 baseline](copilot-ci-baseline.md),
 [C1 compatibility inventory](copilot-compatibility.md),
@@ -16,14 +18,17 @@ Progress: [C0 baseline](copilot-ci-baseline.md),
 [account-bound local session results](copilot-local-session-results.md), and
 [local ExecutionLayer results](copilot-execution-layer-results.md), and
 [shared lifecycle registry results](copilot-session-registry-results.md), and
-[local provisioning and configuration results](copilot-local-provisioning-results.md).
+[local provisioning and configuration results](copilot-local-provisioning-results.md), and
+[authenticated chat preview results](copilot-chat-preview-results.md)
+([setup and contract](copilot-chat-preview-contract.md)).
 
 Tracking issue: [Copilot: full Claude Code and Codex parity](https://github.com/frostyard/oto-dock/issues/1).
 
 Owner: Frostyard. Planning baseline: OtoDock 1.6.0, upstream commit
 `39af5ff79ed209e270a7fce4bd4141496f88c7f9`. Source and vendor documentation
 reviewed 2026-09-09. Reconcile this inventory when rebasing onto newer upstream
-releases. This document describes proposed behavior, not shipped capabilities.
+releases. The parity target below describes proposed behavior; linked progress
+reports distinguish implemented capabilities from remaining qualification gates.
 
 ## Outcome and completion rule
 

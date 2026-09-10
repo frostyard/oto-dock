@@ -3,6 +3,7 @@ import { useAuth } from '../contexts/AuthContext'
 import { fetchCurrentUser } from '../api/auth'
 import { setNativeAuthInProgress } from '../lib/nativeBridge'
 import { CopilotAccountsPreview } from './UserSettings.copilotAccounts'
+import { CopilotChatPreview } from './UserSettings.copilotChat'
 import {
   useUserExecutionLayers,
   useUserDeleteSubscription,
@@ -450,6 +451,7 @@ export function ExecutionLayersSection() {
           <UserLayerCard key={layer.name} layer={layer} />
         ))}
         <CopilotAccountsPreview />
+        <CopilotChatPreview />
       </div>
     </div>
   )

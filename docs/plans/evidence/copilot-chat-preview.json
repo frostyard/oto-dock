@@ -1,0 +1,45 @@
+{
+  "result": "passed",
+  "sdk_version": "1.0.13",
+  "runtime_version": "1.0.83",
+  "live_turn_limit": 3,
+  "flow_deadline_seconds": 240,
+  "actual_cookie_authentication": true,
+  "actual_http_sse": true,
+  "actual_authenticated_config_builder": true,
+  "actual_chat_service": true,
+  "actual_platform_permission_authority": true,
+  "postgresql": false,
+  "storage": "controlled user, agent and account read fixtures",
+  "cross_origin_start_denied": true,
+  "last_create_status": 201,
+  "other_admin_cannot_drive_session": true,
+  "turns": [
+    {
+      "turn": 1,
+      "completed": true,
+      "tool_events": 1,
+      "fixture_intact": true
+    },
+    {
+      "turn": 2,
+      "completed": true,
+      "tool_events": 0,
+      "fixture_intact": true
+    },
+    {
+      "turn": 3,
+      "first_text_received": true,
+      "disconnected": true
+    }
+  ],
+  "real_native_create_permission_approved_over_http": true,
+  "warm_followup_remembers_prior_turn": true,
+  "disconnect_closed_active_session": true,
+  "database_role_revocation_closed_idle_session": true,
+  "runtime_count": 2,
+  "normal_cleanup": true,
+  "all_claims_released": true,
+  "all_contexts_released": true,
+  "elapsed_seconds": 53.591
+}

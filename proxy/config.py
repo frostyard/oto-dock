@@ -231,6 +231,10 @@ SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 PORT = int(_cfg("PROXY_PORT", "8400"))
 HOST = _cfg("PROXY_HOST", "0.0.0.0")
 
+# Explicit opt-in preview; runtime assets are provisioned separately. Empty
+# keeps both its service and UI unavailable without requiring the Copilot SDK.
+COPILOT_LOCAL_ROOT = _cfg("OTODOCK_COPILOT_LOCAL_ROOT", "")
+
 # Authentication
 API_KEY = _cfg("PROXY_API_KEY")
 if not API_KEY:
