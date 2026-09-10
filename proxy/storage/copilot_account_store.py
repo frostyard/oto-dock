@@ -8,6 +8,7 @@ consumers must revalidate it before dispatch and while a runtime remains live.
 
 from functools import wraps
 import json
+import re
 import time
 import uuid
 
@@ -29,16 +30,39 @@ _SELECT = """SELECT s.*, u.role AS owner_role
              JOIN users u ON u.sub = s.owner_sub WHERE s.id = %s"""
 
 
+class CopilotAccountNotFoundError(CredentialUnavailableError):
+    """The requested account is not owned by the caller."""
+
+
+class CopilotAccountConflictError(CredentialUnavailableError):
+    """An explicit account/revision is required, or the supplied one is stale."""
+
+
+class CopilotAccountInvalidError(CredentialUnavailableError):
+    """Account management input does not satisfy the local contract."""
+
+
+_PUBLIC_ERRORS = {
+    CopilotAccountNotFoundError: "Copilot account was not found",
+    CopilotAccountConflictError: "Copilot account changed; select the account and current revision explicitly",
+    CopilotAccountInvalidError: "Invalid Copilot account request",
+    CredentialUnavailableError: "Copilot account credential is unavailable",
+}
+
+
 def _sanitized(operation):
     @wraps(operation)
     def call(*args, **kwargs):
+        error_type = CredentialUnavailableError
         try:
             return operation(*args, **kwargs)
+        except (CopilotAccountNotFoundError, CopilotAccountConflictError, CopilotAccountInvalidError) as error:
+            error_type = type(error)
         except Exception:
             # Database/JSON exceptions may contain credential parameters. Do
             # not chain them into a public error or retain them as its context.
             pass
-        raise CredentialUnavailableError("Copilot account credential is unavailable")
+        raise error_type(_PUBLIC_ERRORS[error_type])
     return call
 
 
@@ -154,3 +178,179 @@ def replace_credential(account_id, owner_sub, expected_revision, principal_id,
         )
         conn.commit()
         return credential
+
+
+def _validate_owner(owner_sub):
+    if not _identity(owner_sub):
+        raise CopilotAccountInvalidError()
+
+
+def _validate_label(label):
+    if not isinstance(label, str) or len(label) > 200 or (label and not label.isprintable()):
+        raise CopilotAccountInvalidError()
+
+
+def _lock_owner(conn, owner_sub):
+    # All managed writes for one owner take this lock before the account lock.
+    # This serializes duplicate connects and races with owner deletion/demotion.
+    owner = conn.execute("SELECT role FROM users WHERE sub = %s FOR UPDATE", (owner_sub,)).fetchone()
+    if not owner:
+        raise CopilotAccountNotFoundError()
+    return owner
+
+
+def _owned_row(conn, account_id, owner_sub, *, lock=False):
+    if not _identity(account_id):
+        raise CopilotAccountInvalidError()
+    row = conn.execute(
+        _SELECT + " AND s.owner_sub = %s AND s.layer = 'copilot-cli' AND s.provider = 'github'"
+        " AND s.auth_type IN ('copilot_user_token', 'copilot_installation_token')"
+        + (" FOR UPDATE OF s" if lock else ""), (account_id, owner_sub),
+    ).fetchone()
+    if not row:
+        raise CopilotAccountNotFoundError()
+    return row
+
+
+def _projection(row):
+    # Decode shape/identity without checking lifetime: expired accounts must
+    # remain visible so their owner can explicitly reconnect or remove them.
+    credential = _decode(row)
+    return {
+        "id": row["id"], "label": row["label"], "principal_id": credential.principal_id,
+        "revision": credential.revision, "auth_kind": credential.kind.value,
+        "status": row["status"], "use_personal": row["use_personal"],
+        "contribute_platform": row["contribute_platform"], "expires_at": credential.expires_at,
+    }
+
+
+@_sanitized
+def get_owned_account(account_id, owner_sub) -> dict:
+    _validate_owner(owner_sub)
+    with get_conn() as conn:
+        return _projection(_owned_row(conn, account_id, owner_sub))
+
+
+@_sanitized
+def list_owned_accounts(owner_sub) -> list[dict]:
+    _validate_owner(owner_sub)
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT s.* FROM execution_layer_subscriptions s
+               JOIN users u ON u.sub = s.owner_sub
+               WHERE s.owner_sub = %s AND s.layer = 'copilot-cli' AND s.provider = 'github'
+               AND s.auth_type IN ('copilot_user_token', 'copilot_installation_token')
+               ORDER BY s.created_at, s.id""", (owner_sub,),
+        ).fetchall()
+        return [_projection(row) for row in rows]
+
+
+@_sanitized
+def connect_user_account(owner_sub, principal_id, token, expires_at, label=None,
+                         account_id=None, expected_revision=None) -> dict:
+    """Persist a caller-verified GitHub user identity, without guessing a replacement.
+
+    Supplying an account ID always means replace that existing account. Missing
+    or deleted targets never fall through to creation; flags/status are retained.
+    """
+    _validate_owner(owner_sub)
+    if label is not None:
+        _validate_label(label)
+    if (not isinstance(principal_id, str)
+            or re.fullmatch(r"github:user:[1-9][0-9]*", principal_id) is None):
+        raise CopilotAccountInvalidError()
+    if (account_id is None) != (expected_revision is None):
+        raise CopilotAccountInvalidError()
+    if account_id is not None and (not _identity(account_id) or not _identity(expected_revision)):
+        raise CopilotAccountInvalidError()
+    invalid = False
+    try:
+        credential = CopilotCredential(
+            account_id=account_id if account_id is not None else str(uuid.uuid4()),
+            principal_id=principal_id, revision=str(uuid.uuid4()), kind=CredentialKind.USER_TOKEN,
+            token=token, expires_at=expires_at,
+        )
+        credential.ensure_usable(time.time())
+    except CredentialUnavailableError:
+        invalid = True
+    if invalid:
+        raise CopilotAccountInvalidError()
+    with get_conn() as conn:
+        _lock_owner(conn, owner_sub)
+        if account_id is not None:
+            row = _owned_row(conn, account_id, owner_sub, lock=True)
+            old = _decode(row)
+            if (old.kind is not CredentialKind.USER_TOKEN or old.principal_id != principal_id
+                    or old.revision != expected_revision):
+                raise CopilotAccountConflictError()
+            row = conn.execute(
+                """UPDATE execution_layer_subscriptions SET credential_data_enc = %s,
+                   label = %s, updated_at = %s WHERE id = %s RETURNING *""",
+                (_encode(credential), row["label"] if label is None else label, _now(), account_id),
+            ).fetchone()
+        else:
+            existing = conn.execute(
+                """SELECT id FROM execution_layer_subscriptions WHERE owner_sub = %s
+                   AND layer = 'copilot-cli' AND provider = 'github'
+                   AND auth_type = 'copilot_user_token' AND oauth_email = %s""",
+                (owner_sub, principal_id),
+            ).fetchone()
+            if existing:
+                raise CopilotAccountConflictError()
+            now = _now()
+            row = conn.execute(
+                """INSERT INTO execution_layer_subscriptions
+                   (id, layer, provider, auth_type, owner_sub, use_personal,
+                    contribute_platform, label, credential_data_enc, oauth_email,
+                    active_sessions, status, created_at, updated_at)
+                   VALUES (%s, 'copilot-cli', 'github', 'copilot_user_token', %s,
+                           TRUE, FALSE, %s, %s, %s, 0, 'active', %s, %s) RETURNING *""",
+                (credential.account_id, owner_sub, label if label is not None else "",
+                 _encode(credential), principal_id, now, now),
+            ).fetchone()
+        result = _projection(row)
+        conn.commit()
+        return result
+
+
+@_sanitized
+def update_owned_account(account_id, owner_sub, *, label=None, use_personal=None,
+                         contribute_platform=None, status=None) -> dict:
+    """Owner-scoped controls; shared contribution requires the owner's current admin role."""
+    _validate_owner(owner_sub)
+    if label is not None:
+        _validate_label(label)
+    if any(value is not None and type(value) is not bool for value in (use_personal, contribute_platform)):
+        raise CopilotAccountInvalidError()
+    if status is not None and status not in ("active", "disabled"):
+        raise CopilotAccountInvalidError()
+    with get_conn() as conn:
+        owner = _lock_owner(conn, owner_sub)
+        row = _owned_row(conn, account_id, owner_sub, lock=True)
+        if contribute_platform is True and owner["role"] != "admin":
+            raise CopilotAccountInvalidError()
+        changes = {key: value for key, value in {
+            "label": label, "use_personal": use_personal,
+            "contribute_platform": contribute_platform, "status": status,
+        }.items() if value is not None}
+        if changes:
+            assignments = ", ".join(f"{key} = %s" for key in changes)
+            row = conn.execute(
+                f"UPDATE execution_layer_subscriptions SET {assignments}, updated_at = %s WHERE id = %s RETURNING *",
+                (*changes.values(), _now(), account_id),
+            ).fetchone()
+        result = _projection(row)
+        conn.commit()
+        return result
+
+
+@_sanitized
+def delete_owned_account(account_id, owner_sub) -> bool:
+    _validate_owner(owner_sub)
+    with get_conn() as conn:
+        _lock_owner(conn, owner_sub)
+        _owned_row(conn, account_id, owner_sub, lock=True)
+        # Deletion remains possible for malformed/expired credential blobs.
+        conn.execute("DELETE FROM execution_layer_subscriptions WHERE id = %s", (account_id,))
+        conn.commit()
+        return True

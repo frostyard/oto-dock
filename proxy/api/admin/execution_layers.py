@@ -279,6 +279,8 @@ async def admin_update_subscription(
     # Owner-or-infra only: an admin manages their OWN accounts (and owner-less
     # platform infra like the relay) — never another admin's connected account.
     existing = subscription_store.get_subscription(sub_id)
+    if existing and existing.get("layer") == "copilot-cli":
+        raise HTTPException(404, "Subscription not found")
     if not existing:
         raise HTTPException(404, "Subscription not found")
     if existing.get("owner_sub") not in ("", user.sub):
@@ -308,6 +310,8 @@ async def admin_delete_subscription(
 ):
     _require_admin(user)
     sub = subscription_store.get_subscription(sub_id)
+    if sub and sub.get("layer") == "copilot-cli":
+        raise HTTPException(404, "Subscription not found")
     if not sub:
         raise HTTPException(404, "Subscription not found")
     # Owner-or-infra only (see admin_update_subscription).
@@ -739,6 +743,8 @@ async def user_update_subscription(
     """
     user = require_auth(user)
     sub = subscription_store.get_subscription(sub_id)
+    if sub and sub.get("layer") == "copilot-cli":
+        raise HTTPException(404, "Subscription not found")
     if not sub or sub.get("owner_sub") != user.sub:
         raise HTTPException(404, "Subscription not found")
     if req.contribute_platform is not None and user.role != "admin":
@@ -764,6 +770,8 @@ async def user_delete_subscription(
     user = require_auth(user)
     # Verify ownership
     sub = subscription_store.get_subscription(sub_id)
+    if sub and sub.get("layer") == "copilot-cli":
+        raise HTTPException(404, "Subscription not found")
     if not sub or sub.get("owner_sub") != user.sub:
         raise HTTPException(404, "Subscription not found")
     subscription_store.delete_subscription(sub_id)

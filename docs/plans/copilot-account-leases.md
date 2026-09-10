@@ -2,8 +2,10 @@
 
 This slice adds account storage, explicit payer scope, typed runtime credentials,
 private session state and a process-local authorization observer. It remains
-unregistered: there are no Copilot connect routes, engine selectors, GitHub App
-installations or deployment changes. C1 qualification and C2 account integration
+unregistered as an execution engine. The follow-up
+[connection preview](copilot-connect-results.md) adds user-token setup routes and
+UI; engine selectors, GitHub App installations and deployment remain outside
+this foundation. C1 qualification and C2 account integration
 are still in progress; this is not full P01–P16 acceptance.
 
 ## Explicit account selection
@@ -104,9 +106,10 @@ explicitly selected user token in sequential sandbox runtimes. Credential
 generation replacement in a controlled source proves the restart and observer
 mechanics; it is not a genuine OAuth refresh or installation-token transaction.
 
-Remaining gates include authenticated connect/reconnect/disconnect routes and UI,
-stable provider identity verification, OAuth/App token issuance and real expiry
-refresh, model entitlement checks, usage/payer attribution, a complete account-
+The [connection preview](copilot-connect-results.md) now adds authenticated
+user-token management and GitHub.com stable user identity validation. Remaining
+gates include OAuth/App token issuance and real expiry refresh, installation
+identity/entitlement verification, model entitlement checks, usage/payer attribution, a complete account-
 bound execution factory, persisted writer leases, native tools and permissions,
 remote transfer/adoption and all supported platforms. Existing engines retain
 their current account pool behavior; this slice adds no database migration.

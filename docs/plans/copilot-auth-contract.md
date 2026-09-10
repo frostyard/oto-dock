@@ -61,6 +61,10 @@ session with callbacks, permissions, and policy supplied again. Reusing an
 existing token under a new application lease proves restart mechanics, not
 OAuth refresh, real expiry handling by GitHub, or installation authentication.
 
+User-token connection now verifies a stable GitHub.com user identity through the
+fixed REST `/user` endpoint; see the [connection preview](copilot-connect-results.md).
+This remains separate from Copilot model entitlement and real token refresh.
+
 ## Identity, entitlement, and redaction
 
 The following details come from the installed SDK and bundled runtime schema:

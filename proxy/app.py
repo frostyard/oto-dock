@@ -92,6 +92,7 @@ from api.meetings import meetings as meetings_router
 from api.admin import execution_layers as execution_layers_router
 from api.auth import claude_oauth as claude_oauth_router
 from api.auth import openai_oauth as openai_oauth_router
+from api.auth import copilot_accounts as copilot_accounts_router
 from api.auth import setup as setup_router
 from api.phone import phone as phone_router
 from api.phone import phone_relay as phone_relay_router
@@ -137,6 +138,7 @@ app.include_router(credentials_router.router)
 # and `/v1/oauth/openai/*` from being shadowed.
 app.include_router(claude_oauth_router.router)
 app.include_router(openai_oauth_router.router)
+app.include_router(copilot_accounts_router.router)
 app.include_router(oauth_router.router)
 app.include_router(mcps_router.router)
 app.include_router(community_router.router)
