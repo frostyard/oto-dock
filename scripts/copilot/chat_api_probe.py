@@ -187,15 +187,27 @@ async def run(args, report):
                         if index == 1:
                             old_handle = sid
                             assert (await client.delete(f"{prefix}/sessions/{sid}")).status_code == 204
-                            archived = (await client.get(f"{prefix}/conversations/{cid}")).json()
+                            archived = (await client.get(f"{prefix}/conversations/{cid}", params={"agent": agent.name})).json()
                             assert archived["conversation"]["can_resume"] is True
                             assert archived["events"][-1]["type"] == "turn_complete"
                             assert any(event["type"] == "permission_prompt" for event in archived["events"])
                             assert [event["seq"] for event in archived["events"]] == list(range(1, len(archived["events"]) + 1))
-                            listing = (await client.get(prefix + "/conversations")).json()
+                            listing = (await client.get(prefix + "/conversations", params={"agent": agent.name})).json()
                             assert [item["id"] for item in listing["conversations"]] == [cid]
                             assert len(runtimes) == 1 and not runtimes[0].alive
                             report["saved_transcript_read_does_not_start_runtime"] = True
+                            # Route-bound reads/resume must not expose or mutate a
+                            # conversation when the URL belongs to another agent.
+                            before = history.get(cid, human["sub"])
+                            denied = await client.get(f"{prefix}/conversations/{cid}", params={"agent": "different-agent"})
+                            assert denied.status_code == 404
+                            denied = await client.post(f"{prefix}/conversations/{cid}/resume",
+                                                       params={"agent": "different-agent"},
+                                                       json={"revision": archived["conversation"]["revision"]})
+                            assert denied.status_code == 404
+                            assert history.get(cid, human["sub"]) == before and len(runtimes) == 1
+                            report["wrong_agent_route_cannot_read_resume_or_mutate"] = True
+                            report["agent_bound_history_read_and_resume"] = True
                             async with httpx.AsyncClient(base_url=base, cookies={"session": other_cookie},
                                                          headers={"Origin": base}) as foreign:
                                 assert (await foreign.get(f"{prefix}/conversations/{cid}")).status_code == 404
@@ -206,11 +218,11 @@ async def run(args, report):
                             await app.state.copilot_chat.aclose()
                             replacement = copilot_chat_lifetime(app, str(args.provisioned_root))
                             await replacement.__aenter__()
-                            archived = (await client.get(f"{prefix}/conversations/{cid}")).json()
+                            archived = (await client.get(f"{prefix}/conversations/{cid}", params={"agent": agent.name})).json()
                             revision = archived["conversation"]["revision"]
-                            rejected = await client.post(f"{prefix}/conversations/{cid}/resume", json={"revision": revision - 1})
+                            rejected = await client.post(f"{prefix}/conversations/{cid}/resume", params={"agent": agent.name}, json={"revision": revision - 1})
                             assert rejected.status_code == 409 and len(runtimes) == 1
-                            resumed = await client.post(f"{prefix}/conversations/{cid}/resume", json={"revision": revision})
+                            resumed = await client.post(f"{prefix}/conversations/{cid}/resume", params={"agent": agent.name}, json={"revision": revision})
                             assert resumed.status_code == 201
                             assert resumed.json()["conversation_id"] == cid
                             sid = resumed.json()["session_id"]
@@ -241,10 +253,10 @@ async def run(args, report):
                             await asyncio.sleep(0.05)
                     report["disconnect_closed_active_session"] = True
                     report["turns"].append({"turn": 3, "first_text_received": True, "disconnected": True})
-                    partial = (await client.get(f"{prefix}/conversations/{cid}")).json()
+                    partial = (await client.get(f"{prefix}/conversations/{cid}", params={"agent": agent.name})).json()
                     assert partial["conversation"]["can_resume"] is False
                     assert any(event["type"] == "text" for event in partial["events"])
-                    rejected = await client.post(f"{prefix}/conversations/{cid}/resume", json={"revision": partial["conversation"]["revision"]})
+                    rejected = await client.post(f"{prefix}/conversations/{cid}/resume", params={"agent": agent.name}, json={"revision": partial["conversation"]["revision"]})
                     assert rejected.status_code == 409
                     report["interrupted_transcript_readable_but_not_resumable"] = True
                     await new_session()

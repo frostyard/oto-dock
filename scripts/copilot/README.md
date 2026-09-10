@@ -7,7 +7,7 @@ change an OtoDock installation, or establish full parity.
 ## Authenticated chat preview
 
 The [preview contract](../../docs/plans/copilot-chat-preview-contract.md) describes
-enabling local chat in User Settings after provisioning. `chat_api_probe.py`
+enabling local chat in agent navigation and User Settings after provisioning. `chat_api_probe.py`
 qualifies the actual signed-cookie HTTP/SSE path in an isolated temporary app:
 
 ```bash
@@ -17,7 +17,8 @@ python scripts/copilot/chat_api_probe.py \
 ```
 
 This spends up to three model turns, approves only an exact temporary native file
-write, checks saved reads, cold recall after service/layer replacement, fresh
+write, checks agent-bound saved reads/resume, wrong-agent rejection before mutation,
+cold recall after service/layer replacement, fresh
 control handles, stale revisions, interrupted-history quarantine, cross-user/
 origin rejection and idle role revocation. It uses real runtime assets and
 retained private history, but controlled user, agent, account and network-discovery

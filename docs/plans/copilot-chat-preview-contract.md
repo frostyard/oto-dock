@@ -1,9 +1,10 @@
 # Copilot authenticated chat preview contract
 
-The opt-in preview runs local Copilot conversations in **User Settings → AI
-Engines → Copilot chat preview**. It supports streamed replies, native tool
+The opt-in preview runs local Copilot conversations from **Copilot chats** in
+an agent’s chat sidebar and **User Settings → AI Engines → Copilot chat preview**.
+Settings also links directly to the full agent chat page. It supports streamed replies, native tool
 activity, permission decisions and questions using an explicitly selected
-personal GitHub account. It is separate from the regular chat list and does not
+personal GitHub account. Its history has a separate section in the chat sidebar and does not
 register Copilot in the general engine picker. This is an intermediate step
 toward the [parity plan](copilot-parity.md), not full Claude/Codex parity.
 
@@ -76,7 +77,7 @@ bodies; a reverse proxy must provide the correct trusted scheme and host.
 
 Under `/v1/copilot/chat`, authenticated `GET /status` returns `{available}`;
 `POST /sessions` takes `{agent, account_id, model, permission_mode}` and returns
-`{session_id}`. For that ID, `POST /sessions/{id}/turn` streams `{text}` replies;
+`{session_id, conversation_id}`. For the session ID, `POST /sessions/{id}/turn` streams `{text}` replies;
 `/permission` accepts `{request_id, approved}`, `/question` accepts
 `{request_id, answers}`, and `DELETE /sessions/{id}` closes its owner.
 
@@ -112,9 +113,10 @@ includes native file approval, a warm follow-up, disconnect cleanup and idle
 role revocation, using controlled storage reads rather than PostgreSQL. It is
 not a browser or reverse-proxy deployment qualification.
 
-General engine registration and main chat persistence/routing remain open, as
-do attachments, queued input, main-chat history integration, model catalog/default
-integration, shared payers and general onboarding. Saved preview conversations
+The [agent chat route](copilot-agent-chat-contract.md) shares message rendering
+and sidebar navigation. General engine registration, shared chat persistence,
+attachments, queued input, model catalog/default integration, shared payers and
+general onboarding remain open. Saved preview conversations
 have a separate owner-only read and explicit clean-resume path.
 Graceful steering/interrupt semantics, MCP/delegation, remote machines, terminal
 sessions, meetings, phone workflows, scheduled work and organization automation

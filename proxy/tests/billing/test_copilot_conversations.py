@@ -428,3 +428,25 @@ def test_validation_mutations_require_explicit_uuid_generation(monkeypatch, oper
     with pytest.raises(store.CopilotConversationError) as error:
         operations[operation]()
     assert not calls and error.value.__context__ is None
+
+
+def test_agent_filter_precedes_pagination_and_never_crosses_owner(conversation):
+    agent_store.create_agent('other-history', 'Other history')
+    # Fill newer rows on a different agent before the original owner's row.
+    for owner, agent in [(OWNER, 'other-history'), (OTHER, 'copilot-history')]:
+        store.create(identifier(), owner, agent=agent, account_id=identifier(), model='model',
+                     permission_mode='default', platform_session_id=identifier(), generation=identifier())
+    rows = store.list_conversations(OWNER, limit=1, agent='copilot-history')
+    assert [row['id'] for row in rows] == [conversation['id']]
+    assert store.list_conversations(OWNER, limit=1, offset=1, agent='copilot-history') == []
+    assert store.list_conversations(OWNER, agent='absent-agent') == []
+    assert len(store.list_conversations(OWNER)) == 2
+
+
+@pytest.mark.parametrize('agent', ['', '../escape', 'bad/agent', 'bad\\agent', 'a' * 65, True])
+def test_validation_agent_filter_rejects_before_database(monkeypatch, agent):
+    def forbidden():
+        pytest.fail('Invalid agent must not open storage')
+    monkeypatch.setattr(store, 'get_conn', forbidden)
+    with pytest.raises(store.CopilotConversationError):
+        store.list_conversations(OWNER, agent=agent)

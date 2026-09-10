@@ -55,9 +55,10 @@ class MemoryConversations:
             row = self.rows.get(cid)
             return deepcopy(row) if row and row['user_sub'] == owner else None
 
-    def list_conversations(self, owner, limit=20, offset=0):
+    def list_conversations(self, owner, limit=20, offset=0, agent=None):
         with self.lock:
-            rows = sorted((row for row in self.rows.values() if row['user_sub'] == owner),
+            rows = sorted((row for row in self.rows.values() if row['user_sub'] == owner
+                           and (agent is None or row['agent'] == agent)),
                           key=lambda row: (row['updated_at'], row['id']), reverse=True)
             return deepcopy(rows[offset:offset + limit])
 

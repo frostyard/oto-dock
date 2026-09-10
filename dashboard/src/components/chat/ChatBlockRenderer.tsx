@@ -102,6 +102,7 @@ export default function BlockRenderer({
   block,
   blockId,
   blockOrder,
+  allowInlineImages = true,
   isUserMessage,
   chatId,
   onPermissionRespond,
@@ -123,6 +124,7 @@ export default function BlockRenderer({
   block: MessageBlock
   blockId: string
   blockOrder: number            // explicit sort key for search match ordering
+  allowInlineImages?: boolean
   isUserMessage: boolean
   chatId?: string
   /** Chat's agent slug — past image_attachments render via its files API. */
@@ -166,7 +168,7 @@ export default function BlockRenderer({
         )
       }
       return (
-        <MarkdownContent className="text-sm" searchMatchIdPrefix={searchQuery ? blockId : undefined} searchOrder={searchQuery ? blockOrder : undefined}>
+        <MarkdownContent allowInlineImages={allowInlineImages} className="text-sm" searchMatchIdPrefix={searchQuery ? blockId : undefined} searchOrder={searchQuery ? blockOrder : undefined}>
           {block.content}
         </MarkdownContent>
       )

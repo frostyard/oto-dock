@@ -11,6 +11,7 @@ import TitleTooltip from '../ui/TitleTooltip'
 import { rowAccentClass } from './projectAccents'
 import ActiveChatsPanel from './ActiveChatsPanel'
 import MoveChatConfirm from './MoveChatConfirm'
+import CopilotHistory from '../copilot/CopilotHistory'
 
 // Unread-row age steps: a fresh response tints the whole row with the full
 // brand surface; one that has sat unread fades in two steps, so the sidebar
@@ -762,6 +763,8 @@ export default function ChatHistory({
           </div>
         )}
       </div>
+
+      <CopilotHistory agentName={agentName} tasksMode={tasksMode} onNavigate={onNavigate} />
 
       {/* Cross-agent "Active now" widget — hidden when nothing is running.
           Its own-agent dedup follows the mode (tasksMode). */}

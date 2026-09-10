@@ -25,6 +25,7 @@ import RemoteMachinesPage from './pages/admin/RemoteMachinesPage'
 import UserSettings from './pages/UserSettings'
 import AgentOverview from './pages/agent/AgentOverview'
 import AgentChat from './pages/agent/AgentChat'
+import AgentCopilotChat from './pages/agent/AgentCopilotChat'
 import AgentSchedules from './pages/agent/AgentSchedules'
 import AgentTriggers from './pages/agent/AgentTriggers'
 import AgentNotifications from './pages/agent/AgentNotifications'
@@ -102,6 +103,11 @@ export default function App() {
           {/* Force password change / 2FA enrollment (exempt from setup guard) */}
           <Route path="change-password" element={<ChangePassword />} />
           <Route path="setup-2fa" element={<Setup2FA />} />
+          {/* Copilot has its own explicit account/setup checks, independent of
+              generic engine subscriptions. Human auth and agent access remain. */}
+          <Route path="chat/:name/copilot/:conversationId?" element={<AgentGuard />}>
+            <Route index element={<AgentCopilotChat />} />
+          </Route>
           {/* Platform setup guard — blocks non-admin if no subscriptions configured */}
           <Route element={<PlatformSetupGuard />}>
           {/* Landing page: redirect to default agent chat */}

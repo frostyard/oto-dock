@@ -206,14 +206,17 @@ def get(cid, owner):
 
 
 @_safe
-def list_conversations(owner, limit=20, offset=0):
+def list_conversations(owner, limit=20, offset=0, agent=None):
     if (not _text(owner) or type(limit) is not int or not 1 <= limit <= 100
-            or type(offset) is not int or not 0 <= offset <= 10000):
+            or type(offset) is not int or not 0 <= offset <= 10000
+            or (agent is not None and (not _text(agent) or not config.is_safe_agent_name(agent)))):
         raise CopilotConversationError()
+    condition = " AND agent = %s" if agent is not None else ""
+    params = (owner, agent, limit, offset) if agent is not None else (owner, limit, offset)
     with _connection() as conn:
         return [dict(row) for row in conn.execute(
-            "SELECT * FROM copilot_conversations WHERE user_sub = %s "
-            "ORDER BY updated_at DESC, id DESC LIMIT %s OFFSET %s", (owner, limit, offset),
+            "SELECT * FROM copilot_conversations WHERE user_sub = %s" + condition +
+            " ORDER BY updated_at DESC, id DESC LIMIT %s OFFSET %s", params,
         ).fetchall()]
 
 
