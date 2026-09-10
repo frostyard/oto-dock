@@ -1,0 +1,41 @@
+{
+  "result": "passed",
+  "sandboxed": true,
+  "sdk_version": "1.0.13",
+  "runtime_version": "1.0.83",
+  "live_turn_limit": 2,
+  "real_oauth_refresh": false,
+  "installation_token_tested": false,
+  "database_account_store_tested": false,
+  "distinct_live_accounts_tested": false,
+  "private_state_outside_workspace": true,
+  "stage": 3,
+  "turns": [
+    {
+      "marker_matched": true,
+      "done_count": 1,
+      "source_revalidated": true,
+      "model_available": true
+    },
+    {
+      "marker_matched": true,
+      "done_count": 1,
+      "source_revalidated": true,
+      "model_available": true
+    }
+  ],
+  "same_user_token_reacquired": true,
+  "runtime_login_available": false,
+  "same_runtime_login": false,
+  "history_marker_retained": true,
+  "idle_generation_change_closed_runtime": true,
+  "noauth_restart_has_no_fallback": true,
+  "all_runtimes_closed": true,
+  "normal_cleanup": true,
+  "runtime_count": 3,
+  "source_read_count": 36,
+  "tool_execution_count": 0,
+  "permission_request_count": 0,
+  "private_state_discarded": true,
+  "elapsed_seconds": 15.617
+}

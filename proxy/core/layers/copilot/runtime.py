@@ -21,6 +21,10 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
+
+from .credentials import CopilotCredential
+from .session_state import PrivateCopilotSessionState, SANDBOX_STATE_DIRECTORY
 
 SDK_VERSION = '1.0.13'
 RUNTIME_VERSION = '1.0.83'
@@ -147,15 +151,24 @@ class SandboxedCopilotRuntime:
     ``builder`` must already expose runtime_path.parent read-only at the parent
     of sandbox_runtime_path, including runtime.node and all adjacent assets.
     environment is an explicit caller-curated dictionary, never os.environ.
-    Inference authentication is only github_token; repository/MCP credentials
-    must use their separate broker rather than an ambient GitHub token here.
+    Inference authentication comes from an explicit credential. github_token is
+    retained for development probes; repository/MCP credentials use their
+    separate broker rather than an ambient GitHub token here.
     """
 
     def __init__(self, builder, *, runtime_path: Path, working_directory: Path,
                  sandbox_state_directory: str, environment: Mapping[str, str],
                  sandbox_runtime_path: str = '/opt/copilot-runtime/copilot-runtime',
-                 github_token: str | None = None, startup_timeout: float = 15,
+                 github_token: str | None = None, credential: CopilotCredential | None = None,
+                 session_state: PrivateCopilotSessionState | None = None,
+                 startup_timeout: float = 15,
                  shutdown_timeout: float = 5):
+        if credential is not None and not isinstance(credential, CopilotCredential):
+            raise TypeError('Invalid Copilot runtime credential')
+        if credential is not None and github_token is not None:
+            raise ValueError('Copilot credential and legacy token are mutually exclusive')
+        if session_state is not None and not isinstance(session_state, PrivateCopilotSessionState):
+            raise TypeError('Invalid Copilot private session state')
         self.builder = builder
         self.runtime_path = Path(runtime_path).resolve()
         self.working_directory = Path(working_directory).resolve()
@@ -163,6 +176,8 @@ class SandboxedCopilotRuntime:
         self.sandbox_state_directory = sandbox_state_directory
         self.environment = dict(environment)
         self._token = github_token
+        self._credential = credential
+        self._session_state = session_state
         self.startup_timeout = startup_timeout
         self.shutdown_timeout = shutdown_timeout
         self._client = None
@@ -185,6 +200,19 @@ class SandboxedCopilotRuntime:
     def _command(self):
         from core.sandbox.sandbox import SandboxBuilder, _NETNS_LAUNCHER
 
+        if self._credential is not None and self._session_state is None:
+            raise ValueError('Copilot credentials require private session state')
+        state_path = None
+        if self._session_state is not None:
+            if self.sandbox_state_directory != SANDBOX_STATE_DIRECTORY:
+                raise ValueError('Copilot private state requires its fixed sandbox destination')
+            state_path = self._session_state.path  # Revalidates host ownership and path identity.
+            if (state_path.is_relative_to(self.runtime_path.parent)
+                    or self.runtime_path.parent.is_relative_to(state_path)
+                    or PurePosixPath(self.sandbox_runtime_path).is_relative_to(SANDBOX_STATE_DIRECTORY)
+                    or PurePosixPath(SANDBOX_STATE_DIRECTORY).is_relative_to(
+                        PurePosixPath(self.sandbox_runtime_path).parent)):
+                raise ValueError('Copilot private state must not overlap runtime assets')
         if not isinstance(self.builder, SandboxBuilder):
             raise TypeError('Copilot requires an actual SandboxBuilder')
         if (not sys.platform.startswith('linux') or not hasattr(os, 'pidfd_open')
@@ -229,13 +257,19 @@ class SandboxedCopilotRuntime:
                     last_overlap = flags[index:index + count]
         if last_overlap != expected_mount:
             raise ValueError('Copilot runtime assets require an explicit read-only sandbox mount')
+        if state_path is not None:
+            # Trusted internal state is deliberately outside MCP/agent trees.
+            # Inject only this validated allocation after community mounts;
+            # keep SandboxBuilder's community manifest allowlist unchanged.
+            command[inner:inner] = ['--bind', str(state_path), SANDBOX_STATE_DIRECTORY]
         return command
 
     def _environment(self):
         if any(not isinstance(k, str) or not isinstance(v, str) for k, v in self.environment.items()):
             raise ValueError('Copilot environment requires string keys and values')
         forbidden = {'GH_TOKEN', 'GITHUB_TOKEN', 'COPILOT_GITHUB_TOKEN', 'COPILOT_SDK_AUTH_TOKEN',
-                     'COPILOT_CONNECTION_TOKEN', 'BASH_ENV', 'ENV', 'GCONV_PATH'}
+                     'COPILOT_CONNECTION_TOKEN', 'GITHUB_COPILOT_API_TOKEN', 'COPILOT_API_URL',
+                     'BASH_ENV', 'ENV', 'GCONV_PATH'}
         if any(key.upper() in forbidden or key.upper().startswith(('PYTHON', 'LD_', 'DYLD_'))
                for key in self.environment):
             raise ValueError('Ambient credentials and host interpreter overrides are prohibited')
@@ -251,17 +285,25 @@ class SandboxedCopilotRuntime:
         return env
 
     def _make_client(self, command):
+        if self._credential is not None:
+            self._credential.ensure_usable(time.time())
+        # Reject caller-supplied authentication before injecting the credential's
+        # selected channel. Installation tokens must never use SDK github_token.
+        env = self._environment()
+        github_token = self._token
+        if self._credential is not None:
+            github_token, credential_environment = self._credential.runtime_auth()
+            env.update(credential_environment)
         if importlib.metadata.version('github-copilot-sdk') != SDK_VERSION:
             raise RuntimeError('Unsupported Copilot SDK version')
         from copilot import CopilotClient, RuntimeConnection
 
-        env = self._environment()
         args = ['-I', str(Path(__file__).with_name('launcher.py')), '--ownership-file', str(self._handshake),
                 '--nonce', self._nonce, '--', *command]
         return CopilotClient(
             connection=RuntimeConnection.for_stdio(path=sys.executable, args=args),
             working_directory=str(self.working_directory), base_directory=self.sandbox_state_directory,
-            env=env, github_token=self._token, use_logged_in_user=False, mode='empty', log_level='error',
+            env=env, github_token=github_token, use_logged_in_user=False, mode='empty', log_level='error',
         )
 
     def _observe(self, *, full_scan: bool = True):
@@ -303,6 +345,8 @@ class SandboxedCopilotRuntime:
             raise RuntimeError('Copilot runtime startup failed') from None
 
     async def _start(self):
+        if self._credential is not None:
+            self._credential.ensure_usable(time.time())
         command = self._command()
         self._temporary = tempfile.TemporaryDirectory(prefix='otodock-copilot-owner-')
         self._handshake = Path(self._temporary.name) / 'identity.json'
@@ -410,6 +454,7 @@ class SandboxedCopilotRuntime:
             if self._temporary is not None:
                 self._temporary.cleanup()
             self._token = None
+            self._credential = None
             self._client = None
             self._start_task = None
             self._popen = None
