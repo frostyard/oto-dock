@@ -42,6 +42,14 @@ class _TextState:
     final: bool = False
 
 
+@dataclass(frozen=True)
+class InterruptBoundary:
+    """Translator-owned fence for explicit interruption settlement."""
+
+    generation: int
+    number: int
+
+
 class CopilotEventTranslator:
     """Translate a single session's serialized, camelCase Copilot events.
 
@@ -63,6 +71,8 @@ class CopilotEventTranslator:
         self._idle_id: str | None = None
         self._generation = 0
         self._settled_generation = -1
+        self._interrupt_boundary: InterruptBoundary | None = None
+        self._interrupt_boundary_number = 0
 
     @staticmethod
     def _string(data: dict, key: str, *, nonempty: bool = False) -> str:
@@ -79,6 +89,20 @@ class CopilotEventTranslator:
     def pending_idle_id(self) -> str | None:
         """Current runtime idle candidate, invalidated by subsequent activity."""
         return self._idle_id
+
+    def begin_submission(self) -> None:
+        """Scope native model-iteration IDs to the next host submission.
+
+        Runtime 1.0.83 reuses turnId values across distinct user messages. Only
+        those iteration IDs/boundaries are scoped here. Keep global event-ID,
+        message and tool tombstones so old stream replay cannot reopen work.
+        A host submission alone does not advance the completion generation;
+        actual model activity must still arrive before another DONE is possible.
+        """
+        self._turn_ids.clear()
+        self._turn_boundaries.clear()
+        self._idle_id = None
+        self._interrupt_boundary = None
 
     def translate(self, event: dict) -> list[CommonEvent]:
         if not isinstance(event, dict):
@@ -278,4 +302,46 @@ class CopilotEventTranslator:
             events.extend(self._tool_result(tool_id, {
                 "success": False, "error": {"message": "Tool execution cancelled."},
             }))
+        return events
+
+    def capture_interrupt_boundary(self) -> InterruptBoundary | None:
+        """Fence current work without manufacturing a native session.idle.
+
+        The coordinator calls this only after a matching successful interrupt
+        RPC, before two authoritative quiescence snapshots. A newer capture
+        replaces this fence. This token alone does not prove interruption.
+        """
+        if self._generation == 0 or self._generation == self._settled_generation:
+            return None
+        self._interrupt_boundary_number += 1
+        self._interrupt_boundary = InterruptBoundary(
+            self._generation, self._interrupt_boundary_number,
+        )
+        return self._interrupt_boundary
+
+    def reconcile_interrupted(
+        self, boundary: InterruptBoundary, *, cancelled_tool_ids: frozenset[str] = frozenset(),
+    ) -> list[CommonEvent]:
+        """Finish explicitly interrupted work after coordinator verification.
+
+        Does not invent a runtime event or imply preserved history. Generation,
+        replay, open-tool and orphan-result gates remain effective. Cancellation
+        IDs require host cancellation/join proof, not merely a control ACK.
+        No tool state mutates unless the entire boundary can settle atomically.
+        """
+        if (not isinstance(boundary, InterruptBoundary)
+                or boundary != self._interrupt_boundary
+                or boundary.generation != self._generation
+                or self._settled_generation == self._generation):
+            return []
+        open_tools = self._tools.keys() - self._completed_tools
+        if not isinstance(cancelled_tool_ids, frozenset) or cancelled_tool_ids - open_tools:
+            raise ValueError("Cancellation proof must identify known open Copilot tools")
+        if self._early_results or open_tools - cancelled_tool_ids:
+            return []
+        events = self.reconcile_cancelled_tools(cancelled_tool_ids)
+        self._idle_id = None
+        self._interrupt_boundary = None
+        self._settled_generation = self._generation
+        events.append(CommonEvent(DONE))
         return events

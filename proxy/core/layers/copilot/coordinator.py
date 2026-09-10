@@ -23,7 +23,7 @@ import json
 from typing import AsyncIterator
 
 from core.events.common_events import CommonEvent, DONE
-from core.layers.copilot.translator import CopilotEventTranslator
+from core.layers.copilot.translator import CopilotEventTranslator, InterruptBoundary
 
 
 class TaskState(Enum):
@@ -103,6 +103,28 @@ class AbortTicket:
     request_number: int
 
 
+class InterruptState(Enum):
+    NONE = "none"
+    REQUESTED = "requested"
+    ACKNOWLEDGED = "acknowledged"
+    SETTLED = "settled"
+    REJECTED = "rejected"
+    SUPERSEDED = "superseded"
+
+
+@dataclass(frozen=True)
+class InterruptTicket:
+    turn_id: str
+    request_number: int
+
+
+@dataclass(frozen=True)
+class InterruptCheckpoint:
+    ticket: InterruptTicket
+    revision: int
+    boundary: InterruptBoundary
+
+
 class EventSequenceError(RuntimeError):
     """The event stream cannot establish safe contiguous session state."""
 
@@ -148,12 +170,20 @@ class CopilotTurnCoordinator:
         self._abort_ticket: AbortTicket | None = None
         self._abort_count = 0
         self._abort_state = AbortState.NONE
+        self._interrupt_ticket: InterruptTicket | None = None
+        self._interrupt_count = 0
+        self._interrupt_state = InterruptState.NONE
+        self._interrupt_checkpoint: InterruptCheckpoint | None = None
         self._writer_lock = asyncio.Lock()
         self._writer_owner: asyncio.Task | None = None
 
     @property
     def abort_state(self) -> AbortState:
         return self._abort_state
+
+    @property
+    def interrupt_state(self) -> InterruptState:
+        return self._interrupt_state
 
     @property
     def last_sequence(self) -> int:
@@ -184,15 +214,28 @@ class CopilotTurnCoordinator:
         self._stream_intact = False
         self._revision += 1
 
-    def invalidate_observation(self) -> None:
+    def invalidate_observation(self, *, new_submission: bool = False) -> None:
         """Call before host callback, approval, or queued-send state changes.
 
         Host mutations need this even without a corresponding runtime event.
         Later snapshots must include the new host state in pending_tools,
         pending_permissions and pending_messages. This only invalidates prior
-        snapshots; it does not claim the new operation completed.
+        snapshots; it does not claim the new operation completed. Pass
+        new_submission=True before any user send/steer/queue mutation so an old
+        interrupt cannot settle the newly submitted work once its queue empties.
         """
         self._revision += 1
+        if new_submission:
+            self._translator.begin_submission()
+            self._supersede_interrupt()
+            self._abort_ticket = None
+            self._abort_state = AbortState.NONE
+
+    def _supersede_interrupt(self) -> None:
+        if self._interrupt_state in {InterruptState.REQUESTED, InterruptState.ACKNOWLEDGED}:
+            self._interrupt_state = InterruptState.SUPERSEDED
+        self._interrupt_ticket = None
+        self._interrupt_checkpoint = None
 
     def receive_event(self, sequence: int, event: dict) -> list[CommonEvent]:
         """Consume contiguous router sequence numbers, starting at one.
@@ -251,6 +294,8 @@ class CopilotTurnCoordinator:
                 self._turn_open = True
                 self._abort_ticket = None
                 self._abort_state = AbortState.NONE
+                self._supersede_interrupt()
+                self._interrupt_state = InterruptState.NONE
         if main and event["type"] == "session.idle":
             self._idle_aborted = data.get("aborted") is True
             self._idle_abort_ticket = self._abort_ticket
@@ -286,6 +331,7 @@ class CopilotTurnCoordinator:
         completed = any(event.type == DONE for event in events)
         if completed:
             self._turn_open = False
+            self._supersede_interrupt()
         if completed and self._abort_ticket is not None:
             if self._abort_state != AbortState.REJECTED:
                 self._abort_state = (
@@ -300,6 +346,7 @@ class CopilotTurnCoordinator:
         """Record intent before invoking the runtime; this does not abort it."""
         if not self._stream_intact or not self._turn_open or self._turn_id is None:
             raise RuntimeError("No known live Copilot turn to interrupt")
+        self._supersede_interrupt()
         self._abort_count += 1
         self._abort_ticket = AbortTicket(self._turn_id, self._abort_count)
         self._abort_state = AbortState.REQUESTED
@@ -314,3 +361,90 @@ class CopilotTurnCoordinator:
         self._abort_state = AbortState.ACKNOWLEDGED if accepted is True else AbortState.REJECTED
         self._revision += 1
         return True
+
+    def request_interrupt(self) -> InterruptTicket:
+        """Record intent before dispatching interrupt_main_turn, not abort.
+
+        The runtime may omit session.idle after a successful interruption.
+        This ticket permits the explicit double-snapshot reconciliation path;
+        it never permits treating an ACK as settled or as history preservation.
+        """
+        if not self._stream_intact or not self._turn_open or self._turn_id is None:
+            raise RuntimeError("No known live Copilot turn to interrupt")
+        self._interrupt_count += 1
+        self._interrupt_ticket = InterruptTicket(self._turn_id, self._interrupt_count)
+        self._interrupt_state = InterruptState.REQUESTED
+        self._interrupt_checkpoint = None
+        self._abort_ticket = None
+        self._abort_state = AbortState.NONE
+        self._revision += 1
+        return self._interrupt_ticket
+
+    def acknowledge_interrupt(self, ticket: InterruptTicket, *, accepted: bool) -> bool:
+        """Accept only the current control response; False means no permission to settle."""
+        if (not self._stream_intact or not self._turn_open
+                or ticket != self._interrupt_ticket
+                or self._interrupt_state != InterruptState.REQUESTED):
+            return False
+        self._interrupt_state = (
+            InterruptState.ACKNOWLEDGED if accepted is True else InterruptState.REJECTED
+        )
+        self._revision += 1
+        return True
+
+    def begin_interrupt_reconciliation(
+        self, ticket: InterruptTicket,
+    ) -> InterruptCheckpoint | None:
+        """Capture after ACK and callback drain, before fetching fresh snapshots.
+
+        Await a full snapshot, then a separate metadata.is_processing barrier,
+        then another full snapshot. All native and host pending-state sources
+        must be represented in each snapshot. A newer capture replaces this one.
+        """
+        if (not self._stream_intact or not self._turn_open
+                or ticket != self._interrupt_ticket
+                or self._interrupt_state != InterruptState.ACKNOWLEDGED):
+            return None
+        boundary = self._translator.capture_interrupt_boundary()
+        if boundary is None:
+            return None
+        self._interrupt_checkpoint = InterruptCheckpoint(ticket, self._revision, boundary)
+        return self._interrupt_checkpoint
+
+    def finish_interrupt_reconciliation(
+        self, checkpoint: InterruptCheckpoint,
+        first: SettlementObservation, second: SettlementObservation,
+        *, processing_barrier: bool | None,
+    ) -> list[CommonEvent]:
+        """Emit an explicit interrupted boundary after two stable observations.
+
+        The barrier must be a fresh is_processing result between the two full
+        snapshot reads. Any intervening runtime event or host mutation rejects
+        the observation fence. Task order may change, but IDs/states and joined
+        cancellation proofs must agree. SETTLED means the interrupted work has
+        quiesced; it is not a successful task or a graceful-abort/history claim.
+        """
+        if (not isinstance(checkpoint, InterruptCheckpoint)
+                or checkpoint != self._interrupt_checkpoint
+                or checkpoint.ticket != self._interrupt_ticket
+                or checkpoint.revision != self._revision
+                or not self._stream_intact or not self._turn_open
+                or self._interrupt_state != InterruptState.ACKNOWLEDGED
+                or processing_barrier is not False
+                or not isinstance(first, SettlementObservation)
+                or not isinstance(second, SettlementObservation)
+                or not first.is_settled() or not second.is_settled()):
+            return []
+        first_tasks = {(task.task_id, task.state) for task in first.tasks}
+        second_tasks = {(task.task_id, task.state) for task in second.tasks}
+        if (first_tasks != second_tasks
+                or first.cancelled_tool_ids != second.cancelled_tool_ids):
+            return []
+        events = self._translator.reconcile_interrupted(
+            checkpoint.boundary, cancelled_tool_ids=second.cancelled_tool_ids,
+        )
+        if any(event.type == DONE for event in events):
+            self._turn_open = False
+            self._interrupt_state = InterruptState.SETTLED
+            self._interrupt_checkpoint = None
+        return events

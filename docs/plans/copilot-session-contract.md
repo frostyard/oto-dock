@@ -54,6 +54,25 @@ before completion. Unknown IDs, already completed tools, stale snapshots, and
 rejected aborts cannot use this path. This reconciliation primitive does not
 itself cancel callbacks or prove that an external side effect was rolled back.
 
+## Explicit interruption and submission boundaries
+
+An acknowledged `interrupt_main_turn` can settle without a fresh native idle.
+The owner captures `begin_interrupt_reconciliation(ticket)`, obtains two complete
+settled observations around a separate processing-false barrier, and supplies
+all three to `finish_interrupt_reconciliation`. The ticket, event sequence,
+translator generation and host revision must remain current. Cancelled tool
+proof follows the same ownership rules as abort. This path shares the native-idle
+completion gate and never synthesizes an idle event.
+
+Call `invalidate_observation(new_submission=True)` before dispatching each new
+input. Copilot can reuse model iteration IDs between user inputs; this resets
+iteration-boundary deduplication while retaining event replay fingerprints and
+message/tool tombstones. Do not admit new input while an accepted control awaits
+settlement, because a new submission supersedes the old control proof.
+
+The [sandbox supervisor](copilot-supervisor-results.md) implements these caller
+obligations and joins SDK-hosted callbacks through an explicit registry.
+
 ## Evidence and limits
 
 Offline tests exercise stale observations, stream gaps, replay, background work,
@@ -65,10 +84,18 @@ and zero replayed DONEs**, with no mapping errors. Its permission callback is
 synchronous and it exposes no SDK-hosted tools; cancellation reconciliation is
 covered separately by deterministic tests informed by the live abort trace.
 
-This primitive has no durable replay cursor, bounded event retention, process
-supervisor, cross-process writer lease, or restart adoption. The separate native
+The combined [sandbox supervisor recording](evidence/copilot-supervisor.json)
+adds live normal, abort and explicit-interrupt completion. Interrupt stays open
+while a controlled background task is running, then emits one DONE after task
+retirement without receiving a new native idle. Actual callback cancellation
+and join precede cancelled tool results; runtime shutdown leaves no owned
+processes alive and requires no SIGKILL.
+
+This primitive has no durable replay cursor, bounded replay retention,
+cross-process writer lease, or restart adoption. Its separate supervisor bounds
+the consumer event queue and owns runtime processes. The native
 [terminal probe](copilot-terminal-results.md) establishes sequential no-tool
-history sharing, not centralized ownership. Fresh activity after an idle still
-requires another genuine idle before settlement. The observed interrupt path
-that never emits another idle therefore remains a liveness blocker; the adapter
-must resolve it without falsely declaring active work complete.
+history sharing, not centralized ownership. Ordinary fresh activity after an
+idle still needs another genuine idle; only the explicit acknowledged interrupt
+path can use the independently verified interruption boundary. Native shell and
+subagent background work still need broader qualification.

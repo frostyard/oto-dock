@@ -246,6 +246,70 @@ class TranslatorTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.send("assistant.message", {"messageId": "m1", "content": "one chunk", "chunkCount": 2})
 
+    def test_interrupt_boundary_requires_work_and_preserves_generation(self):
+        self.assertIsNone(self.translator.capture_interrupt_boundary())
+        self.send("assistant.turn_start", {"turnId": "one"})
+        boundary = self.translator.capture_interrupt_boundary()
+        self.send("assistant.message_delta", {"messageId": "m", "deltaContent": "new"}, "e2")
+        self.assertEqual(self.translator.reconcile_interrupted(boundary), [])
+        current = self.translator.capture_interrupt_boundary()
+        self.assertEqual([e.type for e in self.translator.reconcile_interrupted(current)], ["done"])
+        self.assertEqual(self.translator.reconcile_interrupted(current), [])
+        self.assertIsNone(self.translator.capture_interrupt_boundary())
+
+    def test_submission_scopes_reused_native_turn_ids_without_resetting_event_replay(self):
+        old = frame("assistant.turn_start", {"turnId": "reused"}, "old-start")
+        self.translator.translate(old)
+        self.send("session.idle", event_id="old-idle")
+        self.assertEqual(len(self.translator.settle_idle("old-idle", background_settled=True)), 1)
+        self.translator.begin_submission()
+        self.assertEqual(self.translator.translate(old), [])
+        self.assertIsNone(self.translator.capture_interrupt_boundary())
+        self.assertEqual(len(self.send("assistant.turn_start", {"turnId": "reused"}, "new-start")), 1)
+        self.assertEqual(self.send("assistant.turn_start", {"turnId": "reused"}, "duplicate-new-start"), [])
+        self.send("session.idle", event_id="new-idle")
+        self.assertEqual(len(self.translator.settle_idle("new-idle", background_settled=True)), 1)
+
+    def test_submission_invalidates_old_idle_and_interruption_without_creating_work(self):
+        self.send("assistant.turn_start", {"turnId": "one"})
+        self.send("session.idle", event_id="idle")
+        boundary = self.translator.capture_interrupt_boundary()
+        self.translator.begin_submission()
+        self.assertIsNone(self.translator.pending_idle_id)
+        self.assertEqual(self.translator.settle_idle("idle", background_settled=True), [])
+        self.assertEqual(self.translator.reconcile_interrupted(boundary), [])
+
+    def test_interrupt_recapture_invalidates_old_fence(self):
+        self.send("assistant.turn_start", {"turnId": "one"})
+        old = self.translator.capture_interrupt_boundary()
+        current = self.translator.capture_interrupt_boundary()
+        self.assertEqual(self.translator.reconcile_interrupted(old), [])
+        self.assertEqual(len(self.translator.reconcile_interrupted(current)), 1)
+
+    def test_interrupt_and_native_idle_cannot_duplicate_completion(self):
+        self.send("assistant.turn_start", {"turnId": "one"})
+        boundary = self.translator.capture_interrupt_boundary()
+        self.send("session.idle", event_id="idle")
+        self.assertEqual(len(self.translator.settle_idle("idle", background_settled=True)), 1)
+        self.assertEqual(self.translator.reconcile_interrupted(boundary), [])
+
+    def test_interrupt_cancellation_is_atomic_when_other_tool_still_open(self):
+        for index in range(2):
+            self.send("tool.execution_start", {"toolCallId": f"t{index}", "toolName": "hold"}, f"start-{index}")
+        boundary = self.translator.capture_interrupt_boundary()
+        self.assertEqual(self.translator.reconcile_interrupted(boundary, cancelled_tool_ids=frozenset({"t0"})), [])
+        events = self.translator.reconcile_interrupted(boundary, cancelled_tool_ids=frozenset({"t0", "t1"}))
+        self.assertEqual([e.type for e in events], ["tool_result", "tool_result", "done"])
+        self.assertTrue(all(e.data["is_error"] for e in events[:-1]))
+
+    def test_interrupt_orphan_result_cannot_be_swept_as_cancellation(self):
+        self.send("tool.execution_complete", {"toolCallId": "unknown", "success": False})
+        self.send("assistant.turn_start", {"turnId": "one"}, "start")
+        boundary = self.translator.capture_interrupt_boundary()
+        self.assertEqual(self.translator.reconcile_interrupted(boundary), [])
+        with self.assertRaises(ValueError):
+            self.translator.reconcile_interrupted(boundary, cancelled_tool_ids=frozenset({"unknown"}))
+
 
 if __name__ == "__main__":
     unittest.main()
