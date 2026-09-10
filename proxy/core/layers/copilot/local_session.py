@@ -90,6 +90,7 @@ class CopilotLocalSession:
         instance._context = None
         instance._context_snapshot = None
         instance._close_task = None
+        instance._closing_started = asyncio.Event()
         instance._invalid = False
         instance._opened = False
         instance._streaming = False
@@ -365,10 +366,57 @@ class CopilotLocalSession:
         self._uncertain = True
         return await self._call("interrupt")
 
+    @property
+    def alive(self) -> bool:
+        """Whether this opened owner can still admit work; never starts cleanup.
+
+        This synchronous observation does not depend on a caller task or event
+        loop. Dispatch still performs its own fresh authorization under lock.
+        """
+        try:
+            return bool(
+                self._opened and self._close_task is None and not self._invalid
+                and not self._provider_error and self._context_valid()
+                and self._runtime_started and self._runtime is not None and self._runtime.alive is True
+                and self._guard is not None and self._guard.valid is True
+                and self._supervisor is not None and self._supervisor.failure_detected is False
+            )
+        except Exception:
+            return False
+
+    @property
+    def closed(self) -> bool:
+        """Cleanup has finished, including failure; wait_closed reports its result.
+
+        True alone does not prove every owned resource stopped successfully.
+        """
+        return self._close_task is not None and self._close_task.done()
+
+    async def wait_closed(self) -> None:
+        """Observe shutdown without initiating it or owning another cleanup task.
+
+        Cancelling this waiter never cancels cleanup or other waiters. A late
+        waiter receives the same successful outcome or sanitized failure.
+        """
+        await self._closing_started.wait()
+        task = self._close_task
+        failed = False
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if not task.cancelled() or asyncio.current_task().cancelling():
+                raise
+            failed = True
+        except Exception:
+            failed = True
+        if failed:
+            raise CopilotLocalSessionError("Copilot local session cleanup did not complete successfully")
+
     def _begin_close(self):
         if self._close_task is None:
             self._close_task = asyncio.create_task(self._close())
             self._close_task.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+            self._closing_started.set()
         return self._close_task
 
     async def _close(self):

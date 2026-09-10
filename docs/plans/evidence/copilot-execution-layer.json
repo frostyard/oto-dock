@@ -1,0 +1,56 @@
+{
+  "result": "passed",
+  "sdk_version": "1.0.13",
+  "runtime_version": "1.0.83",
+  "live_turn_limit": 3,
+  "turn_deadline_seconds": 60,
+  "flow_deadline_seconds": 180,
+  "per_session_credit_limit": 30,
+  "sandboxed": true,
+  "actual_execution_layer": true,
+  "actual_sandbox_resolver": true,
+  "platform_registration": "actual layer-owned context",
+  "credential_store": "controlled scoped fixture",
+  "oauth_refresh": false,
+  "postgresql_account_store": false,
+  "duplicate_rejected_before_runtime": true,
+  "duplicate_preserved_context": true,
+  "turns": [
+    {
+      "generation": 1,
+      "resumed": false,
+      "marker_present": true,
+      "done_count": 1,
+      "tool_events": 0
+    },
+    {
+      "generation": 2,
+      "resumed": true,
+      "marker_present": true,
+      "done_count": 1,
+      "tool_events": 0
+    },
+    {
+      "generation": 3,
+      "resumed": false,
+      "first_text_received": true,
+      "done_before_abort": 0,
+      "tool_events": 0
+    }
+  ],
+  "normal_close_removed_context_and_joined": true,
+  "idle_revocation_removed_context_and_joined": true,
+  "idle_revocation_denied_platform_waiter": true,
+  "revoked_history_rejected_before_runtime": true,
+  "paused_producer_abort_returned_false": true,
+  "paused_producer_abort_joined_and_removed_context": true,
+  "aborted_history_rejected_before_runtime": true,
+  "layer_cleanup_joined_all_runtimes": true,
+  "layer_cleanup_removed_all_contexts": true,
+  "layer_cleanup_released_all_claims": true,
+  "layer_cleanup_stopped_all_credential_observers": true,
+  "scoped_store_reads": 577,
+  "runtime_count": 3,
+  "normal_cleanup": true,
+  "elapsed_seconds": 63.851
+}

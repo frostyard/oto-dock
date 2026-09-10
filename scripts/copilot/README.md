@@ -4,6 +4,29 @@ These are development probes for C1 of the
 [parity plan](../../docs/plans/copilot-parity.md). They do not register an engine,
 change an OtoDock installation, or establish full parity.
 
+## Local ExecutionLayer adapter
+
+`execution_layer_probe.py` exercises `CopilotExecutionLayer` through the real
+sandbox resolver, platform registration and permission cleanup. It requires the
+proxy dependencies, pinned SDK/runtime, bubblewrap and pasta:
+
+```bash
+python scripts/copilot/execution_layer_probe.py \
+  --runtime-dir /tmp/otodock-copilot-runtime/prebuilds/linux-x64 \
+  --live --use-gh-token --output /tmp/copilot-execution-layer.json
+```
+
+It makes at most three no-tool model turns: normal completion, explicit clean
+resume, and hard stop with the stream consumer paused. It also checks duplicate
+startup rejection and independent idle revocation, including denial of a held
+platform permission fixture. The overall deadline is 180 seconds, with bounded
+turns and a 30-credit ceiling per native session. Account storage, network-target
+discovery and knowledge attachments are controlled fixtures; the resolver,
+sandbox, layer and platform permission state are actual implementations.
+The engine remains unregistered. See the
+[adapter contract](../../docs/plans/copilot-execution-layer-contract.md) and
+[results](../../docs/plans/copilot-execution-layer-results.md).
+
 ## Account-bound local sessions
 
 `local_session_probe.py` exercises the composed session factory, durable writer
