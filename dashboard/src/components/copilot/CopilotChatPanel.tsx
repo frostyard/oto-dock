@@ -12,6 +12,8 @@ import {
 } from '../../api/copilotChat'
 import CopilotMessages, { type CopilotMessageItem as Item } from './CopilotMessages'
 import CopilotUsage from './CopilotUsage'
+import CopilotDelegations from './CopilotDelegations'
+import { CopilotDelegationError, mergeCopilotDelegates, type CopilotDelegateTask } from '../../lib/copilotDelegation'
 import { CopilotUsageError, mergeCopilotUsage, type CopilotUsageReport } from '../../lib/copilotUsage'
 
 const button = 'px-3 py-1.5 text-sm rounded-lg border border-p-border-light text-p-text disabled:opacity-40'
@@ -38,6 +40,7 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
   const [agent, setAgent] = useState(''), [account, setAccount] = useState('')
   const [model, setModel] = useState(''), [mode, setMode] = useState<ChatMode>('default')
   const [effort, setEffort] = useState('')
+  const [delegationEnabled, setDelegationEnabled] = useState(false)
   const [catalog, setCatalog] = useState<{ scope: string; models: CopilotModel[] } | null>(null)
   const [modelsLoading, setModelsLoading] = useState(false), [modelsError, setModelsError] = useState('')
   const catalogRequest = useRef<{ scope: string; controller: AbortController } | null>(null)
@@ -45,6 +48,8 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
   const [prompt, setPrompt] = useState(''), [items, setItems] = useState<Item[]>([])
   const [usageReports, setUsageReports] = useState<CopilotUsageReport[]>([]), [usageUnavailable, setUsageUnavailable] = useState(false)
   const usage = useRef({ cid: null as string | null, reports: new Map<string, CopilotUsageReport>(), invalid: false })
+  const [delegateTasks, setDelegateTasks] = useState<CopilotDelegateTask[]>([]), [delegationUnavailable, setDelegationUnavailable] = useState(false)
+  const delegates = useRef({ cid: null as string | null, tasks: new Map<string, CopilotDelegateTask>(), invalid: false })
   const [session, setSession] = useState<string | null>(null), [busy, setBusy] = useState(false)
   const [error, setError] = useState(''), [answering, setAnswering] = useState<string | null>(null)
   const life = useRef({ mounted: true, epoch: 0, creating: false, loading: false, cid: null as string | null, sid: null as string | null, busy: false, controller: null as AbortController | null, answer: null as string | null, closing: null as Promise<void> | null, cleanupFailed: false })
@@ -95,7 +100,7 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
     // current owner and producer. Reading a route is never a resume action.
     if (target === current.cid && !current.closing) return
     current.epoch++
-    resetUsage(target)
+    resetEvidence(target)
     setItems([]); setSelected(null); setPrompt('')
     void close().then(() => {
       if (!current.mounted || routeVersion.current !== version || current.cleanupFailed) return
@@ -111,9 +116,28 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [conversationId, status.data])
   const message = (e: unknown) => e instanceof CopilotChatError ? e.message : 'Copilot chat failed. Close this chat and try again.'
-  function resetUsage(cid: string | null) {
+  function resetEvidence(cid: string | null) {
     usage.current = { cid, reports: new Map(), invalid: false }
     setUsageReports([]); setUsageUnavailable(false)
+    delegates.current = { cid, tasks: new Map(), invalid: false }
+    setDelegateTasks([]); setDelegationUnavailable(false)
+  }
+  function invalidateDelegates(cid: string) {
+    if (delegates.current.cid !== cid) return
+    delegates.current.invalid = true; delegates.current.tasks.clear()
+    setDelegateTasks([]); setDelegationUnavailable(true)
+  }
+  function acceptDelegates(values: readonly unknown[], cid: string | null, live = false) {
+    const current = delegates.current
+    if (!cid || current.cid !== cid) return
+    try {
+      if (current.invalid) throw new CopilotDelegationError()
+      const tasks = mergeCopilotDelegates(current.tasks, values, live)
+      current.tasks = tasks; setDelegateTasks([...tasks.values()])
+    } catch {
+      invalidateDelegates(cid)
+      throw new CopilotDelegationError()
+    }
   }
   function invalidateUsage(cid: string) {
     if (usage.current.cid !== cid) return
@@ -160,11 +184,20 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
       if (current.mounted && current.epoch === epoch && current.cid === cid && !current.loading
           && (!agentName || data.conversation.agent === agentName)) {
         setSelected(data.conversation)
-        acceptUsage(data.events.filter(event => event.type === 'usage').map(({ seq: _sequence, ...event }) => event), cid)
+        // Each summary invalidates its own evidence. Failure in one must not
+        // suppress valid status changes in the other conversation summary.
+        try {
+          acceptUsage(data.events.filter(event => event.type === 'usage').map(({ seq: _sequence, ...event }) => event), cid)
+        } catch (error) { if (!(error instanceof CopilotUsageError)) throw error }
+        try {
+          acceptDelegates(data.events.filter(event => ['delegate_spawn', 'delegate_result'].includes(event.type)), cid)
+        } catch (error) { if (!(error instanceof CopilotDelegationError)) throw error }
       }
     }).catch(error => {
-      if (error instanceof CopilotUsageError && current.mounted && current.epoch === epoch
-          && current.cid === cid && !current.loading) invalidateUsage(cid)
+      if (current.mounted && current.epoch === epoch && current.cid === cid && !current.loading) {
+        if (error instanceof CopilotUsageError) invalidateUsage(cid)
+        if (error instanceof CopilotDelegationError) invalidateDelegates(cid)
+      }
     })
   }
   function close(): Promise<void> {
@@ -197,7 +230,8 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
     await close()
     if (current.mounted && !current.cleanupFailed) {
       current.epoch++; current.cid = null; current.loading = false
-      resetUsage(null)
+      resetEvidence(null)
+      setDelegationEnabled(false)
       display.current = { characters: 0, events: 0 }
       setItems([]); setSelected(null); setLoading(false); setError(''); setPrompt('')
       onConversationChange?.(null)
@@ -221,7 +255,7 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
   }
   async function readHistory(id: string, row?: CopilotConversation) {
     const current = life.current, epoch = ++current.epoch
-    resetUsage(id)
+    resetEvidence(id)
     current.cid = id; current.loading = true
     setSelected(row ?? null); setLoading(true); setItems([]); setPrompt(''); setError('')
     display.current = { characters: 0, events: 0 }
@@ -234,6 +268,7 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
     } catch (e) {
       if (current.mounted && current.epoch === epoch && current.cid === id) {
         if (e instanceof CopilotUsageError) invalidateUsage(id)
+        if (e instanceof CopilotDelegationError) invalidateDelegates(id)
         setError(message(e)); setItems([]); setSelected(row ? { ...row, can_resume: false } : null)
       }
     } finally {
@@ -272,6 +307,8 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
     budget(JSON.stringify(archived ? payload : event).length)
     if (event.type === 'usage') {
       acceptUsage([archived ? payload : event], life.current.cid)
+    } else if (['delegate_spawn', 'delegate_result'].includes(event.type)) {
+      acceptDelegates([event], life.current.cid, !archived)
     } else if (event.type === 'user' && typeof event.content === 'string') {
       setItems(old => [...old, { key: next.current++, kind: 'user', text: event.content as string }])
     } else if (event.type === 'text' && typeof event.content === 'string') {
@@ -321,15 +358,15 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
         // Do not cancel creation and lose its owner ID. Dispose late results.
         current.creating = true
         let owner
-        try { owner = await createCopilotChat({ agent: selectedAgent, account_id: selectedAccount, model: chosenModel, permission_mode: mode, ...(effort ? { reasoning_effort: effort as ReasoningEffort } : {}) }); sid = owner.session_id }
+        try { owner = await createCopilotChat({ agent: selectedAgent, account_id: selectedAccount, model: chosenModel, permission_mode: mode, ...(effort ? { reasoning_effort: effort as ReasoningEffort } : {}), ...(delegationEnabled ? { delegation_enabled: true } : {}) }); sid = owner.session_id }
         finally { current.creating = false }
         if (!valid()) {
           try { await closeCopilotChat(sid) } catch (e) { current.cleanupFailed = true; if (current.mounted) setError(message(e)) }
           return
         }
         current.cid = owner.conversation_id
-        resetUsage(owner.conversation_id)
-        setSelected({ id: owner.conversation_id, agent: selectedAgent, account_id: selectedAccount, model: chosenModel, permission_mode: mode, reasoning_effort: effort ? effort as ReasoningEffort : null, title: text.slice(0, 100), created_at: '', updated_at: '', state: 'open', revision: 1, can_resume: false, reason: '' })
+        resetEvidence(owner.conversation_id)
+        setSelected({ id: owner.conversation_id, agent: selectedAgent, account_id: selectedAccount, model: chosenModel, permission_mode: mode, reasoning_effort: effort ? effort as ReasoningEffort : null, delegation_enabled: delegationEnabled, title: text.slice(0, 100), created_at: '', updated_at: '', state: 'open', revision: 1, can_resume: false, reason: '' })
         current.sid = sid; setSession(sid)
         onConversationChange?.(owner.conversation_id, { replace: true })
       }
@@ -387,7 +424,10 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
             {reasoningEfforts.map(value => <option key={value} value={value}>{value}</option>)}
           </select></label>}
         <label>Permission mode<select className={input} value={selected?.permission_mode ?? mode} onChange={e => setMode(e.target.value as ChatMode)}><option value="default">Ask when needed</option><option value="acceptEdits">Accept edits</option><option value="plan">Plan only</option><option value="dontAsk">Deny actions needing approval</option></select></label>
+        {selected ? <label>Delegated tasks<input className={input} readOnly value={selected.delegation_enabled ? 'Enabled' : 'Disabled'} /></label>
+          : <label className="flex items-center gap-2"><input type="checkbox" checked={delegationEnabled} onChange={e => setDelegationEnabled(e.target.checked)} />Allow delegated tasks</label>}
       </fieldset>
+      <p className="text-xs text-p-text-secondary">Delegated workers use the target agent’s configured engine and account, with unattended task permissions.</p>
       {!selected && <div className="space-y-1 text-sm">
         <button type="button" className={button} disabled={modelsLoading || busy || loading || !!life.current.cid || !agentAccessible || !accountUsable() || life.current.cleanupFailed} onClick={() => void loadModels()}>{modelsLoading ? 'Loading available models…' : currentModels ? 'Reload available models' : 'Load available models'}</button>
         {modelsLoading && <p role="status">Checking models for this agent and account…</p>}
@@ -402,6 +442,7 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
       {!eligible.length && <p className="text-sm">Connect an active personal account in <Link className="underline" to="/user-settings?tab=ai-engines">AI Engines settings</Link>.</p>}
       <CopilotMessages items={items} activeSession={session} answering={answering} onAnswer={(item, approved, answers) => void answer(item, approved, answers)} streaming={busy && !!session} agentDisplayName={agents.data?.find(a => a.name === selectedAgent)?.display_name || selectedAgent} />
       <CopilotUsage reports={usageReports} unavailable={usageUnavailable} />
+      <CopilotDelegations tasks={delegateTasks} active={busy && !!session} unavailable={delegationUnavailable} />
       <form onSubmit={send} className="space-y-2">
         <label className="block text-sm text-p-text">Message<textarea className={input} maxLength={32768} rows={3} value={prompt} disabled={busy || loading || (!!life.current.cid && !session)} onChange={e => setPrompt(e.target.value)} /></label>
         <div className="flex gap-2"><button className={button} disabled={modelsLoading || busy || loading || (!!life.current.cid && !session) || !prompt.trim() || !selectedAgent || !selectedAccount || (!session && (!chosenModel || !effortValid)) || life.current.cleanupFailed}>Send</button>

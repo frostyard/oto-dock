@@ -216,6 +216,10 @@ def install_fake_sdk(monkeypatch):
     rpc = ModuleType("copilot.rpc")
     rpc.ToolsListRequest = ToolsListRequest
     sdk.rpc = rpc
+    sdk_tools = ModuleType("copilot.tools")
+    sdk_tools.Tool = SimpleNamespace
+    sdk_tools.ToolResult = SimpleNamespace
+    monkeypatch.setitem(sys.modules, "copilot.tools", sdk_tools)
     monkeypatch.setitem(sys.modules, "copilot", sdk)
     monkeypatch.setitem(sys.modules, "copilot.rpc", rpc)
 
@@ -1019,4 +1023,61 @@ async def test_owner_observer_precedes_usage_observer_validation(harness):
     with pytest.raises(harness.module.CopilotLocalSessionError):
         await open_session(harness, on_owner=captured.append, usage_observer="invalid")
     assert len(captured) == 1 and captured[0].usage_source_closed is True
+    assert harness.runtimes == [] and harness.guards == []
+
+
+@pytest.mark.asyncio
+async def test_delegation_callback_bound_before_create_and_reattached_on_resume(harness):
+    calls = []
+
+    async def handler(call_id, arguments):
+        calls.append((call_id, arguments))
+        return "child result"
+
+    selected = config(harness, delegation_targets=("repo", "qa"))
+    first = await open_session(harness, selected, delegate_handler=handler)
+    try:
+        options = harness.runtimes[0].client.opened[0].options
+        assert options["available_tools"] == ["builtin:bash", "builtin:view", "custom:oto_delegate"]
+        assert len(options["tools"]) == 1 and options["tools"][0].name == "oto_delegate"
+        assert options["mcp_servers"] == {}
+        _ = [item async for item in first.stream("complete")]
+        await first.close()
+        resumed = await open_session(harness, selected, resume=True, delegate_handler=handler)
+        try:
+            old_tool = options["tools"][0]
+            new_tool = harness.runtimes[1].client.opened[0].options["tools"][0]
+            assert old_tool is not new_tool and old_tool.handler != new_tool.handler
+            assert calls == []  # Registration/resume never executes delegation.
+        finally:
+            await resumed.close()
+    finally:
+        await clean(harness)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("before,after", [((), ("repo",)), (("repo",), ()), (("repo",), ("qa",))])
+async def test_delegation_profile_change_cannot_resume_or_launch_runtime(harness, before, after):
+    async def handler(*_):
+        return "result"
+
+    first = await open_session(harness, config(harness, delegation_targets=before),
+                               delegate_handler=handler if before else None)
+    _ = [item async for item in first.stream("complete")]
+    await first.close()
+    count = len(harness.runtimes)
+    try:
+        with pytest.raises(harness.module.CopilotLocalSessionError):
+            await open_session(harness, config(harness, delegation_targets=after), resume=True,
+                               delegate_handler=handler if after else None)
+        assert len(harness.runtimes) == count
+    finally:
+        await clean(harness)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("targets,handler", [((), True), (("repo",), None), (("repo",), "not-callable")])
+async def test_delegation_handler_and_profile_must_agree_before_resources(harness, targets, handler):
+    with pytest.raises(harness.module.CopilotLocalSessionError):
+        await open_session(harness, config(harness, delegation_targets=targets), delegate_handler=handler)
     assert harness.runtimes == [] and harness.guards == []

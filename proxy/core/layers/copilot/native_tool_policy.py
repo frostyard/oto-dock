@@ -14,6 +14,7 @@ import math
 from pathlib import Path
 import uuid
 
+from core.layers.copilot.host_tools import CopilotDelegationTool, DELEGATE_TOOL
 from core.layers.copilot.reasoning import valid_reasoning_effort
 from core.layers.copilot.permissions import _path, _text
 
@@ -129,10 +130,13 @@ def project_native_tool(name, args, *, working_directory):
 
 
 class CopilotNativeToolPolicy:
-    def __init__(self, bridge, *, enabled_tools: frozenset[str]):
+    def __init__(self, bridge, *, enabled_tools: frozenset[str], delegation=None):
         if (not isinstance(enabled_tools, frozenset) or not enabled_tools
                 or not enabled_tools <= SUPPORTED_NATIVE_TOOLS):
             raise ValueError("An explicit supported Copilot native tool subset is required")
+        if delegation is not None and (type(delegation) is not CopilotDelegationTool or delegation.bridge is not bridge):
+            raise ValueError("Invalid trusted Copilot delegation binding")
+        self.delegation = delegation
         self.bridge = bridge
         self.enabled_tools = enabled_tools
         self._session_claimed = False
@@ -151,6 +155,8 @@ class CopilotNativeToolPolicy:
             if not isinstance(tool, dict) or not isinstance(tool.get("name"), str):
                 raise ValueError("Invalid Copilot native tool catalog")
             name = tool["name"]
+            if self.delegation is not None and name == DELEGATE_TOOL:
+                raise ValueError("Copilot host tool collides with native catalog")
             if name in self.enabled_tools:
                 if name in selected or _structure(tool.get("parameters")) != _SCHEMAS[name]:
                     raise ValueError("Copilot native tool schema changed")
@@ -175,10 +181,12 @@ class CopilotNativeToolPolicy:
             raise ValueError("Copilot reasoning effort is invalid")
         return {
             **options,
-            "available_tools": [f"builtin:{name}" for name in sorted(self.enabled_tools)],
-            "tools": [], "mcp_servers": {},
+            "available_tools": [f"builtin:{name}" for name in sorted(self.enabled_tools)]
+                + ([f"custom:{DELEGATE_TOOL}"] if self.delegation is not None else []),
+            "tools": [self.delegation.sdk_tool()] if self.delegation is not None else [], "mcp_servers": {},
             "hooks": {"on_pre_tool_use": self.on_pre_tool_use},
-            "on_permission_request": self.bridge.on_permission_request,
+            "on_permission_request": (self.on_permission_request if self.delegation is not None
+                                      else self.bridge.on_permission_request),
             "on_user_input_request": self.bridge.on_user_input_request,
             "enable_config_discovery": False, "enable_file_hooks": False,
             "enable_host_git_operations": False,
@@ -233,6 +241,14 @@ class CopilotNativeToolPolicy:
             pass
         raise NativePolicySessionError("Copilot native policy session could not be opened")
 
+    async def on_permission_request(self, request, invocation):
+        # Native admission alone cannot execute a host capability. The fixed
+        # handler reauthorizes through Oto immediately before dispatch, once.
+        from copilot.rpc import PermissionDecisionApproveOnce
+        if self.delegation is not None and self.delegation.admit_permission(request, invocation):
+            return PermissionDecisionApproveOnce()
+        return await self.bridge.on_permission_request(request, invocation)
+
     async def on_pre_tool_use(self, request, invocation):
         def project():
             if (not isinstance(original, dict) or request != original
@@ -246,6 +262,12 @@ class CopilotNativeToolPolicy:
 
         try:
             original = deepcopy(request)
+            if (self.delegation is not None and isinstance(original, dict)
+                    and original.get("sessionId") == invocation.get("session_id")
+                    and original.get("workingDirectory") == self.bridge.working_directory
+                    and not original.keys() - {"sessionId", "timestamp", "workingDirectory", "toolName", "toolArgs"}
+                    and self.delegation.admit(original.get("toolName"), original.get("toolArgs"), invocation)):
+                return {"permissionDecision": "allow"}
             allowed = await self.bridge.authorize_operation(project, invocation, require_bound_session=True)
             if allowed is True and request == original and project() is not None:
                 return {"permissionDecision": "allow"}

@@ -74,6 +74,9 @@ class _Entry:
     model: str
     mode: str
     reasoning_effort: str | None = None
+    delegation_enabled: bool = False
+    workers: dict = field(default_factory=dict)
+    delegation_pending: set = field(default_factory=set)
     handle: str = ""
     cid: str = ""
     resume: bool = False
@@ -317,6 +320,8 @@ class CopilotChatService:
 
     async def _config(self, entry, user):
         options = {"reasoning_effort": entry.reasoning_effort} if entry.reasoning_effort is not None else {}
+        if entry.delegation_enabled:
+            options["delegation_enabled"] = True
         async with asyncio.timeout(self.authorization_timeout):
             return await build_copilot_agent_config(
                 user=user, agent_name=entry.agent, account_id=entry.account_id,
@@ -473,7 +478,7 @@ class CopilotChatService:
             await self._db("create", entry.cid, entry.user.sub, agent=entry.agent,
                            account_id=entry.account_id, model=entry.model, permission_mode=entry.mode,
                            platform_session_id=entry.sid, generation=entry.handle,
-                           reasoning_effort=entry.reasoning_effort, entry=entry)
+                           reasoning_effort=entry.reasoning_effort, delegation_enabled=entry.delegation_enabled, entry=entry)
         self._check(entry)
         async with asyncio.timeout(5):
             admission = await acquire_chat_slot(entry.sid, target="local", execution_path="copilot-cli", user_sub=entry.user.sub)
@@ -485,7 +490,12 @@ class CopilotChatService:
         config.resume = entry.resume
         entry.usage_task = asyncio.create_task(self._record_usage(entry))
         entry.layer_start_attempted = True
-        await self.layer.start_session(entry.sid, config, usage_observer=lambda frame: self._receive_usage(entry, frame))
+        options = {}
+        if entry.delegation_enabled:
+            async def delegate(tool_call_id, args):
+                return await self._delegate(entry, tool_call_id, args)
+            options["delegate_handler"] = delegate
+        await self.layer.start_session(entry.sid, config, usage_observer=lambda frame: self._receive_usage(entry, frame), **options)
         self._check(entry)
         entry.last_activity = asyncio.get_running_loop().time()
 
@@ -506,15 +516,99 @@ class CopilotChatService:
         await self._close_entry(entry)
         raise CopilotChatError(status, "Copilot session could not be started")
 
-    async def create(self, user, agent, account_id, model, permission_mode="default", reasoning_effort=None):
+    async def create(self, user, agent, account_id, model, permission_mode="default", reasoning_effort=None, delegation_enabled=False):
         _human(user)
-        if not valid_reasoning_effort(reasoning_effort):
-            raise CopilotChatError(422, "Invalid Copilot reasoning effort")
+        if not valid_reasoning_effort(reasoning_effort) or type(delegation_enabled) is not bool:
+            raise CopilotChatError(422, "Invalid Copilot conversation options")
         self._capacity(user)
         sid = str(uuid.uuid4())
         entry = _Entry(sid, deepcopy(user), agent, account_id, model, permission_mode,
-                       reasoning_effort=reasoning_effort, handle=sid, cid=str(uuid.uuid4()))
+                       reasoning_effort=reasoning_effort, delegation_enabled=delegation_enabled, handle=sid, cid=str(uuid.uuid4()))
         return await self._launch(entry)
+
+    async def _delegate(self, entry, tool_call_id, args):
+        from core.layers.copilot.host_tools import valid_delegate_args
+        from services.delegation.copilot_worker import OwnedCopilotWorker
+
+        self._check(entry)
+        turn = entry.turn
+        if (not entry.delegation_enabled or turn is None or not turn._durable_started
+                or turn._failed or turn._complete
+                or not valid_delegate_args(args, entry.config.delegation_targets)
+                or tool_call_id in entry.delegation_pending
+                or len(entry.delegation_pending) >= 4):
+            raise CopilotChatError(403, "Copilot delegation is unavailable")
+        # Reserve before any await so simultaneous host callbacks share one cap.
+        entry.delegation_pending.add(tool_call_id)
+        worker = None
+
+        def parent_valid():
+            return (self._entries.get(entry.sid) is entry and self._closing is None
+                    and entry.closing is None and entry.turn is turn
+                    and not turn._failed and not turn._complete)
+
+        async def authorize_parent():
+            # Do not await parent shutdown from an owned child callback: parent
+            # cleanup must join this callback, so that would form a wait cycle.
+            try:
+                self._check(entry)
+                current = await self._config(entry, entry.user)
+                self._check(entry)
+                if not parent_valid() or current != entry.config:
+                    raise ValueError()
+            except (Exception, asyncio.CancelledError):
+                self._begin_close(entry)
+                raise CopilotChatError(403, "Copilot delegation is unavailable") from None
+
+        async def publish(frame):
+            await authorize_parent()
+            emission = asyncio.create_task(turn._emit(frame))
+            try:
+                while not emission.done():
+                    await asyncio.wait({emission}, timeout=0.1)
+                    if not parent_valid():
+                        raise CopilotChatError(503, "Copilot delegation is unavailable")
+                await emission
+            finally:
+                # Startup owns this publisher. A disconnected full SSE queue
+                # must not hold startup while parent shutdown joins its child.
+                # _db still joins any in-flight commit before emission ends.
+                async def settle():
+                    if not emission.done():
+                        emission.cancel()
+                    await asyncio.gather(emission, return_exceptions=True)
+                await _join(asyncio.create_task(settle()))
+
+        try:
+            await authorize_parent()
+            reserved = await self._db("reserve_delegation", entry.cid, entry.user.sub,
+                                      entry.handle, tool_call_id, args, entry=entry)
+            if not reserved:
+                raise CopilotChatError(409, "Copilot delegation was already requested")
+            await authorize_parent()
+            worker = OwnedCopilotWorker(
+                user=deepcopy(entry.user), source_agent=entry.agent, target_agent=args["agent"],
+                name=args["name"], prompt=args["prompt"], tool_call_id=tool_call_id,
+                parent_valid=parent_valid, authorize_parent=authorize_parent, publish=publish,
+            )
+            entry.workers[tool_call_id] = worker
+            result = await worker.run()
+            await worker.close()
+            await authorize_parent()
+            frame = {**result, "type": "delegate_result", "tool_id": tool_call_id, "name": args["name"]}
+            await publish(frame)
+            return json.dumps(result, ensure_ascii=False, allow_nan=False)
+        finally:
+            if worker is not None:
+                cleanup = asyncio.create_task(worker.close())
+                try:
+                    await _join(cleanup)
+                except BaseException:
+                    self._begin_close(entry)
+                    raise
+                else:
+                    entry.workers.pop(tool_call_id, None)
+            entry.delegation_pending.discard(tool_call_id)
 
     async def _model_credential(self, entry):
         from storage.copilot_account_store import read_credential
@@ -610,6 +704,7 @@ class CopilotChatService:
                   "created_at", "updated_at", "state", "revision")
         metadata = {key: row[key].isoformat() if hasattr(row[key], "isoformat") else row[key] for key in fields}
         metadata["reasoning_effort"] = row.get("reasoning_effort")
+        metadata["delegation_enabled"] = row.get("delegation_enabled", False)
         metadata.update(can_resume=bool(resumable), reason="Ready to resume" if resumable else "Conversation is not ready to resume")
         return metadata
 
@@ -659,7 +754,8 @@ class CopilotChatService:
         if sid in self._entries:
             raise CopilotChatError(409, "Copilot conversation already has an owner")
         entry = _Entry(sid, deepcopy(user), row["agent"], row["account_id"], row["model"], row["permission_mode"],
-                       reasoning_effort=row.get("reasoning_effort"), handle=str(uuid.uuid4()), cid=cid,
+                       reasoning_effort=row.get("reasoning_effort"), delegation_enabled=row.get("delegation_enabled", False),
+                       handle=str(uuid.uuid4()), cid=cid,
                        resume=True, expected_revision=expected_revision)
         return await self._launch(entry)
 
@@ -770,6 +866,7 @@ class CopilotChatService:
                 if not entry.turn._complete:
                     entry.turn._failed = True
                 cleanup.append(entry.turn._stop())
+            cleanup.extend(worker.close() for worker in tuple(entry.workers.values()))
             results = await asyncio.gather(*cleanup, return_exceptions=True)
             native_dead = (not entry.layer_start_attempted
                            or await self.layer.is_session_process_dead(entry.sid))

@@ -156,20 +156,48 @@ def _documents(agent_name, username):
     return documents
 
 
-def _prompt(agent_name, ctx, enabled_tools):
+def _delegation_targets(sub, source):
+    from services.mcp import mcp_registry
+    from storage import mcp_store
+    from core.layers.copilot.host_tools import valid_delegation_targets
+
+    state = mcp_store.get_mcp_state("delegation-mcp")
+    if (not state or state.get("enabled") is not True
+            or "delegation-mcp" not in {m.name for m in mcp_registry.get_agent_mcps(source)}):
+        raise ValueError()
+    targets = []
+    for target in agent_store.get_delegation_targets(source):
+        try:
+            _authority(sub, target)
+        except ValueError:
+            continue
+        targets.append(target)
+    result = tuple(sorted(set(targets)))
+    if not result or not valid_delegation_targets(result):
+        raise ValueError()
+    return result
+
+
+def _prompt(agent_name, ctx, enabled_tools, delegation_targets=()):
     files = _documents(agent_name, ctx.mount_username)
     parts = [body if index == 0 else f"\n## {name}\n{body}"
              for index, (name, body) in enumerate(files)]
     parts.append("\nRespond in the same language the user uses unless they ask you to switch.")
     parts.append("\n# Native tools\nEnabled tools: " + ", ".join(sorted(enabled_tools))
                  + ". All tool operations require the current session's permission policy."
-                 + " MCP servers, delegation tools, and remote execution are unavailable in this profile.")
+                 + (" MCP servers and remote execution are unavailable in this profile." if delegation_targets else
+                    " MCP servers, delegation tools, and remote execution are unavailable in this profile."))
+    if delegation_targets:
+        parts.append("\n# Delegated tasks\nUse oto_delegate with agent, name, and prompt to request a bounded task. "
+                     "Authorized targets: " + ", ".join(delegation_targets) +
+                     ". Workers use their configured engine, credentials, and unattended permissions. "
+                     "The tool waits for the worker result. Nested delegation is unavailable.")
     parts.append(build_permission_context(ctx, assigned_mcp_names=(), execution_path="copilot-cli"))
     return "\n".join(parts)
 
 
 def _build(sub, agent_name, account_id, account_scope, model, permission_mode,
-           client_type, resume, enabled_tools, reasoning_effort):
+           client_type, resume, enabled_tools, reasoning_effort, delegation_enabled):
     facts = _authority(sub, agent_name)
     user, agent, role, libraries = facts
     if account_scope.kind is AccountScopeKind.PLATFORM and user.get("allow_platform_auth") is not True:
@@ -185,16 +213,18 @@ def _build(sub, agent_name, account_id, account_scope, model, permission_mode,
         config_visible=role in {"admin", "manager"}, available_scopes=available,
         knowledge_libraries=libraries,
     )
+    targets = _delegation_targets(sub, agent_name) if delegation_enabled else ()
     result = CopilotAgentConfig(
         agent_name=agent_name, user_sub=sub, account_id=account_id, account_scope=account_scope,
         model=model, permission_mode=permission_mode, client_type=client_type, resume=resume,
         enabled_tools=enabled_tools, security_context=ctx, effort=reasoning_effort or "",
-        system_prompt=_prompt(agent_name, ctx, enabled_tools),
+        system_prompt=_prompt(agent_name, ctx, enabled_tools, targets), delegation_targets=targets,
     )
     # The validator is independent of runtime/root provisioning. Keep one source
     # of truth for the native profile's configuration boundary.
     CopilotExecutionLayer._validate(str(uuid.uuid4()), result)
-    if _authority(sub, agent_name) != facts:
+    if (_authority(sub, agent_name) != facts
+            or (delegation_enabled and _delegation_targets(sub, agent_name) != targets)):
         raise ValueError()
     copilot_account_store.read_credential(account_id, account_scope)
     return result
@@ -224,7 +254,8 @@ async def authorize_copilot_history(user: UserContext, agent_name: str) -> None:
 async def build_copilot_agent_config(*, user: UserContext, agent_name: str,
                                      account_id: str, account_scope: CopilotAccountScope,
                                      model: str, permission_mode="default", client_type="dashboard",
-                                     resume=False, enabled_tools=frozenset(), reasoning_effort=None) -> CopilotAgentConfig:
+                                     resume=False, enabled_tools=frozenset(), reasoning_effort=None,
+                                     delegation_enabled=False) -> CopilotAgentConfig:
     """Build from a current human identity and an explicitly selected payer.
 
     Platform borrowing requires the driver's current Platform Auth toggle and
@@ -246,11 +277,11 @@ async def build_copilot_agent_config(*, user: UserContext, agent_name: str,
                 or client_type not in {"dashboard", "sse"} or type(resume) is not bool
                 or type(enabled_tools) is not frozenset or not enabled_tools
                 or not enabled_tools <= SUPPORTED_NATIVE_TOOLS
-                or not valid_reasoning_effort(reasoning_effort)):
+                or not valid_reasoning_effort(reasoning_effort) or type(delegation_enabled) is not bool):
             raise ValueError()
         return await asyncio.to_thread(
             _build, user.sub, agent_name, account_id, account_scope, model,
-            permission_mode, client_type, resume, enabled_tools, reasoning_effort,
+            permission_mode, client_type, resume, enabled_tools, reasoning_effort, delegation_enabled,
         )
     except Exception:
         failed = True

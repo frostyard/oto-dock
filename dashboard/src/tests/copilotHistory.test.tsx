@@ -21,7 +21,7 @@ vi.mock('../hooks/useActiveChats', () => ({ useActiveChats: () => [] }))
 vi.mock('../components/chat/ActiveChatsPanel', () => ({ default: () => null }))
 
 function row(title = 'Saved Copilot conversation', agent = 'dev', id = 'conversation-1'): CopilotConversation {
-  return { id, agent, account_id: 'account', model: 'model', permission_mode: 'default', reasoning_effort: null, title,
+  return { id, agent, account_id: 'account', model: 'model', permission_mode: 'default', reasoning_effort: null, delegation_enabled: false, title,
     created_at: '2026-09-10', updated_at: '2026-09-10', state: 'closed', revision: 1, can_resume: true, reason: '' }
 }
 function Position() { return <output data-testid="location">{useLocation().pathname}</output> }

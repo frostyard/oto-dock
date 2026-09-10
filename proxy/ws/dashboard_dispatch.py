@@ -54,6 +54,10 @@ class ClientMessageDispatcher:
     async def _dispatch_client_message(self, msg: dict) -> str | None:
 
         msg_type = msg.get("type", "")
+        from ws.dashboard import owned_worker_message_blocked
+        if owned_worker_message_blocked(self.chat_id, msg):
+            await self._send_error("This delegated worker is still owned by its parent. Wait for cleanup to finish.")
+            return None
 
         if msg_type == "pre_warmup":
             # Background so the dispatcher can keep processing the user's

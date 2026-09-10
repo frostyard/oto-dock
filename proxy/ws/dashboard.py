@@ -510,6 +510,11 @@ def task_run_active(chat_id: str) -> bool:
     ``chats.model`` at record time) and can kill a launching run. Non-task
     chats and lookup errors return False (this augments, never replaces,
     ``chat_process_alive``)."""
+    from core.session.worker_ownership import is_owned_worker_chat
+    # A terminal run row does not prove that its owner joined native cleanup.
+    # Retained failure claims protect the lane even when DB reads are down.
+    if is_owned_worker_chat(chat_id):
+        return True
     if not chat_id.startswith("task-"):
         return False
     try:
@@ -525,10 +530,24 @@ def task_run_active(chat_id: str) -> bool:
 async def task_run_active_async(chat_id: str) -> bool:
     """``task_run_active`` with its two run reads on the DB executor — for
     the async handlers (non-task chats short-circuit without a job)."""
+    from core.session.worker_ownership import is_owned_worker_chat
+    if is_owned_worker_chat(chat_id):
+        return True
     if not chat_id.startswith("task-"):
         return False
     from storage.pg import run_db
     return await run_db(task_run_active, chat_id)
+
+
+def owned_worker_message_blocked(chat_id: str | None, msg: dict) -> bool:
+    """Owned worker lanes permit observation, never another dashboard driver."""
+    from core.session.worker_ownership import is_owned_worker_chat
+    if msg.get("type") in {"resume_chat", "chat_read", "probe_liveness", "client_info",
+                           "user_active", "user_idle", "ping", "close"}:
+        return False
+    # Bound-lane controls frequently ignore a supplied chat_id. Check both
+    # identities so an unrelated field cannot bypass the bound owner.
+    return is_owned_worker_chat(chat_id) or is_owned_worker_chat(msg.get("chat_id"))
 
 
 def _resume_username_for_chat(

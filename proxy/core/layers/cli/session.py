@@ -1236,6 +1236,8 @@ async def get_or_create_persistent_session(
 
     # Start outside the pool lock (slow: MCP init)
     try:
+        from core.session.worker_ownership import capture_session
+        capture_session(session)
         await session.start()
     except BaseException:
         # A failed start leaves the entry unreachable (never is_alive) — drop
@@ -1346,6 +1348,5 @@ async def reap_idle_sessions() -> None:
     while True:
         await asyncio.sleep(60)
         await _reap_idle_pass()
-
 
 

@@ -73,10 +73,13 @@ class Service:
         finally:
             self.closed.set()
 
-    async def create(self, user, agent, account_id, model, permission_mode="default", reasoning_effort=None):
+    async def create(self, user, agent, account_id, model, permission_mode="default", reasoning_effort=None,
+                     delegation_enabled=False):
         options = {"agent": agent, "account_id": account_id, "model": model, "permission_mode": permission_mode}
         if reasoning_effort is not None:
             options["reasoning_effort"] = reasoning_effort
+        if delegation_enabled:
+            options["delegation_enabled"] = delegation_enabled
         self.calls.append(("create", user, options))
         if self.error:
             raise self.error
@@ -794,5 +797,34 @@ async def test_create_rejects_invalid_reasoning_before_dispatch(api, effort):
     ('/models', {'agent': 'demo', 'account_id': 'account-one', 'reasoning_effort': 'high'}),
 ])
 async def test_reasoning_cannot_override_resume_or_catalog_options(api, path, body):
+    response = await post(api, path, body)
+    assert response.status_code == 422 and not api.service.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('enabled', [False, True])
+async def test_create_delegation_requires_explicit_strict_opt_in(api, enabled):
+    response = await post(api, body=create_body(delegation_enabled=enabled))
+    assert response.status_code == 201
+    expected = create_body(permission_mode='default')
+    if enabled:
+        expected['delegation_enabled'] = True
+    assert api.service.calls == [('create', api.user[0], expected)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('enabled', [None, 0, 1, 'true', 'false', [], {}])
+async def test_delegation_rejects_coerced_flags_before_dispatch(api, enabled):
+    response = await post(api, body=create_body(delegation_enabled=enabled))
+    assert response.status_code == 422 and not api.service.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('path,body', [
+    (f'/conversations/{CID}/resume', {'revision': 1, 'delegation_enabled': True}),
+    ('/models', {'agent': 'demo', 'account_id': 'account-one', 'delegation_enabled': True}),
+    (f'/sessions/{SID}/turn', {'text': 'hello', 'delegation_enabled': True}),
+])
+async def test_delegation_cannot_be_enabled_by_resume_discovery_or_turn(api, path, body):
     response = await post(api, path, body)
     assert response.status_code == 422 and not api.service.calls

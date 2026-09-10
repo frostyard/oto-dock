@@ -2010,6 +2010,7 @@ def init_copilot_conversations(conn) -> None:
     """)
     # Nullable for conversations created before effort selection was supported.
     # Omitting effort preserves their original model-default behavior.
+    conn.execute("ALTER TABLE copilot_conversations ADD COLUMN IF NOT EXISTS delegation_enabled BOOLEAN NOT NULL DEFAULT FALSE")
     conn.execute("""ALTER TABLE copilot_conversations
                     ADD COLUMN IF NOT EXISTS reasoning_effort TEXT
                     CHECK (reasoning_effort IN ('low','medium','high','xhigh','max'))""")

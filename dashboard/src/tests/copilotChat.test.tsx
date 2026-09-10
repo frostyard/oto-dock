@@ -7,6 +7,7 @@ vi.mock('@/api/auth', () => ({ apiFetch }))
 vi.mock('@/contexts/AuthContext', () => ({ useAuth: () => auth }))
 import * as chat from '@/api/copilotChat'
 import { CopilotUsageError } from '@/lib/copilotUsage'
+import { CopilotDelegationError } from '@/lib/copilotDelegation'
 import { CopilotChatPreview } from '@/pages/UserSettings.copilotChat'
 class ObserverStub { observe() {} unobserve() {} disconnect() {} }
 vi.stubGlobal('ResizeObserver', ObserverStub)
@@ -229,7 +230,7 @@ it('closing an unanswered question never labels it answered', async () => {
 })
 
 const savedConversation = (overrides: Partial<chat.CopilotConversation> = {}): chat.CopilotConversation => ({
-  id: 'conversation-a', agent: 'demo', account_id: 'account-1', model: 'saved-model', permission_mode: 'plan', reasoning_effort: null,
+  id: 'conversation-a', agent: 'demo', account_id: 'account-1', model: 'saved-model', permission_mode: 'plan', reasoning_effort: null, delegation_enabled: false,
   title: 'Saved work', created_at: 100, updated_at: 200, state: 'closed', revision: 7, can_resume: true, reason: '', ...overrides,
 })
 function savedFixture(row = savedConversation(), events: chat.ChatEvent[] = [{ seq: 1, type: 'text', content: 'Saved response' }]) {
@@ -586,4 +587,96 @@ it('loads usage reported after transport completion and clears it on a user chan
   page.rerender(<QueryClientProvider client={client}><MemoryRouter><CopilotChatPreview /></MemoryRouter></QueryClientProvider>)
   expect(screen.queryByRole('region', { name: 'Reported usage' })).not.toBeInTheDocument()
   await waitFor(() => expect(apiFetch.mock.calls.some(([url, options]) => url.endsWith('/session-1') && options.method === 'DELETE')).toBe(true))
+})
+const delegatedSpawn = { type: 'delegate_spawn', tool_id: 'native-delegate', task_id: 'task-delegate', run_id: 'run-delegate', chat_id: 'child-chat', agent: 'repo-agent', name: 'Check migration' }
+const delegatedResult = { ...delegatedSpawn, type: 'delegate_result', status: 'completed', output: 'QA found no regressions.' }
+it('sends delegation only after explicit opt-in and makes the active setting immutable', async () => {
+  mount()
+  expect(await screen.findByRole('checkbox', { name: 'Allow delegated tasks' })).not.toBeChecked()
+  fireEvent.click(screen.getByRole('checkbox', { name: 'Allow delegated tasks' }))
+  await send(); await screen.findByText('Hello from Copilot')
+  expect(JSON.parse(apiFetch.mock.calls.find(([url]) => url.endsWith('/sessions'))![1].body).delegation_enabled).toBe(true)
+  expect(screen.getByRole('textbox', { name: 'Delegated tasks' })).toHaveValue('Enabled')
+  expect(screen.getByRole('textbox', { name: 'Delegated tasks' })).toBeDisabled()
+  await waitFor(() => expect(screen.getByRole('button', { name: 'New chat' })).toBeEnabled())
+  fireEvent.click(screen.getByRole('button', { name: 'New chat' }))
+  expect(await screen.findByRole('checkbox', { name: 'Allow delegated tasks' })).not.toBeChecked()
+})
+it('normalizes legacy delegation settings and rejects nonboolean create or saved values', async () => {
+  const { delegation_enabled: _enabled, ...legacy } = savedConversation()
+  apiFetch.mockResolvedValueOnce(json({ conversation: legacy, events: [] }))
+  expect((await chat.getCopilotConversation(legacy.id)).conversation.delegation_enabled).toBe(false)
+  for (const value of [null, 1, 'true']) {
+    apiFetch.mockResolvedValueOnce(json({ conversation: { ...legacy, delegation_enabled: value }, events: [] }))
+    await expect(chat.getCopilotConversation(legacy.id)).rejects.toThrow(chat.CopilotChatError)
+    const count = apiFetch.mock.calls.length
+    await expect(chat.createCopilotChat({ agent: 'demo', account_id: 'account-1', model: 'model', permission_mode: 'default', delegation_enabled: value as unknown as boolean })).rejects.toThrow(chat.CopilotChatError)
+    expect(apiFetch.mock.calls.length).toBe(count)
+  }
+})
+it('resumes the saved delegation setting without an override and keeps archived worker cards inert', async () => {
+  const row = savedFixture(savedConversation({ delegation_enabled: true }), [{ seq: 1, ...delegatedSpawn }, { seq: 2, ...delegatedResult }])
+  const base = apiFetch.getMockImplementation()!
+  apiFetch.mockImplementation((url, options) => url.endsWith('/resume') ? Promise.resolve(json({ session_id: 'fresh-owner', conversation_id: row.id })) : base(url, options))
+  mount(); await selectSaved()
+  expect(screen.getByRole('textbox', { name: 'Delegated tasks' })).toHaveValue('Enabled')
+  expect(screen.getByRole('region', { name: 'Delegated tasks' })).toHaveTextContent('Completed')
+  expect(screen.getByRole('link', { name: 'Open worker run in new tab' })).toHaveAttribute('href', '/runs/run-delegate')
+  fireEvent.click(screen.getByRole('button', { name: 'Resume conversation' }))
+  await waitFor(() => expect(apiFetch.mock.calls.some(([url]) => url.endsWith('/resume'))).toBe(true))
+  expect(JSON.parse(apiFetch.mock.calls.find(([url]) => url.endsWith('/resume'))![1].body)).toEqual({ revision: row.revision })
+  expect(screen.getAllByText('Check migration')).toHaveLength(1)
+})
+it('merges live worker progress and late saved results once without replacing parent text', async () => {
+  const row = savedConversation({ id: 'conversation-1', delegation_enabled: true }), pending = deferred<void>()
+  vi.spyOn(chat, 'getCopilotConversation').mockResolvedValue({ conversation: row, events: [{ seq: 1, ...delegatedSpawn }, { seq: 2, ...delegatedResult }] })
+  vi.spyOn(chat, 'streamCopilotTurn').mockImplementation(async (_sid, _text, _signal, emit) => {
+    emit(delegatedSpawn); emit(delegatedSpawn); emit({ type: 'text', content: 'Parent waits for QA' }); await pending.promise
+  })
+  mount(); await send()
+  expect(await screen.findByText('Running')).toBeInTheDocument()
+  expect(screen.getAllByText('Check migration')).toHaveLength(1)
+  await act(async () => pending.resolve())
+  expect(await screen.findByText('Completed')).toBeInTheDocument()
+  expect(screen.getByText('Parent waits for QA')).toBeInTheDocument()
+  expect(screen.getAllByText('Check migration')).toHaveLength(1)
+})
+it('rejects malformed history delegation through the typed parser', async () => {
+  const row = savedConversation()
+  apiFetch.mockResolvedValueOnce(json({ conversation: row, events: [{ seq: 1, ...delegatedSpawn, agent: '../other' }] }))
+  await expect(chat.getCopilotConversation(row.id)).rejects.toThrow(CopilotDelegationError)
+})
+it('closes on conflicting worker evidence and does not show an invented result', async () => {
+  vi.spyOn(chat, 'streamCopilotTurn').mockImplementation(async (_sid, _text, _signal, emit) => {
+    emit(delegatedSpawn); emit({ ...delegatedResult, run_id: 'unrelated-run' })
+  })
+  mount(); await send()
+  expect(await screen.findByText('Delegated task status is unavailable.')).toBeInTheDocument()
+  await waitFor(() => expect(apiFetch.mock.calls.some(([url, options]) => url.endsWith('/session-1') && options.method === 'DELETE')).toBe(true))
+  expect(screen.queryByText('Completed')).not.toBeInTheDocument()
+})
+it('does not merge a late worker result into a new conversation', async () => {
+  const row = savedConversation({ id: 'conversation-1' }), pending = deferred<{ conversation: chat.CopilotConversation; events: chat.ChatEvent[] }>()
+  vi.spyOn(chat, 'getCopilotConversation').mockReturnValue(pending.promise)
+  vi.spyOn(chat, 'streamCopilotTurn').mockImplementation(async (_sid, _text, _signal, emit) => { emit(delegatedSpawn) })
+  mount(); await send()
+  await waitFor(() => expect(screen.getByRole('button', { name: 'New chat' })).toBeEnabled())
+  fireEvent.click(screen.getByRole('button', { name: 'New chat' }))
+  await waitFor(() => expect(screen.queryByRole('region', { name: 'Delegated tasks' })).not.toBeInTheDocument())
+  await act(async () => pending.resolve({ conversation: row, events: [{ seq: 1, ...delegatedSpawn }, { seq: 2, ...delegatedResult }] }))
+  expect(screen.queryByRole('region', { name: 'Delegated tasks' })).not.toBeInTheDocument()
+})
+it('unavailable usage cannot suppress a valid delegated result from close history', async () => {
+  const row = savedConversation({ id: 'conversation-1', delegation_enabled: true })
+  vi.spyOn(chat, 'getCopilotConversation').mockResolvedValue({ conversation: row, events: [
+    { seq: 1, ...delegatedSpawn }, { seq: 2, ...delegatedResult }, { seq: 3, ...usageFrame(usageOne) },
+  ] })
+  vi.spyOn(chat, 'streamCopilotTurn').mockImplementation(async (_sid, _text, _signal, emit) => {
+    emit(delegatedSpawn); emit(usageFrame(usageOne)); emit(usageFrame(usageOne, 11))
+  })
+  mount(); await send()
+  expect(await screen.findByText('Reported usage is unavailable.')).toBeInTheDocument()
+  expect(await screen.findByText('Completed')).toBeInTheDocument()
+  expect(screen.getByText('QA found no regressions.')).toBeInTheDocument()
+  expect(screen.queryByText('Input tokens')).not.toBeInTheDocument()
 })

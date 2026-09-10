@@ -434,3 +434,93 @@ async def test_invalid_reasoning_effort_fails_before_account_lookup(facts, effor
     with pytest.raises(builder.CopilotConfigError):
         await build(facts, reasoning_effort=effort)
     assert not facts.reads
+
+
+@pytest.fixture
+def delegation(facts, monkeypatch):
+    from services.mcp import mcp_registry
+    from storage import mcp_store
+
+    state = SimpleNamespace(enabled=True, assigned=True, targets=['qa', 'repo', 'hidden', 'repo'], calls=0,
+                            on_scan=None)
+    agents = [facts.agent] + [{**facts.agent, 'slug': slug} for slug in ['qa', 'repo', 'hidden']]
+    facts.roles.update(qa='viewer', repo='editor')
+    monkeypatch.setattr(builder.agent_store, 'get_all_agents', lambda: agents)
+    monkeypatch.setattr(builder.agent_store, 'get_delegation_targets', lambda source: state.targets)
+    monkeypatch.setattr(mcp_store, 'get_mcp_state', lambda name: {'enabled': state.enabled})
+
+    def assigned(source):
+        assert source == 'demo'
+        state.calls += 1
+        if state.on_scan:
+            state.on_scan(state.calls)
+        return [SimpleNamespace(name='delegation-mcp')] if state.assigned else []
+
+    monkeypatch.setattr(mcp_registry, 'get_agent_mcps', assigned)
+    return state
+
+
+@pytest.mark.asyncio
+async def test_opted_in_roster_uses_only_current_accessible_assigned_targets(facts, delegation):
+    result = await build(facts, delegation_enabled=True)
+    assert result.delegation_targets == ('qa', 'repo')
+    assert 'Authorized targets: qa, repo' in result.system_prompt
+    assert 'hidden' not in result.system_prompt
+    assert 'Nested delegation is unavailable' in result.system_prompt
+    assert delegation.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_default_native_config_never_loads_or_advertises_delegation(facts, delegation, monkeypatch):
+    def forbidden(*_):
+        pytest.fail('Default-off delegation must not consult the MCP roster')
+    delegation.on_scan = forbidden
+    monkeypatch.setattr(builder, '_delegation_targets', forbidden)
+    result = await build(facts)
+    assert result.delegation_targets == ()
+    assert 'Authorized targets:' not in result.system_prompt
+    assert ('\n# Native tools\nEnabled tools: bash, view. All tool operations require the current '
+            "session's permission policy. MCP servers, delegation tools, and remote execution "
+            'are unavailable in this profile.') in result.system_prompt
+    explicit_default = await build(facts, delegation_enabled=False)
+    assert explicit_default.system_prompt == result.system_prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('change', ['disabled', 'unassigned', 'empty', 'inaccessible'])
+async def test_opt_in_requires_enabled_source_assignment_and_accessible_roster(facts, delegation, change):
+    if change == 'disabled':
+        delegation.enabled = False
+    elif change == 'unassigned':
+        delegation.assigned = False
+    elif change == 'empty':
+        delegation.targets = []
+    else:
+        facts.roles = {'demo': 'viewer'}
+    with pytest.raises(builder.CopilotConfigError):
+        await build(facts, delegation_enabled=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('change', ['assignment', 'roster', 'target_access'])
+async def test_delegation_configuration_rejects_authority_changed_during_build(facts, delegation, change):
+    def mutate(scan):
+        if scan != 2:
+            return
+        if change == 'assignment':
+            delegation.assigned = False
+        elif change == 'roster':
+            delegation.targets = ['qa']
+        else:
+            facts.roles.pop('repo')
+    delegation.on_scan = mutate
+    with pytest.raises(builder.CopilotConfigError):
+        await build(facts, delegation_enabled=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('flag', [None, 0, 1, 'true', [], {}])
+async def test_delegation_flag_is_strict_before_credentials_or_roster(facts, delegation, flag):
+    with pytest.raises(builder.CopilotConfigError):
+        await build(facts, delegation_enabled=flag)
+    assert not facts.reads and delegation.calls == 0

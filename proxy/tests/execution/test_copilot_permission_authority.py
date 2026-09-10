@@ -185,3 +185,40 @@ async def test_wrong_sdk_session_cannot_reach_human_authority(authority):
     result = await authority.bridge.on_permission_request(shell(), {"session_id": "other-native-session"})
     assert isinstance(result, Reject)
     assert session_state.get_permission_queue(authority.sid).empty()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("approved", [True, False])
+async def test_fixed_delegation_dispatch_uses_shared_human_authority(authority, monkeypatch, approved):
+    from core.layers.copilot.callbacks import CallbackRegistry
+    from core.layers.copilot.host_tools import CopilotDelegationTool, DELEGATE_CANONICAL, DELEGATE_TOOL
+    from services.mcp import mcp_permissions, mcp_registry
+
+    tools = ModuleType("copilot.tools")
+    tools.ToolResult = SimpleNamespace
+    monkeypatch.setitem(sys.modules, "copilot.tools", tools)
+    # Controlled manifest reads; the shared path/mode policy and prompt queue
+    # remain real. Delegation's undeclared tier resolves to standard in runtime.
+    monkeypatch.setattr(mcp_permissions, "resolve_tool_tier", lambda *args: "standard")
+    monkeypatch.setattr(mcp_registry, "device_capability_for_server", lambda *args: None)
+    monkeypatch.setattr(mcp_registry, "is_high_risk_device_tool", lambda *args: False)
+    calls = []
+    async def authorize():
+        pass
+    async def delegate(call_id, args):
+        calls.append((call_id, args))
+        return "Repository review finished"
+    callbacks = CallbackRegistry(lambda: None)
+    tool = CopilotDelegationTool(targets=("repo",), handler=delegate, bridge=authority.bridge,
+                                 callbacks=callbacks, authorize=authorize)
+    args = {"agent": "repo", "name": "Review", "prompt": "Review the repository"}
+    pending = asyncio.create_task(tool.execute(SimpleNamespace(session_id="native-fixture", tool_call_id="call-1",
+                                                               tool_name=DELEGATE_TOOL, arguments=args)))
+    prompt = await asyncio.wait_for(session_state.get_permission_queue(authority.sid).get(), 2)
+    assert prompt["tool_name"] == DELEGATE_CANONICAL and prompt["tool_input"] == args
+    assert not calls
+    assert session_state.resolve_permission(prompt["request_id"], approved)
+    result = await asyncio.wait_for(pending, 2)
+    assert result.result_type == ("success" if approved else "failure")
+    assert len(calls) == int(approved)
+    assert not callbacks.pending_ids and not authority.requests.pending_ids
