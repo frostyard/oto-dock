@@ -869,3 +869,154 @@ async def test_resume_rechecks_current_model_effort_advertisement(harness):
         assert documents(harness)[0]["status"] == "active"
     finally:
         await clean(harness)
+
+
+def usage_event(**data):
+    import uuid
+    return {"id": str(uuid.uuid4()), "type": "assistant.usage", "data": {"model": "reported-model", **data}}
+
+
+@pytest.mark.asyncio
+async def test_usage_observed_before_create_returns_after_done_and_during_cleanup(harness):
+    received = []
+
+    async def emit_early():
+        harness.runtimes[0].client.opened[0].options["on_event"](usage_event(inputTokens=1))
+
+    harness.stages["sdk.create"] = emit_early
+    owner = await open_session(harness, usage_observer=received.append)
+    sdk = harness.runtimes[0].client.opened[0]
+    try:
+        first = [item async for item in owner.stream("first")]
+        assert first[-1].type == "done"
+        queued = list(owner._supervisor._events)
+        late = usage_event(outputTokens=2)
+        sdk.options["on_event"](late)
+        sdk.options["on_event"](late)
+        assert list(owner._supervisor._events) == queued
+        second = [item async for item in owner.stream("second")]
+        assert [item.type for item in second if item.type != "system"] == [
+            item.type for item in first if item.type != "system"]
+        assert not any("assistant.usage" in str(item.data) for item in second)
+        assert all(item.type != "usage" for item in first + second)
+        assert len(received) == 2
+
+        async def emit_closing():
+            sdk.options["on_event"](usage_event(cacheReadTokens=3))
+
+        harness.stages["runtime.close"] = emit_closing
+        await owner.close()
+        assert len(received) == 3 and received[-1]["cache_read_tokens"] == 3
+        assert owner._usage is None and documents(harness)[0]["status"] == "ready"
+    finally:
+        await clean(harness)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["idle", "runtime.close"])
+async def test_usage_callback_failure_joins_owner_and_keeps_history_active(harness, phase):
+    def fail(frame):
+        raise RuntimeError("gho_private_callback_error")
+
+    owner = await open_session(harness, usage_observer=fail)
+    assert owner.usage_source_closed is False
+    _ = [item async for item in owner.stream("completed")]
+    sdk = harness.runtimes[0].client.opened[0]
+
+    async def emit():
+        sdk.options["on_event"](usage_event(inputTokens=1))
+
+    if phase == "idle":
+        await emit()
+    else:
+        harness.stages[phase] = emit
+    try:
+        with pytest.raises(harness.module.CopilotLocalSessionError) as caught:
+            await owner.close()
+        assert "gho_" not in str(caught.value) and caught.value.__context__ is None
+        assert harness.runtimes[0].closed and not harness.guards[0].valid
+        assert documents(harness)[0]["status"] == "active"
+        assert owner.usage_source_closed is True
+    finally:
+        await clean(harness)
+
+
+@pytest.mark.asyncio
+async def test_usage_without_observer_drops_without_changing_next_turn(harness):
+    owner = await open_session(harness)
+    try:
+        first = [item async for item in owner.stream("first")]
+        sdk = harness.runtimes[0].client.opened[0]
+        sdk.options["on_event"]({"type": "assistant.usage", "data": {"model": None}})
+        second = [item async for item in owner.stream("second")]
+        assert [item.type for item in second if item.type != "system"] == [
+            item.type for item in first if item.type != "system"]
+        assert not any("assistant.usage" in str(item.data) for item in second)
+    finally:
+        await owner.close()
+        await clean(harness)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reports_alive", [True, False])
+async def test_failed_runtime_close_cannot_prove_usage_source_joined(harness, reports_alive):
+    owner = await open_session(harness, usage_observer=lambda frame: None)
+
+    async def fail():
+        harness.runtimes[0].alive = reports_alive
+        raise RuntimeError("private shutdown failure")
+
+    harness.stages["runtime.close"] = fail
+    try:
+        with pytest.raises(harness.module.CopilotLocalSessionError):
+            await owner.close()
+        assert owner.usage_source_closed is False
+        assert owner._usage is not None
+        assert documents(harness)[0]["status"] == "active"
+    finally:
+        await clean(harness)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rollback_fails", [True, False])
+async def test_startup_observer_retains_initialized_owner_when_runtime_rollback_fails(harness, rollback_fails):
+    captured = []
+
+    def capture(owner):
+        assert harness.runtimes == [] and harness.guards == []
+        assert owner.usage_source_closed is False and owner.closed is False
+        captured.append(owner)
+
+    async def fail_startup():
+        raise RuntimeError("private startup failure")
+
+    async def fail_close():
+        raise RuntimeError("private rollback failure")
+
+    harness.stages["sdk.create"] = fail_startup
+    if rollback_fails:
+        harness.stages["runtime.close"] = fail_close
+    try:
+        with pytest.raises(harness.module.CopilotLocalSessionError) as caught:
+            await open_session(harness, on_owner=capture)
+        assert caught.value.__context__ is None and "private" not in str(caught.value)
+        assert len(captured) == 1
+        assert captured[0].usage_source_closed is (not rollback_fails)
+        if rollback_fails:
+            with pytest.raises(harness.module.CopilotLocalSessionError):
+                await captured[0].close()
+            assert harness.runtimes[0].alive is True
+        else:
+            await captured[0].close()
+            assert harness.runtimes[0].closed is True
+    finally:
+        await clean(harness)
+
+
+@pytest.mark.asyncio
+async def test_owner_observer_precedes_usage_observer_validation(harness):
+    captured = []
+    with pytest.raises(harness.module.CopilotLocalSessionError):
+        await open_session(harness, on_owner=captured.append, usage_observer="invalid")
+    assert len(captured) == 1 and captured[0].usage_source_closed is True
+    assert harness.runtimes == [] and harness.guards == []

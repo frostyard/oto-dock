@@ -61,6 +61,8 @@ async def run(args, report):
                                        CredentialKind.USER_TOKEN, selected_token())
         originals = []
         runtimes = []
+        observed_usage, held_usage, usage_receivers = {}, [], []
+        usage_after_first_close = {}
         history = MemoryConversations()
         original_service = copilot_chat.CopilotChatService
 
@@ -95,6 +97,32 @@ async def run(args, report):
                             "operation": kind, "reasoning_effort": options.get("reasoning_effort"),
                             "explicit": "reasoning_effort" in options,
                         })
+                        if args.verify_usage:
+                            receive = options["on_event"]
+                            usage_receivers.append(receive)
+
+                            def usage_event(event):
+                                raw = event if isinstance(event, dict) else event.to_dict()
+                                data = raw.get("data", {})
+                                if (raw.get("type") == "assistant.usage" and not raw.get("agentId")
+                                        and not data.get("parentToolCallId")):
+                                    event_id = raw["id"]
+                                    projection = {
+                                        "type": "usage", "event_id": event_id, "reported_model": data["model"],
+                                        "input_tokens": data.get("inputTokens"), "output_tokens": data.get("outputTokens"),
+                                        "cache_read_tokens": data.get("cacheReadTokens"),
+                                        "cache_write_tokens": data.get("cacheWriteTokens"),
+                                        "reasoning_tokens": data.get("reasoningTokens"),
+                                        "reported_nano_aiu": (data.get("copilotUsage") or {}).get("totalNanoAiu"),
+                                    }
+                                    if event_id in observed_usage:
+                                        assert observed_usage[event_id] == projection
+                                    observed_usage[event_id] = projection
+                                    if not held_usage:
+                                        held_usage.append((receive, event, event_id))
+                                        return
+                                receive(event)
+                            options["on_event"] = usage_event
                         session = await original(*values, **options)
                         if args.reasoning_effort is not None:
                             current = await client._client.request("session.model.getCurrent", {
@@ -183,6 +211,20 @@ async def run(args, report):
                     assert denied.status_code == 403 and not runtimes
                     report["cross_origin_start_denied"] = True
 
+                    async def verified_usage(cid):
+                        async with asyncio.timeout(10):
+                            while True:
+                                response = await client.get(f"{prefix}/conversations/{cid}", params={"agent": agent.name})
+                                assert response.status_code == 200
+                                archived = response.json()
+                                usage = [event for event in archived["events"] if event["type"] == "usage"]
+                                actual = {event["event_id"]: {key: value for key, value in event.items() if key != "seq"}
+                                          for event in usage}
+                                assert len(actual) == len(usage)
+                                if actual == observed_usage:
+                                    return archived, actual
+                                await asyncio.sleep(0.025)
+
                     async def new_session():
                         response = await client.post(prefix + "/sessions", json=create)
                         report["last_create_status"] = response.status_code
@@ -236,6 +278,19 @@ async def run(args, report):
                         report.setdefault("turns", []).append({"turn": index, "completed": completed,
                                                               "tool_events": tool_events, "fixture_intact": True})
                         if index == 1:
+                            if args.verify_usage:
+                                assert held_usage and observed_usage
+                                receive, event, held_id = held_usage[0]
+                                assert history.rows[cid]["turn_active"] is False
+                                receive(event)
+                                receive(event)
+                                checked, _ = await verified_usage(cid)
+                                terminal_seq = max(event["seq"] for event in checked["events"] if event["type"] == "turn_complete")
+                                held_seq = next(event["seq"] for event in checked["events"]
+                                                if event["type"] == "usage" and event["event_id"] == held_id)
+                                assert held_seq > terminal_seq
+                                report["held_real_usage_persisted_after_turn_completion"] = True
+                                report["duplicate_real_usage_deduplicated"] = True
                             old_handle = sid
                             assert (await client.delete(f"{prefix}/sessions/{sid}")).status_code == 204
                             archived = (await client.get(f"{prefix}/conversations/{cid}", params={"agent": agent.name})).json()
@@ -244,7 +299,11 @@ async def run(args, report):
                                 assert archived["conversation"]["reasoning_effort"] == args.reasoning_effort
                                 assert history.rows[cid]["reasoning_effort"] == args.reasoning_effort
                                 report["explicit_effort_persisted_in_owned_conversation_metadata"] = True
-                            assert archived["events"][-1]["type"] == "turn_complete"
+                            assert [event for event in archived["events"] if event["type"] != "usage"][-1]["type"] == "turn_complete"
+                            if args.verify_usage:
+                                _, actual = await verified_usage(cid)
+                                usage_after_first_close.update(actual)
+                                report["reported_usage_after_first_close"] = len(actual)
                             assert any(event["type"] == "permission_prompt" for event in archived["events"])
                             assert [event["seq"] for event in archived["events"]] == list(range(1, len(archived["events"]) + 1))
                             listing = (await client.get(prefix + "/conversations", params={"agent": agent.name})).json()
@@ -274,6 +333,11 @@ async def run(args, report):
                             replacement = copilot_chat_lifetime(app, str(args.provisioned_root))
                             await replacement.__aenter__()
                             archived = (await client.get(f"{prefix}/conversations/{cid}", params={"agent": agent.name})).json()
+                            if args.verify_usage:
+                                before_runtime_count = len(runtimes)
+                                _, actual = await verified_usage(cid)
+                                assert actual == usage_after_first_close and len(runtimes) == before_runtime_count
+                                report["persisted_usage_survives_service_replacement_without_runtime"] = True
                             revision = archived["conversation"]["revision"]
                             if args.reasoning_effort is not None:
                                 before = history.get(cid, human["sub"])
@@ -289,6 +353,14 @@ async def run(args, report):
                             assert resumed.json()["conversation_id"] == cid
                             sid = resumed.json()["session_id"]
                             assert sid != old_handle
+                            if args.verify_usage:
+                                before = history.get(cid, human["sub"])
+                                usage_receivers[-1](held_usage[0][1])
+                                await app.state.copilot_chat._flush_usage(app.state.copilot_chat._entries[platform_sid])
+                                assert history.get(cid, human["sub"]) == before
+                                _, actual = await verified_usage(cid)
+                                assert actual == usage_after_first_close
+                                report["cross_runtime_replayed_usage_deduplicated_without_revision_change"] = True
                             assert (await client.delete(f"{prefix}/sessions/{old_handle}")).status_code == 404
                             assert get_owned_session(platform_sid) is not None and runtimes[-1].alive
                             report["cold_resume_after_service_and_layer_replacement"] = True
@@ -321,6 +393,20 @@ async def run(args, report):
                     rejected = await client.post(f"{prefix}/conversations/{cid}/resume", params={"agent": agent.name}, json={"revision": partial["conversation"]["revision"]})
                     assert rejected.status_code == 409
                     report["interrupted_transcript_readable_but_not_resumable"] = True
+                    if args.verify_usage:
+                        _, actual = await verified_usage(cid)
+                        assert all(actual.get(key) == value for key, value in usage_after_first_close.items())
+                        assert len(actual) > len(usage_after_first_close)
+                        report["reported_usage_after_resume_and_interrupt"] = len(actual)
+                        report["persisted_usage_matches_observed_native_events"] = True
+                        report["reported_token_totals"] = {
+                            key: sum(event[key] for event in actual.values() if event[key] is not None)
+                            for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
+                        }
+                        report["missing_metric_observation_counts"] = {
+                            key: sum(event[key] is None for event in actual.values())
+                            for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "reported_nano_aiu")
+                        }
                     await new_session()
                     revoked = session_ids[-1]
                     roles.clear()
@@ -353,6 +439,7 @@ def main():
     parser.add_argument("--use-gh-token", action="store_true", required=True)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--reasoning-effort", choices=("low", "medium", "high", "xhigh", "max"), default=None)
+    parser.add_argument("--verify-usage", action="store_true")
     args = parser.parse_args()
     logging.disable(logging.CRITICAL)
     report = {"result": "failed", "sdk_version": "1.0.13", "runtime_version": "1.0.83",
@@ -362,6 +449,9 @@ def main():
               "actual_private_history_and_resume_locks": True,
               "postgresql": False, "storage": "controlled user, agent and account reads; in-memory conversation store"}
     report["reasoning_effort"] = args.reasoning_effort
+    report["verify_usage"] = args.verify_usage
+    if args.verify_usage:
+        report["usage_fixture"] = "first real usage callback held until idle; same event replayed twice locally and once after cold resume"
     started = time.monotonic()
     try:
         asyncio.run(run(args, report))

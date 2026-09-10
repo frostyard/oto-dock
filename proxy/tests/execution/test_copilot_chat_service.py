@@ -6,6 +6,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 import uuid
 import sys
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts" / "copilot"))
@@ -26,8 +27,10 @@ class Layer:
         self.sessions = {}
         self.started, self.closed, self.messages = [], [], []
         self.program = self.start_hook = self.close_hook = None
+        self.usage_observers = {}
 
-    async def start_session(self, sid, config):
+    async def start_session(self, sid, config, *, usage_observer=None):
+        self.usage_observers[sid] = usage_observer
         self.started.append((sid, config))
         self.sessions[sid] = asyncio.Lock()
         if self.start_hook:
@@ -59,6 +62,9 @@ class Layer:
         return sid in self.sessions
 
     async def is_session_process_dead(self, sid):
+        return sid not in self.sessions
+
+    async def is_usage_source_closed(self, sid):
         return sid not in self.sessions
 
     async def history_ready(self, sid, owner):
@@ -557,7 +563,7 @@ async def test_failed_start_cannot_release_visible_foreign_registration(fixture,
     async def no_close():
         pytest.fail("Foreign owner must never be closed")
 
-    async def refused(sid, _config):
+    async def refused(sid, _config, **_kwargs):
         if foreign == "legacy":
             foreign_ids.add(sid)
         if foreign == "context":
@@ -1173,3 +1179,210 @@ async def test_legacy_history_without_effort_keeps_model_default_on_resume(fixtu
     assert row['reasoning_effort'] is None
     await service.resume(fixture.user, cid, row['revision'])
     assert not hasattr(fixture.layer.started[-1][1], 'reasoning_effort')
+
+
+def usage_report():
+    return dict(type='usage', event_id=str(uuid.uuid4()), reported_model='reported-model',
+                input_tokens=100, output_tokens=5, cache_read_tokens=0, cache_write_tokens=None,
+                reasoning_tokens=2, reported_nano_aiu=None)
+
+
+@pytest.mark.asyncio
+async def test_usage_is_durable_before_stream_delivery_and_completion(fixture, monkeypatch):
+    service = fixture.service()
+    sid = await create(fixture, service)
+    entry = service._entries[sid]
+    report = usage_report()
+    began, release = threading.Event(), threading.Event()
+    original = service.store.append_usage
+
+    def held(*args):
+        began.set()
+        assert release.wait(3)
+        return original(*args)
+
+    monkeypatch.setattr(service.store, 'append_usage', held)
+
+    async def program(sid):
+        fixture.layer.usage_observers[sid](report)
+        yield CommonEvent('text', {'content': 'work'})
+        yield CommonEvent('done')
+
+    fixture.layer.program = program
+    turn = await service.prepare_turn(fixture.user, sid, 'work')
+
+    async def collect():
+        frames = []
+        async for frame in turn:
+            if frame['type'] == 'usage':
+                assert any(event.get('event_id') == report['event_id']
+                           for event in service.store.events(entry.cid, fixture.user.sub))
+            frames.append(frame)
+        return frames
+
+    reading = asyncio.create_task(collect())
+    try:
+        async with asyncio.timeout(1):
+            while not began.is_set():
+                await asyncio.sleep(0.001)
+        assert not reading.done()
+        assert all(frame['type'] != 'usage' for frame in service.store.events(entry.cid, fixture.user.sub))
+    finally:
+        release.set()
+    frames = await reading
+    assert [frame for frame in frames if frame['type'] == 'usage'] == [report]
+    assert frames[-1]['type'] == 'turn_complete'
+
+
+@pytest.mark.asyncio
+async def test_late_idle_and_shutdown_usage_are_saved_without_another_turn(fixture):
+    service = fixture.service()
+    sid = await create(fixture, service)
+    entry = service._entries[sid]
+    frames = [frame async for frame in await service.prepare_turn(fixture.user, sid, 'work')]
+    first, last = usage_report(), usage_report()
+    observer = fixture.layer.usage_observers[sid]
+    observer(first)
+    observer(first.copy())
+    await service._flush_usage(entry)
+
+    async def close_hook(closing_sid):
+        assert closing_sid == sid
+        observer(last)
+
+    fixture.layer.close_hook = close_hook
+    await service.close(fixture.user, sid)
+    saved = await service.get_conversation(fixture.user, entry.cid)
+    reports = [event for event in saved['events'] if event['type'] == 'usage']
+    assert [{key: value for key, value in report.items() if key != 'seq'} for report in reports] == [first, last]
+    assert saved['conversation']['can_resume']
+    assert frames[-1]['type'] == 'turn_complete'
+    assert len(fixture.layer.messages) == 1
+    assert entry.usage_task.done() and entry.usage_sealed
+
+
+@pytest.mark.asyncio
+async def test_usage_survives_cold_resume_without_duplicate_or_stale_writer(fixture):
+    store = MemoryConversations()
+    first = fixture.service(store=store)
+    sid = await create(fixture, first)
+    original = first._entries[sid]
+    old_observer = fixture.layer.usage_observers[sid]
+    _ = [event async for event in await first.prepare_turn(fixture.user, sid, 'work')]
+    report = usage_report()
+    old_observer(report)
+    await first.close(fixture.user, sid)
+    saved = await first.get_conversation(fixture.user, original.cid)
+    second = fixture.service(store=store)
+    handle = await second.resume(fixture.user, original.cid, saved['conversation']['revision'])
+    resumed = second._entry(fixture.user, handle)
+    with pytest.raises(ValueError):
+        old_observer(usage_report())
+    fixture.layer.usage_observers[sid](report)
+    fresh = usage_report()
+    fixture.layer.usage_observers[sid](fresh)
+    await second._flush_usage(resumed)
+    rows = await second.get_conversation(fixture.user, original.cid)
+    assert [event['event_id'] for event in rows['events'] if event['type'] == 'usage'] == [report['event_id'], fresh['event_id']]
+    assert resumed.closing is None and resumed.user.sub == original.user.sub
+    assert resumed.account_id == original.account_id and resumed.model == original.model
+    with pytest.raises(CopilotChatError) as denied:
+        await second.get_conversation(fixture.other, original.cid)
+    assert denied.value.status_code == 404
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['database', 'conflicting_id', 'malformed', 'overflow'])
+async def test_failed_usage_closes_and_quarantines_owner(fixture, monkeypatch, failure):
+    service = fixture.service()
+    sid = await create(fixture, service)
+    entry = service._entries[sid]
+    _ = [event async for event in await service.prepare_turn(fixture.user, sid, 'work')]
+    observer = fixture.layer.usage_observers[sid]
+    report = usage_report()
+    if failure == 'database':
+        def broken(*args):
+            raise RuntimeError('private provider material')
+        monkeypatch.setattr(service.store, 'append_usage', broken)
+        observer(report)
+    elif failure == 'conflicting_id':
+        observer(report)
+        await service._flush_usage(entry)
+        observer({**report, 'input_tokens': 101})
+    elif failure == 'malformed':
+        with pytest.raises(ValueError, match='observation is unavailable'):
+            observer({**report, 'input_tokens': True})
+    else:
+        with pytest.raises(ValueError, match='observation is unavailable'):
+            for _ in range(129):
+                observer(usage_report())
+    await gone(fixture, service, sid)
+    saved = await service.get_conversation(fixture.user, entry.cid)
+    assert saved['conversation']['state'] == 'incomplete'
+    assert not saved['conversation']['can_resume']
+    assert entry.usage_task.done() and entry.usage_failed
+
+
+@pytest.mark.asyncio
+async def test_failed_layer_cleanup_drains_confirmed_closed_usage_source_but_retains_claim(fixture, monkeypatch):
+    service = fixture.service()
+    sid = await create(fixture, service)
+    entry = service._entries[sid]
+    report = usage_report()
+
+    async def failed_close(closing_sid):
+        fixture.layer.usage_observers[closing_sid](report)
+        fixture.layer.sessions.pop(closing_sid)
+        raise RuntimeError('An ownership tombstone remains after native shutdown')
+
+    async def claimed(_sid):
+        return False
+
+    fixture.layer.close_hook = failed_close
+    monkeypatch.setattr(fixture.layer, 'is_session_process_dead', claimed)
+    with pytest.raises(CopilotChatError):
+        await service.close(fixture.user, sid)
+    assert service._entries[sid] is entry and sid in fixture.slots
+    assert entry.usage_sealed and entry.usage_task.done()
+    assert service.store.events(entry.cid, fixture.user.sub) == [{**report, 'seq': 1}]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_waits_for_accepted_usage_write(fixture, monkeypatch):
+    service = fixture.service()
+    sid = await create(fixture, service)
+    entry = service._entries[sid]
+    _ = [event async for event in await service.prepare_turn(fixture.user, sid, 'complete')]
+    began, release = threading.Event(), threading.Event()
+    original = service.store.append_usage
+
+    def held(*args):
+        began.set()
+        assert release.wait(3)
+        return original(*args)
+
+    monkeypatch.setattr(service.store, 'append_usage', held)
+    report = usage_report()
+    fixture.layer.usage_observers[sid](report)
+    closing = None
+    try:
+        async with asyncio.timeout(1):
+            while not began.is_set():
+                await asyncio.sleep(0.001)
+        closing = asyncio.create_task(service.close(fixture.user, sid))
+        async with asyncio.timeout(1):
+            while not entry.usage_sealed:
+                await asyncio.sleep(0.001)
+        closing.cancel()
+        await asyncio.sleep(0)
+        assert not closing.done() and not entry.usage_task.done()
+        assert service._entries[sid] is entry
+    finally:
+        release.set()
+        if closing is not None:
+            result = await asyncio.gather(closing, return_exceptions=True)
+    assert isinstance(result[0], asyncio.CancelledError)
+    assert sid not in service._entries and entry.usage_task.done()
+    saved = await service.get_conversation(fixture.user, entry.cid)
+    assert [event['event_id'] for event in saved['events'] if event['type'] == 'usage'] == [report['event_id']]
+    assert saved['conversation']['can_resume']

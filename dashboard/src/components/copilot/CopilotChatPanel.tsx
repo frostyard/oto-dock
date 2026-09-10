@@ -11,6 +11,8 @@ import {
   loadCopilotModels, type CopilotModel, type ReasoningEffort,
 } from '../../api/copilotChat'
 import CopilotMessages, { type CopilotMessageItem as Item } from './CopilotMessages'
+import CopilotUsage from './CopilotUsage'
+import { CopilotUsageError, mergeCopilotUsage, type CopilotUsageReport } from '../../lib/copilotUsage'
 
 const button = 'px-3 py-1.5 text-sm rounded-lg border border-p-border-light text-p-text disabled:opacity-40'
 const input = 'block w-full rounded-lg border border-p-border-light bg-white dark:bg-p-surface px-3 py-2'
@@ -41,6 +43,8 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
   const catalogRequest = useRef<{ scope: string; controller: AbortController } | null>(null)
   const catalogScope = useRef('')
   const [prompt, setPrompt] = useState(''), [items, setItems] = useState<Item[]>([])
+  const [usageReports, setUsageReports] = useState<CopilotUsageReport[]>([]), [usageUnavailable, setUsageUnavailable] = useState(false)
+  const usage = useRef({ cid: null as string | null, reports: new Map<string, CopilotUsageReport>(), invalid: false })
   const [session, setSession] = useState<string | null>(null), [busy, setBusy] = useState(false)
   const [error, setError] = useState(''), [answering, setAnswering] = useState<string | null>(null)
   const life = useRef({ mounted: true, epoch: 0, creating: false, loading: false, cid: null as string | null, sid: null as string | null, busy: false, controller: null as AbortController | null, answer: null as string | null, closing: null as Promise<void> | null, cleanupFailed: false })
@@ -91,6 +95,7 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
     // current owner and producer. Reading a route is never a resume action.
     if (target === current.cid && !current.closing) return
     current.epoch++
+    resetUsage(target)
     setItems([]); setSelected(null); setPrompt('')
     void close().then(() => {
       if (!current.mounted || routeVersion.current !== version || current.cleanupFailed) return
@@ -106,6 +111,28 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [conversationId, status.data])
   const message = (e: unknown) => e instanceof CopilotChatError ? e.message : 'Copilot chat failed. Close this chat and try again.'
+  function resetUsage(cid: string | null) {
+    usage.current = { cid, reports: new Map(), invalid: false }
+    setUsageReports([]); setUsageUnavailable(false)
+  }
+  function invalidateUsage(cid: string) {
+    if (usage.current.cid !== cid) return
+    usage.current.invalid = true; usage.current.reports.clear()
+    setUsageReports([]); setUsageUnavailable(true)
+  }
+  function acceptUsage(values: readonly unknown[], cid: string | null) {
+    const current = usage.current
+    if (!cid || current.cid !== cid) return
+    try {
+      if (current.invalid) throw new CopilotUsageError()
+      const reports = mergeCopilotUsage(current.reports, values)
+      current.reports = reports
+      setUsageReports([...reports.values()])
+    } catch {
+      invalidateUsage(cid)
+      throw new CopilotUsageError()
+    }
+  }
   async function loadModels() {
     const current = life.current
     if (catalogRequest.current || current.busy || current.creating || current.closing || current.sid || current.cid || current.cleanupFailed
@@ -131,8 +158,14 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
     if (cid) void getCopilotConversation(cid, agentName).then(data => {
       // Metadata refresh must never replace a newer selection or live transcript.
       if (current.mounted && current.epoch === epoch && current.cid === cid && !current.loading
-          && (!agentName || data.conversation.agent === agentName)) setSelected(data.conversation)
-    }).catch(() => {})
+          && (!agentName || data.conversation.agent === agentName)) {
+        setSelected(data.conversation)
+        acceptUsage(data.events.filter(event => event.type === 'usage').map(({ seq: _sequence, ...event }) => event), cid)
+      }
+    }).catch(error => {
+      if (error instanceof CopilotUsageError && current.mounted && current.epoch === epoch
+          && current.cid === cid && !current.loading) invalidateUsage(cid)
+    })
   }
   function close(): Promise<void> {
     const current = life.current
@@ -164,6 +197,7 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
     await close()
     if (current.mounted && !current.cleanupFailed) {
       current.epoch++; current.cid = null; current.loading = false
+      resetUsage(null)
       display.current = { characters: 0, events: 0 }
       setItems([]); setSelected(null); setLoading(false); setError(''); setPrompt('')
       onConversationChange?.(null)
@@ -187,6 +221,7 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
   }
   async function readHistory(id: string, row?: CopilotConversation) {
     const current = life.current, epoch = ++current.epoch
+    resetUsage(id)
     current.cid = id; current.loading = true
     setSelected(row ?? null); setLoading(true); setItems([]); setPrompt(''); setError('')
     display.current = { characters: 0, events: 0 }
@@ -197,7 +232,10 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
       setSelected(data.conversation)
       for (const event of data.events) receive(event, true)
     } catch (e) {
-      if (current.mounted && current.epoch === epoch) { setError(message(e)); setItems([]); setSelected(row ? { ...row, can_resume: false } : null) }
+      if (current.mounted && current.epoch === epoch && current.cid === id) {
+        if (e instanceof CopilotUsageError) invalidateUsage(id)
+        setError(message(e)); setItems([]); setSelected(row ? { ...row, can_resume: false } : null)
+      }
     } finally {
       if (current.mounted && current.epoch === epoch) { current.loading = false; setLoading(false) }
     }
@@ -232,7 +270,9 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
     // budget. Keep the same content limit when loading or receiving live data.
     const { seq: _sequence, ...payload } = event
     budget(JSON.stringify(archived ? payload : event).length)
-    if (event.type === 'user' && typeof event.content === 'string') {
+    if (event.type === 'usage') {
+      acceptUsage([archived ? payload : event], life.current.cid)
+    } else if (event.type === 'user' && typeof event.content === 'string') {
       setItems(old => [...old, { key: next.current++, kind: 'user', text: event.content as string }])
     } else if (event.type === 'text' && typeof event.content === 'string') {
       const content = event.content
@@ -288,6 +328,7 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
           return
         }
         current.cid = owner.conversation_id
+        resetUsage(owner.conversation_id)
         setSelected({ id: owner.conversation_id, agent: selectedAgent, account_id: selectedAccount, model: chosenModel, permission_mode: mode, reasoning_effort: effort ? effort as ReasoningEffort : null, title: text.slice(0, 100), created_at: '', updated_at: '', state: 'open', revision: 1, can_resume: false, reason: '' })
         current.sid = sid; setSession(sid)
         onConversationChange?.(owner.conversation_id, { replace: true })
@@ -360,6 +401,7 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
       {(agents.isError || accounts.isError) && <p role="alert" className="text-sm text-red-500">Agents or accounts could not be loaded. Refresh this page to try again.</p>}
       {!eligible.length && <p className="text-sm">Connect an active personal account in <Link className="underline" to="/user-settings?tab=ai-engines">AI Engines settings</Link>.</p>}
       <CopilotMessages items={items} activeSession={session} answering={answering} onAnswer={(item, approved, answers) => void answer(item, approved, answers)} streaming={busy && !!session} agentDisplayName={agents.data?.find(a => a.name === selectedAgent)?.display_name || selectedAgent} />
+      <CopilotUsage reports={usageReports} unavailable={usageUnavailable} />
       <form onSubmit={send} className="space-y-2">
         <label className="block text-sm text-p-text">Message<textarea className={input} maxLength={32768} rows={3} value={prompt} disabled={busy || loading || (!!life.current.cid && !session)} onChange={e => setPrompt(e.target.value)} /></label>
         <div className="flex gap-2"><button className={button} disabled={modelsLoading || busy || loading || (!!life.current.cid && !session) || !prompt.trim() || !selectedAgent || !selectedAccount || (!session && (!chosenModel || !effortValid)) || life.current.cleanupFailed}>Send</button>

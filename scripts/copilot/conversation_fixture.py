@@ -85,6 +85,22 @@ class MemoryConversations:
             self._append(row, event)
             self._update(row)
 
+    def append_usage(self, cid, owner, generation, event):
+        contract.validate_usage_frame(event)
+        with self.lock:
+            row = self._row(cid, owner, generation)
+            if row['state'] != 'open':
+                raise contract.CopilotConversationConflict()
+            previous = next((frame for frame in self.frames[cid]
+                             if frame['type'] == 'usage' and frame['event_id'] == event['event_id']), None)
+            if previous is not None:
+                if {key: value for key, value in previous.items() if key != 'seq'} != event:
+                    raise contract.CopilotConversationConflict()
+                return False
+            self._append(row, event)
+            self._update(row)
+            return True
+
     def finish_turn(self, cid, owner, generation):
         with self.lock:
             row = self._row(cid, owner, generation)

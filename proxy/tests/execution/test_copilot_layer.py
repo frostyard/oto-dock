@@ -118,9 +118,12 @@ async def harness(monkeypatch, tmp_path):
         assert context is not None and context.cli_session_id == config.platform_session_id
         scenario.opens.append((config, options))
         owner = Owner()
+        owner.alive = False  # Initialized factory owner is not yet usable.
         scenario.owners.append(owner)
+        options["on_owner"](owner)
         if scenario.open_hook:
             await scenario.open_hook(owner)
+        owner.alive = True
         return owner
 
     monkeypatch.setattr(module, "resolve_sandbox_config", resolve)
@@ -1094,3 +1097,85 @@ async def test_catalog_actual_caller_cancellation_propagates_only_after_cleanup(
         await task
     assert not catalog_runtime.runtimes[0].alive and not layer._sessions
     assert not list(harness.records.state_root.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_usage_observer_is_owner_option_not_native_profile_config(harness):
+    layer, sid = harness.layer(), harness.identity()
+    reports = []
+    callback = reports.append
+    await layer.start_session(sid, config(), usage_observer=callback)
+    local, options = harness.opens[-1]
+    assert options["usage_observer"] is callback
+    assert not hasattr(local, "usage_observer")
+    await layer.close_session(sid)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("proven", [True, False, None, 1])
+async def test_usage_source_proof_does_not_release_failed_cleanup_tombstone(harness, proven):
+    layer, sid, owner = await start(harness)
+    assert await layer.is_usage_source_closed(sid) is False
+    owner.usage_source_closed = proven
+    owner.close_error = True
+    with pytest.raises(module.CopilotLayerError):
+        await layer.close_session(sid)
+    assert await layer.is_usage_source_closed(sid) is (proven is True)
+    assert await layer.is_session_process_dead(sid) is False
+    assert module._claims[sid] is layer._sessions[sid]
+    # A different layer cannot borrow a captured owner's proof.
+    assert await harness.layer().is_usage_source_closed(sid) is False
+
+
+@pytest.mark.asyncio
+async def test_usage_source_proof_unknown_during_startup_and_true_after_release(harness):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def hold(owner):
+        entered.set()
+        await release.wait()
+
+    harness.open_hook = hold
+    layer, sid = harness.layer(), harness.identity()
+    startup = asyncio.create_task(layer.start_session(sid, config()))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        assert await layer.is_usage_source_closed(sid) is False
+        release.set()
+        await startup
+        await layer.close_session(sid)
+        assert await layer.is_usage_source_closed(sid) is True
+        assert await layer.is_session_process_dead(sid) is True
+    finally:
+        release.set()
+        await asyncio.gather(startup, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rollback_fails", [True, False])
+async def test_failed_factory_startup_preserves_captured_owner_until_confirmed_rollback(harness, rollback_fails):
+    from core.session.owned_sessions import get_owned_session
+
+    async def fail_startup(owner):
+        owner.usage_source_closed = not rollback_fails
+        owner.close_error = rollback_fails
+        raise RuntimeError("private startup failure")
+
+    harness.open_hook = fail_startup
+    layer, sid = harness.layer(), harness.identity()
+    with pytest.raises(module.CopilotLayerError) as caught:
+        await layer.start_session(sid, config())
+    assert "private" not in str(caught.value)
+    assert len(harness.owners) == 1
+    if rollback_fails:
+        assert layer._sessions[sid].owner is harness.owners[0]
+        assert module._claims[sid] is layer._sessions[sid]
+        assert get_owned_session(sid) is not None
+        assert await layer.is_session_process_dead(sid) is False
+        assert await layer.is_usage_source_closed(sid) is False
+    else:
+        assert harness.owners[0].closed is True
+        assert sid not in layer._sessions and sid not in module._claims
+        assert get_owned_session(sid) is None
+        assert await layer.is_session_process_dead(sid) is True
+        assert await layer.is_usage_source_closed(sid) is True
