@@ -495,7 +495,13 @@ async def _oldest_evictable_local(min_idle_s: float, *,
     sessions have idle-age ≈ 0 ⇒ auto-excluded). Ordering: unclaimed **pre-warms
     first** (speculative, unused) → the **requesting user's own** idle sessions →
     everyone else; within a group, most-idle first.
+
+    Owned engines are deliberately excluded: their generic cold-resume path
+    is not qualified. Ownership persists through startup and failed cleanup,
+    even when a stale legacy pool entry has the same session ID.
     """
+    from core.session.owned_sessions import get_owned_session
+
     now = time.monotonic()
     try:
         from core.session.prewarm_session_registry import _entries as _pw_entries
@@ -504,8 +510,8 @@ async def _oldest_evictable_local(min_idle_s: float, *,
     cands: list[tuple[int, float, str, str, bool]] = []
 
     def consider(sid: str, s: object, source: str) -> None:
-        if sid not in _sessions:
-            return  # must hold a reservation to be worth evicting
+        if sid not in _sessions or get_owned_session(sid) is not None:
+            return  # owned engines are not eligible for generic eviction
         age = now - getattr(s, "last_activity", now)
         if age < min_idle_s:
             return
@@ -554,7 +560,13 @@ async def _oldest_evictable_local(min_idle_s: float, *,
 async def _evict_one(sid: str, source: str, is_prewarm: bool = False) -> bool:
     """Free the reservation under _cond, then close the real session OUTSIDE _cond
     (close is slow). The later release() from close_session is a no-op (already
-    removed). Existing dead-session resume covers the evicted-user-returns race."""
+    removed). Existing dead-session resume covers the evicted-user-returns race.
+    A new owned generation invalidates even a previously selected legacy victim.
+    """
+    from core.session.owned_sessions import get_owned_session
+
+    if get_owned_session(sid) is not None:
+        return False
     if is_prewarm:
         # Atomically take the pre-warm out of the reapable set so the reuse path
         # in _spawn_tail can't adopt the session we're about to kill. If someone
@@ -566,7 +578,7 @@ async def _evict_one(sid: str, source: str, is_prewarm: bool = False) -> bool:
         except Exception:
             pass
     async with _cond:
-        if sid not in _sessions:
+        if sid not in _sessions or get_owned_session(sid) is not None:
             return False
         _remove(sid)
     logger.info("Concurrency: evicting idle %ssession %s (%s) to admit a new one",
@@ -667,11 +679,14 @@ async def reconcile_chat_slots() -> int:
     Tasks are EXCLUDED (their task_slot finally is authoritative); remote layer
     sessions are not a live source (they never hold a slot); interactive counted
     LOCAL-only; sids added within the last sweep are spared (mid-spawn window).
+    Explicit local owners retain slots until ownership is released, including
+    startup, closing and failed cleanup; active admission status is irrelevant.
     """
     from core.layers.cli.session import _persistent_sessions, _persistent_sessions_lock
     from core.layers.direct.session import _direct_sessions, _direct_sessions_lock
     from core.layers.codex.session import _codex_sessions, _codex_sessions_lock
     from core.events.stream_pump import _active_pumps
+    from core.session.owned_sessions import owned_session_ids
 
     live_sids: set[str] = set()
     async with _persistent_sessions_lock:
@@ -693,6 +708,9 @@ async def reconcile_chat_slots() -> int:
     now = time.monotonic()
     orphaned: list[str] = []
     async with _cond:
+        # Read after the last await: a claim acquired while we waited for the
+        # condition must protect its reservation in this same reconciliation.
+        live_sids.update(owned_session_ids(local_only=True))
         for sid, kind in list(_sessions.items()):
             if kind == "task":
                 continue  # lifecycle owned by task_slot's finally

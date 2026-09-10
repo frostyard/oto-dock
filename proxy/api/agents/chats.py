@@ -812,10 +812,27 @@ async def _close_chat_session(chat: dict) -> None:
     reaper — or longer, when background work keeps extending the reaper's
     leash. Registry membership, not resolution, picks the layer: the chat's
     stored execution_path may be stale relative to where the session actually
-    lives. Best-effort — an absent/dead session is fine."""
+    lives. Explicit owners must confirm cleanup before deletion; legacy
+    session cleanup remains best-effort. An absent/dead session is fine."""
     session_id = chat.get("session_id") or ""
     agent = chat.get("agent") or ""
-    if not session_id or not agent:
+    if not session_id:
+        return
+    from core.session.owned_sessions import get_owned_session
+
+    owned = get_owned_session(session_id)
+    if owned is not None:
+        # The stored agent/engine can change while this generation still owns
+        # processes. Preserve the chat if cleanup fails or ownership changes.
+        failed = False
+        try:
+            await owned.close()
+        except Exception:
+            failed = True
+        if failed or get_owned_session(session_id) is not None:
+            raise HTTPException(status_code=503, detail="Session cleanup is incomplete. The chat has been kept.")
+        return
+    if not agent:
         return
     try:
         from core.session.session_manager import (

@@ -445,6 +445,8 @@ async def chat_process_alive(chat: dict) -> bool:
     ``_close_chat_session`` documents). All checks are in-memory dict lookups;
     no RPC. Rules:
       - a live interactive PTY for the chat counts (any target);
+      - an explicitly owned session counts until cleanup releases its claim,
+        including startup, closing and failed cleanup;
       - a remote session counts when alive OR grace-held (a satellite WS blip
         deregisters the machine, so ``is_session_alive`` alone reads a
         reconnecting session as dead — it will be re-adopted);
@@ -461,6 +463,10 @@ async def chat_process_alive(chat: dict) -> bool:
     sid = chat.get("session_id") or ""
     if not sid:
         return False
+    from core.session.owned_sessions import get_owned_session
+
+    if get_owned_session(sid) is not None:
+        return True
     try:
         from core.session.session_manager import (
             _remote_layer, resolve_execution_path,

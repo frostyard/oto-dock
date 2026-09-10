@@ -19,6 +19,7 @@ from core.layers.copilot.sandbox_home import CopilotSandboxHomes
 from core.layers.copilot.session_records import CopilotSessionRecords
 from core.sandbox.sandbox import SandboxBuilder, SandboxMount, resolve_sandbox_config
 from core.session import session_state as state
+from core.session.owned_sessions import register_owned_session, release_owned_session
 
 
 class CopilotLayerError(RuntimeError):
@@ -44,6 +45,7 @@ class _Entry:
     startup: asyncio.Task | None = None
     closing: asyncio.Task | None = None
     reaper: asyncio.Task | None = None
+    claim: object = None
 
 
 # Reserve before any await/registration, including across separately constructed
@@ -129,17 +131,23 @@ class CopilotExecutionLayer(ExecutionLayer):
             failed = True
         if failed:
             raise CopilotLayerError("Invalid Copilot local session request")
-        from core.session.session_manager import is_session_registered
+        from core.session.session_manager import has_legacy_session
 
         if (session_id in _claims or state.get_session_security(session_id) is not None
-                or is_session_registered(session_id)):
+                or has_legacy_session(session_id)):
             raise CopilotLayerError("Copilot platform session is already owned")
         entry = _Entry(session_id, config)
+        entry.claim = register_owned_session(
+            session_id=session_id, engine="copilot-cli", agent=config.agent_name,
+            user_sub=config.user_sub, username=config.security_context.mount_username,
+            active=lambda: (entry.closing is None and entry.owner is not None and entry.owner.alive),
+            close=lambda: self._close_entry(entry),
+        )
         _claims[session_id] = self._sessions[session_id] = entry
         entry.startup = asyncio.create_task(self._start(entry, local))
         try:
             await entry.startup
-            if entry.closing is not None or not entry.owner.alive:
+            if entry.closing is not None or not entry.claim.active:
                 raise CopilotLayerError("Copilot session closed during startup")
             return
         except asyncio.CancelledError:
@@ -153,10 +161,10 @@ class CopilotExecutionLayer(ExecutionLayer):
 
     async def _start(self, entry, local):
         config, ctx = entry.config, entry.config.security_context
-        from core.session.session_manager import is_session_registered
+        from core.session.session_manager import has_legacy_session
 
         if (state.get_session_security(entry.session_id) is not None
-                or is_session_registered(entry.session_id)):
+                or has_legacy_session(entry.session_id)):
             raise CopilotLayerError("Copilot platform session was claimed before startup")
         # No await between registration and capturing the actual stamped object.
         entry.registration_started = True
@@ -218,6 +226,9 @@ class CopilotExecutionLayer(ExecutionLayer):
                 if (entry.registration_started
                         and state.get_session_security(entry.session_id) is entry.context):
                     state.cleanup_session_permission_state(entry.session_id)
+                    if not failed:
+                        from core.concurrency import release_chat_slot
+                        release_chat_slot(entry.session_id)
             except Exception:
                 failed = True
             finally:
@@ -225,6 +236,8 @@ class CopilotExecutionLayer(ExecutionLayer):
                     del self._sessions[entry.session_id]
                 if not failed and _claims.get(entry.session_id) is entry:
                     del _claims[entry.session_id]
+                if not failed:
+                    release_owned_session(entry.claim)
         if failed:
             raise CopilotLayerError("Copilot execution cleanup is incomplete")
 
@@ -245,7 +258,7 @@ class CopilotExecutionLayer(ExecutionLayer):
 
     def _live(self, session_id):
         entry = self._sessions.get(session_id)
-        if entry is None or entry.closing is not None or entry.owner is None or not entry.owner.alive:
+        if entry is None or entry.closing is not None or entry.owner is None or not entry.claim.active:
             raise CopilotLayerError("Copilot execution session is unavailable")
         return entry
 

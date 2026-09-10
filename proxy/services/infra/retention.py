@@ -28,8 +28,9 @@ plans, ``state_*.sqlite``, token/credential dirs.
 
 Safety model: live sessions are excluded via a snapshot of the real runtime
 registries (cli ``_persistent_sessions``, codex ``_codex_sessions`` incl.
-their exact ``config_dir``/``thread_id``, ``_session_security`` contexts,
-``_active_pumps``) — NOT ``session_state._sessions``, which is append-only.
+their exact ``config_dir``/``thread_id``, explicit owned-session claims,
+``_session_security`` contexts, ``_active_pumps``) — NOT
+``session_state._sessions``, which is append-only.
 Session ids shared across chat rows (continue_session delegation chains) are
 protected by a "referenced by any fresh chat" set. Every file age-checked;
 flagging chats never bumps ``updated_at`` (chat-list order is preserved).
@@ -117,21 +118,30 @@ def _build_live_snapshot() -> LiveSnapshot:
     registries are loop-owned); the threaded sweep gets the frozen copy.
 
     Liveness truth = the warm-daemon registries (cli _persistent_sessions +
-    codex _codex_sessions) and _active_pumps. Deliberately NOT
+    codex _codex_sessions), explicit owned-session claims, and _active_pumps. Deliberately NOT
     core.session.session_state._sessions (append-only, persisted — would mark
     everything live) and NOT the raw _session_security map: contexts are
     cleared on clean close but survive a proxy restart for up to 24h, so
     blanket-trusting them marked every recently-used home busy and starved
     the junk pass. A context contributes the
     (agent, username) busy-home only when its session is in a live registry.
+    Explicit owners also contribute their captured mount metadata directly:
+    failed cleanup remains protected after its context has been removed.
     """
     snap = LiveSnapshot()
     from core.layers.cli.session import _persistent_sessions
     from core.layers.codex.session import _codex_sessions
     from core.layers.direct.session import _direct_sessions
     from core.session.session_state import _session_security
+    from core.session.owned_sessions import owned_sessions
     from core.events.stream_pump import _active_pumps
 
+    for owned in owned_sessions(local_only=True):
+        snap.session_ids.add(owned.session_id)
+        # Closing/failed-cleanup owners may have already removed their policy
+        # context. Captured mount metadata still protects their local home.
+        if owned.agent:
+            snap.busy_homes.add((owned.agent, owned.username))
     snap.session_ids.update(_persistent_sessions.keys())
     # Direct-LLM sessions have no files of their own, but an external caller
     # on a Direct agent still has a live caller tree.
