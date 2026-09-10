@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -559,6 +560,9 @@ class SandboxConfig:
     host_agents_dir: Path                    # config.AGENTS_DIR resolved
     host_mcps_dir: Path                      # absolute path to mcps/
     host_claude_dir: Path                    # persistent .claude/ on host
+    # Explicit internal opt-in: shadow this session's .claude path with its
+    # selected private scratch home, not a different engine's existing config.
+    isolated_config_home: bool = False
     # Visibility-modes decouple. ``username`` above is the MOUNT username ("" for
     # any agent-scope mount, incl. a Shared-only HUMAN chat), so it alone no
     # longer tells the mount builder whether the human is an owner or which
@@ -596,6 +600,9 @@ class SandboxConfig:
     # (always RO) on Personal-only agents with no parent /knowledge at all.
     knowledge_libraries: list[tuple[str, str, bool]] = field(default_factory=list)
     mcp_sandbox_mounts: list[SandboxMount] = field(default_factory=list)
+    # Internal host-selected runtime assets, not populated from MCP manifests.
+    # These may live outside the MCP/agent trees but must bind read-only.
+    trusted_runtime_mounts: list[SandboxMount] = field(default_factory=list)
     extra_ro_binds: list[str] = field(default_factory=list)  # additional RO paths to mount
     # Per-MCP dirs to identity-bind RO (this session's assigned stdio MCPs +
     # mcps/.uv-python). The whole mcps/ tree is NEVER mounted — an agent must
@@ -639,7 +646,9 @@ def _is_safe_mcp_mount_dest(dest: str) -> bool:
     """
     if not dest or not dest.startswith("/"):
         return False
-    norm = os.path.normpath(dest)
+    # Linux bind destinations treat a leading // as /, while normpath retains
+    # exactly two leading slashes. Compare the actual destination namespace.
+    norm = "/" + os.path.normpath(dest).lstrip("/")
     if norm in _PROTECTED_MOUNT_DEST_EXACT:
         return False
     parts = norm.split("/")
@@ -673,6 +682,7 @@ class SandboxBuilder:
         args.extend(self._system_mounts())
         args.extend(self._claude_config_mount())
         args.extend(self._workspace_mounts())
+        args.extend(self._trusted_runtime_mounts())
         args.extend(self._mcp_mounts())
         args.extend(self._conditional_mcp_mounts())
         args.extend(["--chdir", self.get_cwd()])
@@ -900,6 +910,48 @@ class SandboxBuilder:
             args.extend(["--bind" if m.rw else "--ro-bind", m.host, m.sandbox])
         return args
 
+    def _isolated_config_home_mounts(self) -> list[Mount]:
+        """Validate an explicitly selected private home without following links."""
+        descriptor = None
+        try:
+            if type(self.cfg.isolated_config_home) is not bool:
+                raise ValueError()
+            if not self.cfg.isolated_config_home:
+                return []
+            source = Path(self.cfg.host_claude_dir)
+            if not source.is_absolute() or ".." in source.parts:
+                raise ValueError()
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            descriptor = os.open("/", flags)
+            for component in source.parts[1:]:
+                child = os.open(component, flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+            info = os.fstat(descriptor)
+            if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                raise ValueError()
+            # The personal cwd root is bound RO. bwrap cannot create a missing
+            # child there later, so materialize only an empty literal mountpoint.
+            agent_root = self._agent_dir.resolve()
+            if self.cfg.external_home:
+                cwd = Path(self.cfg.external_home)
+            elif self.cfg.username:
+                cwd = self._agent_dir / "users" / self.cfg.username
+            else:
+                cwd = self._agent_dir / "workspace"
+            relative = cwd.relative_to(self._agent_dir) / ".claude"
+            destination = _verified_literal_path(agent_root, *relative.parts)
+            if destination is None:
+                raise ValueError()
+            destination.mkdir(parents=True, exist_ok=True)
+            return [Mount(str(source), self.get_cwd() + "/.claude", True)]
+        except (OSError, ValueError, TypeError):
+            pass
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        raise ValueError("Invalid isolated sandbox configuration home")
+
     def workspace_mount_table(self) -> list[Mount]:
         """Role-dependent workspace mounts (3-tier per-agent model), as the
         ordered list of :class:`Mount` decisions.
@@ -934,6 +986,7 @@ class SandboxBuilder:
         inside the proxy with no bwrap underneath, resolve against this very
         list so they see exactly the kernel's view.
         """
+        isolated_home = self._isolated_config_home_mounts()
         mounts: list[Mount] = []
         role = self.cfg.role
         username = self.cfg.username
@@ -1066,7 +1119,7 @@ class SandboxBuilder:
                     mounts.append(Mount(str(cred_dir),
                                         "/knowledge/.credentials", True))
             mounts.extend(self._external_mounts(agent_dir_path, agent_root_real))
-            return mounts
+            return mounts + isolated_home
 
         # User-scope MOUNT — the session has its own personal dir. The dir
         # ROOT is read-only with the known subdirs stacked RW on top: agents
@@ -1136,7 +1189,7 @@ class SandboxBuilder:
                 mounts.append(Mount(_mirror_host(_src, _subdir),
                                     _mirror_dest(_src, _subdir), False))
 
-        return mounts
+        return mounts + isolated_home
 
     def _external_mounts(self, agent_dir_path: Path, agent_root_real: Path) -> list[Mount]:
         """The external-session additions to the agent-scope mount set
@@ -1192,6 +1245,42 @@ class SandboxBuilder:
                 mounts.append(Mount(str(p), f"{EXTERNAL_SANDBOX_HOME}/{sub}", True))
         return mounts
 
+    def _trusted_runtime_mounts(self) -> list[str]:
+        """Strict RO assets explicitly selected by a trusted host caller.
+
+        This is not an alternative manifest source allowlist. Reject malformed
+        configuration rather than silently starting without required assets.
+        """
+        args: list[str] = []
+        destinations: list[Path] = []
+        try:
+            if type(self.cfg.trusted_runtime_mounts) is not list:
+                raise ValueError()
+            for mount in self.cfg.trusted_runtime_mounts:
+                if type(mount) is not SandboxMount or mount.mode != "ro":
+                    raise ValueError()
+                for value in (mount.host, mount.sandbox):
+                    if (not isinstance(value, str) or not value or "\x00" in value
+                            or "\\" in value or not Path(value).is_absolute()
+                            or value.startswith("//") or ".." in value.split("/")
+                            or os.path.normpath(value) != value):
+                        raise ValueError()
+                if not _is_safe_mcp_mount_dest(mount.sandbox):
+                    raise ValueError()
+                source = Path(mount.host).resolve(strict=True)
+                if not source.is_dir():
+                    raise ValueError()
+                destination = Path(mount.sandbox)
+                if any(destination.is_relative_to(old) or old.is_relative_to(destination)
+                       for old in destinations):
+                    raise ValueError()
+                destinations.append(destination)
+                args.extend(["--ro-bind", str(source), mount.sandbox])
+            return args
+        except (OSError, ValueError, TypeError, RuntimeError):
+            pass
+        raise ValueError("Invalid trusted runtime sandbox mount")
+
     def _mcp_mounts(self) -> list[str]:
         """Mount this session's MCP dirs at the SAME absolute paths (RO).
 
@@ -1234,6 +1323,7 @@ class SandboxBuilder:
             except (OSError, ValueError):
                 continue
         args: list[str] = []
+        trusted_destinations = [Path(value) for value in self._trusted_runtime_mounts()[2::3]]
         for mount in self.cfg.mcp_sandbox_mounts:
             if not os.path.exists(mount.host):
                 continue
@@ -1249,6 +1339,11 @@ class SandboxBuilder:
                     "Refusing MCP sandbox mount to %s (mode=%s): destination "
                     "overlays a protected sandbox path", mount.sandbox, mount.mode,
                 )
+                continue
+            destination = Path("/" + os.path.normpath(mount.sandbox).lstrip("/"))
+            if any(destination.is_relative_to(trusted) or trusted.is_relative_to(destination)
+                   for trusted in trusted_destinations):
+                logger.warning("Refusing MCP sandbox mount over trusted runtime assets")
                 continue
             target = str(host_resolved)
             if mount.mode == "rw":
@@ -1324,6 +1419,8 @@ def resolve_sandbox_config(
     *,
     user_sub: str = "",
     mcp_sandbox_mounts: list[SandboxMount] | None = None,
+    trusted_runtime_mounts: list[SandboxMount] | None = None,
+    isolated_config_home: bool = False,
     extra_ro_binds: list[str] | None = None,
     net_forwards: list[str] | None = None,
     net_allow_hosts: list[str] | None = None,
@@ -1367,7 +1464,17 @@ def resolve_sandbox_config(
     :func:`mcp_dir_binds_from_config`) — never the whole mcps/ tree.
     ``mcp_dir_binds`` overrides the derivation for layers with no config FILE
     (Direct-LLM's proxy-managed delivery passes its assigned stdio dirs).
+
+    ``trusted_runtime_mounts`` is an internal host-selected RO asset channel,
+    never populated from manifest fields. Invalid entries fail at build time.
+    ``isolated_config_home`` shadows only the selected session's .claude path
+    with its explicitly provided private home; other credential paths are not
+    removed by this opt-in.
     """
+    if trusted_runtime_mounts is not None and type(trusted_runtime_mounts) is not list:
+        raise ValueError("Invalid trusted runtime sandbox mounts")
+    if type(isolated_config_home) is not bool:
+        raise ValueError("Invalid isolated sandbox configuration home")
     if net_forwards is None:
         try:
             from services.mcp import mcp_registry
@@ -1413,11 +1520,13 @@ def resolve_sandbox_config(
         host_agents_dir=app_config.AGENTS_DIR.resolve(),
         host_mcps_dir=app_config.MCPS_DIR.resolve(),
         host_claude_dir=host_claude_dir,
+        isolated_config_home=isolated_config_home,
         config_visible=config_visible,
         mount_shared=mount_shared,
         knowledge_rw=knowledge_rw,
         knowledge_libraries=knowledge_libraries,
         mcp_sandbox_mounts=mcp_sandbox_mounts or [],
+        trusted_runtime_mounts=list(trusted_runtime_mounts or []),
         extra_ro_binds=extra_ro_binds or [],
         net_forwards=net_forwards or [],
         net_allow_hosts=net_allow_hosts or [],
