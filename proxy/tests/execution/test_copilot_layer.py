@@ -82,7 +82,11 @@ async def harness(monkeypatch, tmp_path):
     registry = ModuleType("core.session.session_manager")
     registered = set()
     registry.is_session_registered = registered.__contains__
+    registry.has_legacy_session = registered.__contains__
     monkeypatch.setitem(sys.modules, "core.session.session_manager", registry)
+    from core.session import owned_sessions
+    monkeypatch.setattr(owned_sessions, "_sessions", {})
+    monkeypatch.setattr(owned_sessions, "_shutting_down", False)
     roots = [tmp_path / name for name in ("records", "state", "homes")]
     for root in roots:
         root.mkdir(mode=0o700)
@@ -167,6 +171,17 @@ async def start(harness, **changes):
     layer, sid = harness.layer(), harness.identity()
     await layer.start_session(sid, config(**changes))
     return layer, sid, harness.owners[-1]
+
+
+@pytest.fixture
+def reservations(monkeypatch):
+    from core import concurrency
+
+    for name in ("_sessions", "_session_est", "_session_added_at"):
+        monkeypatch.setattr(concurrency, name, {})
+    monkeypatch.setattr(concurrency, "_reserved_mb", 0)
+    monkeypatch.setattr(concurrency, "_cond", asyncio.Condition())
+    return concurrency
 
 
 async def pending_permission(sid):
@@ -597,3 +612,171 @@ async def test_config_snapshot_cannot_be_changed_by_caller_during_startup(harnes
     finally:
         release.set()
         await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_published_owner_tracks_startup_active_closing_and_confirmed_release(harness):
+    from core.session import owned_sessions
+
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def hold(_owner):
+        entered.set()
+        await release.wait()
+
+    harness.open_hook = hold
+    layer, sid = harness.layer(), harness.identity()
+    startup = asyncio.create_task(layer.start_session(sid, config()))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        handle = owned_sessions.get_owned_session(sid)
+        assert handle is not None and not handle.active
+        assert handle.local is True
+        assert (handle.engine, handle.agent, handle.user_sub, handle.username) == (
+            "copilot-cli", "demo", "alice", "alice",
+        )
+        assert sid in owned_sessions.owned_session_ids(local_only=True)
+        release.set()
+        await asyncio.wait_for(startup, 1)
+        assert owned_sessions.get_owned_session(sid) is handle and handle.active
+        owner = harness.owners[-1]
+        owner.close_release = asyncio.Event()
+        closing = asyncio.create_task(layer.close_session(sid))
+        try:
+            await asyncio.wait_for(owner.close_entered.wait(), 1)
+            assert owned_sessions.get_owned_session(sid) is handle and not handle.active
+            assert await layer.is_session_process_dead(sid) is False
+        finally:
+            owner.close_release.set()
+            await asyncio.wait_for(closing, 1)
+        assert owned_sessions.get_owned_session(sid) is None
+        assert not handle.active and await handle.close() is False
+        assert await layer.is_session_process_dead(sid) is True
+    finally:
+        release.set()
+        await asyncio.gather(startup, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_global_close_denies_send_before_layer_cleanup_begins(harness, monkeypatch):
+    from core.session import owned_sessions
+
+    layer, sid, owner = await start(harness)
+    handle = owned_sessions.get_owned_session(sid)
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = layer._close_entry
+
+    async def delayed(entry):
+        entered.set()
+        await release.wait()
+        await original(entry)
+
+    monkeypatch.setattr(layer, "_close_entry", delayed)
+    closing = asyncio.create_task(handle.close())
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        assert owner.alive and layer._sessions[sid].closing is None
+        assert not handle.active and not await layer.is_session_alive(sid)
+        with pytest.raises(module.CopilotLayerError):
+            _ = [event async for event in layer.send_message(sid, "must not dispatch")]
+        assert owner.messages == []
+        assert owned_sessions.get_owned_session(sid) is handle
+    finally:
+        release.set()
+        await asyncio.wait_for(closing, 1)
+    assert owner.closed and owned_sessions.get_owned_session(sid) is None
+
+
+@pytest.mark.asyncio
+async def test_global_close_failure_retains_claim_and_reservation(harness, reservations):
+    from core.session import owned_sessions
+
+    layer, sid, owner = await start(harness)
+    reservations._add(sid, "chat", 1000)
+    handle = owned_sessions.get_owned_session(sid)
+    owner.close_error = True
+    with pytest.raises(owned_sessions.SessionOwnershipError) as error:
+        await handle.close()
+    assert error.value.__context__ is None
+    assert owned_sessions.get_owned_session(sid) is handle and not handle.active
+    assert sid in reservations._sessions and reservations._reserved_mb == 1000
+    assert await layer.is_session_process_dead(sid) is False
+    with pytest.raises(module.CopilotLayerError):
+        _ = [event async for event in layer.send_message(sid, "must not dispatch")]
+    assert owner.messages == []
+
+
+@pytest.mark.asyncio
+async def test_successful_close_releases_slot_after_runtime_join_without_sweep(harness, reservations):
+    from core.session import owned_sessions
+
+    layer, sid, owner = await start(harness)
+    reservations._add(sid, "chat", 1000)
+    owner.close_release = asyncio.Event()
+    closing = asyncio.create_task(layer.close_session(sid))
+    try:
+        await asyncio.wait_for(owner.close_entered.wait(), 1)
+        assert reservations._reserved_mb == 1000 and sid in reservations._sessions
+        assert owned_sessions.get_owned_session(sid) is not None
+    finally:
+        owner.close_release.set()
+        await asyncio.wait_for(closing, 1)
+    assert owner.closed
+    assert sid not in reservations._sessions and reservations._reserved_mb == 0
+    assert owned_sessions.get_owned_session(sid) is None
+
+
+@pytest.mark.asyncio
+async def test_old_owner_close_preserves_replacement_context_reservation(harness, reservations):
+    from core.session import owned_sessions
+
+    layer, sid, owner = await start(harness)
+    reservations._add(sid, "chat", 1000)
+    replacement = replace(config().security_context, display_name="replacement")
+    state.register_session_state(sid, "plan", replacement)
+    current = state.get_session_security(sid)
+    await layer.close_session(sid)
+    assert owner.closed and owned_sessions.get_owned_session(sid) is None
+    assert state.get_session_security(sid) is current
+    assert sid in reservations._sessions and reservations._reserved_mb == 1000
+
+
+@pytest.mark.asyncio
+async def test_global_close_during_startup_keeps_late_owner_claim_until_join(harness, reservations):
+    from core.session import owned_sessions
+
+    entered, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def late(_owner):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+
+    harness.open_hook = late
+    layer, sid = harness.layer(), harness.identity()
+    reservations._add(sid, "chat", 1000)
+    startup = asyncio.create_task(layer.start_session(sid, config()))
+    closing = None
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        handle = owned_sessions.get_owned_session(sid)
+        closing = asyncio.create_task(handle.close())
+        await asyncio.wait_for(cancelled.wait(), 1)
+        assert not handle.active
+        assert owned_sessions.get_owned_session(sid) is handle
+        assert reservations._reserved_mb == 1000
+        assert await layer.is_session_process_dead(sid) is False
+        assert not closing.done()
+        release.set()
+        assert await asyncio.wait_for(closing, 1) is True
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(startup, 1)
+        assert harness.owners[-1].closed
+        assert owned_sessions.get_owned_session(sid) is None
+        assert reservations._reserved_mb == 0
+    finally:
+        release.set()
+        await asyncio.gather(startup, *([closing] if closing else []), return_exceptions=True)

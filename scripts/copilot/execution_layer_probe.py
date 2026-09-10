@@ -116,6 +116,11 @@ async def run(args, report):
             # Include failed attempts in final idempotent cleanup as well.
             owners.append((layer, session_id))
             await layer.start_session(session_id, replace(config, resume=resume))
+            from core.session.owned_sessions import get_owned_session
+            from core.session.session_manager import is_session_registered
+            claim = get_owned_session(session_id)
+            assert claim is not None and claim.active and claim.engine == "copilot-cli"
+            assert is_session_registered(session_id)
 
         async def clean_closed(layer, session_id):
             async with asyncio.timeout(15):
@@ -123,6 +128,8 @@ async def run(args, report):
                        or state.get_session_security(session_id) is not None):
                     await asyncio.sleep(0.05)
             assert not await layer.is_session_alive(session_id)
+            from core.session.owned_sessions import get_owned_session
+            assert get_owned_session(session_id) is None
 
         async def marker_turn(layer, prompt, *, generation):
             async with asyncio.timeout(60), layer.session_lock(platform_id):
@@ -175,10 +182,12 @@ async def run(args, report):
                     first, f"Remember this marker exactly: {marker}. Reply with only that marker. Do not use tools.",
                     generation=1,
                 )
-                await first.close_session(platform_id)
+                from core.session.owned_sessions import get_owned_session
+                assert await get_owned_session(platform_id).close()
                 await clean_closed(first, platform_id)
                 assert not runtimes[-1].alive and not runtimes[-1].forced_cleanup
                 report["normal_close_removed_context_and_joined"] = True
+                report["normal_close_through_owned_registry"] = True
 
                 current = replace(current, revision="revision-two")
                 second = new_layer()
@@ -304,6 +313,7 @@ def main():
         "live_turn_limit": 3, "turn_deadline_seconds": 60, "flow_deadline_seconds": 180,
         "per_session_credit_limit": 30, "sandboxed": True, "actual_execution_layer": True,
         "actual_sandbox_resolver": True, "platform_registration": "actual layer-owned context",
+        "actual_owned_registry": True,
         "credential_store": "controlled scoped fixture", "oauth_refresh": False,
         "postgresql_account_store": False,
     }

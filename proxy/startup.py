@@ -752,6 +752,10 @@ async def _shutdown_cleanup(logger) -> None:
 
 async def _shutdown_sessions(logger):
     """Close all active sessions across all layers (called with timeout)."""
+    from core.session.owned_sessions import begin_owned_session_shutdown
+
+    # Stop new claims before draining dependents can yield to another startup.
+    owned_handles = begin_owned_session_shutdown()
     # 1. Cancel running tasks and meetings first (they depend on sessions)
     await scheduler.shutdown()
     from services.meetings.meeting_orchestrator import shutdown_meetings
@@ -763,6 +767,19 @@ async def _shutdown_sessions(logger):
     from core.layers.codex.session import _codex_sessions, _codex_sessions_lock
     from core.session.session_manager import get_execution_layer
     from core.session.session_state import _sessions
+
+    # Explicit owners need no global engine registration or current agent
+    # configuration. Remote shutdown keeps its existing in-flight policy below.
+    async def close_owned(owned):
+        try:
+            await owned.close()
+        except Exception:
+            logger.warning("Shutdown: owned session %s cleanup failed",
+                           owned.session_id[:8])
+
+    # Dispatch the whole snapshot so one slow owner cannot consume the outer
+    # shutdown deadline before the remaining owners even begin cleanup.
+    await asyncio.gather(*(close_owned(owned) for owned in owned_handles if owned.local))
 
     # CLI sessions
     async with _persistent_sessions_lock:

@@ -211,6 +211,12 @@ def _lane_pump_wedged(pump) -> bool:
     a user's in-flight turn on the lane (its producer holds
     layer.session_lock; the reap shoots the holder)."""
     sid = pump.session_id
+    from core.session.owned_sessions import get_owned_session
+
+    # Inactive may mean startup, closing or uncertain cleanup, not a dead
+    # producer. Its exact owner must complete cleanup before a lane can reap.
+    if get_owned_session(sid) is not None:
+        return False
     from core.session.session_manager import _remote_layer
     if _remote_layer is not None and sid in _remote_layer._sessions:
         info = _remote_layer._sessions[sid]
@@ -236,6 +242,8 @@ async def _settle_prior_lane(chat_id: str, run_id: str) -> bool:
     reusing would put two concurrent stdout readers on one CLI, while the
     respawn path's stale-live guard closes the old process first."""
     from core.events.stream_pump import _active_pumps
+    from core.session.owned_sessions import get_owned_session
+
     prior = _active_pumps.get(chat_id)
     if prior is None or prior.is_done:
         return False
@@ -244,6 +252,10 @@ async def _settle_prior_lane(chat_id: str, run_id: str) -> bool:
         prior = _active_pumps.get(chat_id)
         if prior is None or prior.is_done:
             return False
+    # A quiescence ceiling is not evidence of owner cleanup. Re-read the
+    # current pump after that await, including any replacement on this lane.
+    if get_owned_session(prior.session_id) is not None:
+        raise RuntimeError("Prior lane still owns runtime resources")
     await _reap_prior_lane_pump(chat_id, run_id)
     return True
 

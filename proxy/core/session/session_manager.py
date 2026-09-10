@@ -48,14 +48,27 @@ def _get_remote_layer() -> "RemoteExecutionLayer":
 
 
 def is_session_registered(session_id: str) -> bool:
-    """True while ``session_id`` is a LIVE session in some execution layer's
-    registry (cli / codex / direct / remote). This — not the persisted
-    security context — is the liveness a session-scoped token is checked
-    against (``middleware.external_session_confinement``): the registries
-    are populated at spawn and popped at close, so a token lifted from a
-    session is dead the moment the session ends."""
+    """Request admission used by external-session JWT confinement.
+
+    Legacy pool membership retains its existing semantics. Explicit owned
+    runtimes must be active; a retained cleanup claim grants no admission.
+    This is not a universal JWT revocation check or a resource inventory.
+    """
     if not session_id:
         return False
+    from core.session.owned_sessions import get_owned_session
+    owned = get_owned_session(session_id)
+    if owned is not None:
+        return owned.active
+    return has_legacy_session(session_id)
+
+
+def has_legacy_session(session_id: str) -> bool:
+    """Legacy ownership independent of any newer claim shadowing the same ID.
+
+    Admission rechecks use this to detect a foreign startup that raced an
+    explicit claim. Do not infer absence of resources from inactive ownership.
+    """
     from core.layers.cli.session import _persistent_sessions
     from core.layers.codex.session import _codex_sessions
     from core.layers.direct.session import _direct_sessions

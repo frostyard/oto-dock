@@ -27,6 +27,11 @@ The engine remains unregistered. See the
 [adapter contract](../../docs/plans/copilot-execution-layer-contract.md) and
 [results](../../docs/plans/copilot-execution-layer-results.md).
 
+The probe also verifies actual ownership-registry admission and release, with
+normal close dispatched through the captured generation handle. The follow-up
+[registry evidence](../../docs/plans/copilot-session-registry-results.md) records
+that run separately from the original execution-layer qualification.
+
 ## Account-bound local sessions
 
 `local_session_probe.py` exercises the composed session factory, durable writer
