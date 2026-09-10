@@ -924,3 +924,39 @@ async def test_failed_terminal_delivery_quarantines_even_after_iterator_detaches
     assert saved['events'][-1]['type'] == 'turn_complete'
     assert saved['conversation']['state'] == 'incomplete'
     assert saved['conversation']['can_resume'] is False
+
+
+@pytest.mark.asyncio
+async def test_agent_page_filters_before_pagination_and_checks_empty_page_authority(fixture):
+    service = fixture.service()
+    handle = await create(fixture, service)
+    cid = service.conversation_id(fixture.user, handle)
+    store = service.store
+    store.create(str(uuid.uuid4()), fixture.user.sub, agent='another-agent', account_id='account', model='model',
+                 permission_mode='default', platform_session_id=str(uuid.uuid4()), generation=str(uuid.uuid4()))
+    page = await service.list_conversations(fixture.user, limit=1, agent='agent')
+    assert [item['id'] for item in page['conversations']] == [cid]
+    assert not page['has_more']
+    fixture.current['denied'] = True
+    with pytest.raises(CopilotChatError) as error:
+        await service.list_conversations(fixture.user, agent='no-history')
+    assert error.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_agent_page_mismatch_cannot_read_or_resume_or_mutate_saved_generation(fixture):
+    service = fixture.service()
+    handle = await create(fixture, service)
+    cid = service.conversation_id(fixture.user, handle)
+    assert [event async for event in await service.prepare_turn(fixture.user, handle, 'complete')][-1]['type'] == 'turn_complete'
+    await service.close(fixture.user, handle)
+    before = service.store.get(cid, fixture.user.sub)
+    starts = len(fixture.layer.started)
+    for operation in [service.get_conversation(fixture.user, cid, agent='another-agent'),
+                      service.resume(fixture.user, cid, before['revision'], agent='another-agent')]:
+        with pytest.raises(CopilotChatError) as error:
+            await operation
+        assert error.value.status_code == 404
+    assert service.store.get(cid, fixture.user.sub) == before
+    assert len(fixture.layer.started) == starts
+    assert (await service.get_conversation(fixture.user, cid, agent='agent'))['conversation']['id'] == cid

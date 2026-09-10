@@ -295,6 +295,7 @@ function buildSearchComponents(idPrefix: string, counterRef: { current: number }
 }
 
 interface Props {
+  allowInlineImages?: boolean
   children: string
   className?: string
   searchMatchIdPrefix?: string  // stable prefix for search match IDs
@@ -307,7 +308,7 @@ interface Props {
 // the duplex player's 250ms lookahead). Props are all primitives, so the
 // default shallow compare is exact; context-driven re-renders (search)
 // still pass through memo as always.
-function MarkdownContent({ children, className, searchMatchIdPrefix, searchOrder }: Props) {
+function MarkdownContent({ children, className, searchMatchIdPrefix, searchOrder, allowInlineImages = true }: Props) {
   const { query } = useSearch()
   const counterRef = useRef(0)
   // Reset counter on each render so IDs are stable for same content
@@ -319,6 +320,11 @@ function MarkdownContent({ children, className, searchMatchIdPrefix, searchOrder
     ? buildSearchComponents(idPrefix, counterRef, order)
     : baseComponents
 
+  const renderedComponents: Components = allowInlineImages ? components : {
+    ...components,
+    img: ({ alt }) => <span className="text-p-text-secondary">{alt ? `Image: ${alt} (not loaded)` : 'Image not loaded'}</span>,
+  }
+
   return (
     <div className={`markdown-content prose prose-sm max-w-none dark:prose-invert
       prose-headings:mt-4 prose-headings:mb-2 prose-headings:font-semibold
@@ -329,7 +335,7 @@ function MarkdownContent({ children, className, searchMatchIdPrefix, searchOrder
       prose-strong:text-gray-900 dark:prose-strong:text-gray-100
       ${className || ''}`}
     >
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components} urlTransform={urlTransform}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={renderedComponents} urlTransform={urlTransform}>
         {children}
       </ReactMarkdown>
     </div>

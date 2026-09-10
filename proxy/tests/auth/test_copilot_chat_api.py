@@ -73,20 +73,20 @@ class Service:
     def conversation_id(self, user, sid):
         return CID
 
-    async def list_conversations(self, user, *, limit, offset):
-        self.calls.append(("list", user, limit, offset))
+    async def list_conversations(self, user, *, limit, offset, agent=None):
+        self.calls.append(("list", user, limit, offset) + ((agent,) if agent is not None else ()))
         if self.error:
             raise self.error
         return {"conversations": [{"id": CID}], "has_more": False}
 
-    async def get_conversation(self, user, cid):
-        self.calls.append(("get", user, cid))
+    async def get_conversation(self, user, cid, agent=None):
+        self.calls.append(("get", user, cid) + ((agent,) if agent is not None else ()))
         if self.error:
             raise self.error
         return {"conversation": {"id": CID}, "events": [{"type": "user", "content": "hello", "seq": 1}]}
 
-    async def resume(self, user, cid, revision):
-        self.calls.append(("resume", user, cid, revision))
+    async def resume(self, user, cid, revision, agent=None):
+        self.calls.append(("resume", user, cid, revision) + ((agent,) if agent is not None else ()))
         if self.error:
             raise self.error
         if self.create_hook:
@@ -640,3 +640,22 @@ async def test_whole_history_page_deadline_is_sanitized_without_starting_runtime
     response = await api.client.get(BASE + '/conversations')
     assert response.status_code == 503 and cancelled.is_set()
     assert api.service.calls == []
+
+
+@pytest.mark.asyncio
+async def test_agent_route_context_reaches_each_history_service_boundary(api):
+    assert (await api.client.get(BASE + '/conversations?agent=demo&limit=2')).status_code == 200
+    assert (await api.client.get(BASE + f'/conversations/{CID}?agent=demo')).status_code == 200
+    assert (await post(api, f'/conversations/{CID}/resume?agent=demo', {'revision': 1})).status_code == 201
+    assert api.service.calls == [('list', api.user[0], 2, 0, 'demo'),
+                                 ('get', api.user[0], CID, 'demo'),
+                                 ('resume', api.user[0], CID, 1, 'demo')]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('agent', ['', 'a' * 65])
+@pytest.mark.parametrize('path', ['/conversations', f'/conversations/{CID}', f'/conversations/{CID}/resume'])
+async def test_agent_query_bounds_reject_before_service(api, agent, path):
+    path += '?agent=' + agent
+    response = await post(api, path, {'revision': 1}) if '/resume?' in path else await api.client.get(BASE + path)
+    assert response.status_code == 422 and not api.service.calls

@@ -56,22 +56,24 @@ export async function createCopilotChat(body: { agent: string; account_id: strin
   const response = await request('/sessions', { method: 'POST', body: JSON.stringify(body) })
   return owner(response)
 }
-export async function listCopilotConversations(offset = 0): Promise<{ conversations: CopilotConversation[]; has_more: boolean }> {
+export async function listCopilotConversations(offset = 0, agent?: string): Promise<{ conversations: CopilotConversation[]; has_more: boolean }> {
   if (!Number.isSafeInteger(offset) || offset < 0) throw new CopilotChatError(failure)
-  const response = await request(`/conversations?limit=20&offset=${offset}`)
+  const response = await request(`/conversations?limit=20&offset=${offset}${agent ? `&agent=${encodeURIComponent(agent)}` : ''}`)
   try {
     const data = await response.json()
     if (!Array.isArray(data.conversations) || data.conversations.length > 20 || typeof data.has_more !== 'boolean') throw new Error()
-    return { conversations: data.conversations.map(conversation), has_more: data.has_more }
+    const rows: CopilotConversation[] = data.conversations.map(conversation)
+    if (agent && rows.some(row => row.agent !== agent)) throw new Error()
+    return { conversations: rows, has_more: data.has_more }
   } catch { throw new CopilotChatError(failure) }
 }
-export async function getCopilotConversation(id: string): Promise<{ conversation: CopilotConversation; events: ChatEvent[] }> {
-  const response = await request(`/conversations/${encodeURIComponent(id)}`)
+export async function getCopilotConversation(id: string, agent?: string): Promise<{ conversation: CopilotConversation; events: ChatEvent[] }> {
+  const response = await request(`/conversations/${encodeURIComponent(id)}${agent ? `?agent=${encodeURIComponent(agent)}` : ''}`)
   try {
     const data = await response.json(), metadata = conversation(data.conversation)
     // Storage bounds the payloads before adding sequence fields and array
     // framing. Allow bounded transport overhead for at most 1,000 events.
-    if (metadata.id !== id || !Array.isArray(data.events) || data.events.length > 1000
+    if (metadata.id !== id || (agent && metadata.agent !== agent) || !Array.isArray(data.events) || data.events.length > 1000
         || new TextEncoder().encode(JSON.stringify(data.events)).length > 1048576 + 65536) throw new Error()
     let previous = 0
     let payloadBytes = 0
@@ -86,9 +88,9 @@ export async function getCopilotConversation(id: string): Promise<{ conversation
     return { conversation: metadata, events: data.events }
   } catch { throw new CopilotChatError(failure) }
 }
-export async function resumeCopilotConversation(id: string, revision: number) {
+export async function resumeCopilotConversation(id: string, revision: number, agent?: string) {
   if (!Number.isSafeInteger(revision) || revision < 1) throw new CopilotChatError(failure)
-  return owner(await request(`/conversations/${encodeURIComponent(id)}/resume`, { method: 'POST', body: JSON.stringify({ revision }) }))
+  return owner(await request(`/conversations/${encodeURIComponent(id)}/resume${agent ? `?agent=${encodeURIComponent(agent)}` : ''}`, { method: 'POST', body: JSON.stringify({ revision }) }))
 }
 const path = (sid: string) => `/sessions/${encodeURIComponent(sid)}`
 export async function closeCopilotChat(sid: string) {

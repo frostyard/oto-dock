@@ -28,6 +28,9 @@ interface Props {
   onPlanFetched?: (filename: string, content: string) => void
   onDismissPreview?: (fileId: string, key?: { snapshotId?: string; dbMessageId?: number }) => void
   onArtifactInteraction?: (token: string, title: string, payload: unknown) => Promise<{ status: string; reason?: string }>
+  /** Disable unqualified audio APIs on isolated transcript surfaces. */
+  enableSpeech?: boolean
+  allowInlineImages?: boolean
   streaming?: boolean
   queuedMessages?: string[]
   onCancelQueued?: (index: number) => void
@@ -67,6 +70,7 @@ const FOCUS_GUARD_POINTER_MS = 1500
 // Format timestamp for message headers
 function formatMessageTime(iso: string): string {
   const d = new Date(iso)
+  if (!Number.isFinite(d.getTime())) return ''
   const day = d.getDate()
   const mon = d.toLocaleString('en', { month: 'short' })
   const h = d.getHours().toString().padStart(2, '0')
@@ -151,6 +155,8 @@ export default function ChatMessages({
   onDismissPreview,
   onArtifactInteraction,
   streaming,
+  enableSpeech = true,
+  allowInlineImages = true,
   queuedMessages,
   onCancelQueued,
   onLoadOlder,
@@ -517,6 +523,7 @@ export default function ChatMessages({
                           blockId={`${msg.id}-b${i}`}
                           blockOrder={msgIdx * 1000 + i}
                           isUserMessage
+                          allowInlineImages={allowInlineImages}
                           chatId={chatId}
                           agentName={agentName}
                           onPermissionRespond={onPermissionRespond}
@@ -625,6 +632,7 @@ export default function ChatMessages({
                       blockId={`${msg.id}-b${i}`}
                       blockOrder={msgIdx * 1000 + i}
                       isUserMessage={false}
+                      allowInlineImages={allowInlineImages}
                       chatId={chatId}
                       agentName={msgSlug || agentName}
                       onPermissionRespond={onPermissionRespond}
@@ -687,7 +695,7 @@ export default function ChatMessages({
                       {/* Sound icon only once the message is complete — `meta` is
                           the completion signal; `!streaming` covers older rows
                           (never read half-streamed text). */}
-                      {(!!meta || !streaming) && <SoundIcon text={extractPlainText(msg.blocks)} />}
+                      {enableSpeech && (!!meta || !streaming) && <SoundIcon text={extractPlainText(msg.blocks)} />}
                     </div>
                   )}
                 </div>

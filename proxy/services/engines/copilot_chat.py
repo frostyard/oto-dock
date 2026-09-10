@@ -7,6 +7,7 @@ import json
 import math
 import uuid
 
+import config
 from auth.providers import UserContext
 from core.concurrency import acquire_chat_slot, release_chat_slot
 from core.config.copilot_config_builder import authorize_copilot_history, build_copilot_agent_config
@@ -54,6 +55,12 @@ def _message(text):
 def _request_id(value):
     if not isinstance(value, str) or not 0 < len(value) <= 256:
         raise CopilotChatError(422, "A request identifier is required")
+
+
+def _agent_filter(agent):
+    if agent is not None and (not isinstance(agent, str) or not 0 < len(agent) <= 256
+                              or not config.is_safe_agent_name(agent)):
+        raise CopilotChatError(422, "A valid agent is required")
 
 
 @dataclass(eq=False)
@@ -463,11 +470,15 @@ class CopilotChatService:
         metadata.update(can_resume=bool(resumable), reason="Ready to resume" if resumable else "Conversation is not ready to resume")
         return metadata
 
-    async def list_conversations(self, user, limit=20, offset=0):
+    async def list_conversations(self, user, limit=20, offset=0, agent=None):
         _human(user)
+        _agent_filter(agent)
         if type(limit) is not int or not 1 <= limit <= 100 or type(offset) is not int or not 0 <= offset <= 10000:
             raise CopilotChatError(422, "Invalid conversation pagination")
-        rows = await self._db("list_conversations", user.sub, limit=limit, offset=offset)
+        if agent is not None:
+            await self._history_authorize(user, agent)
+        filters = {"agent": agent} if agent is not None else {}
+        rows = await self._db("list_conversations", user.sub, limit=limit, offset=offset, **filters)
         metadata = []
         for row in rows:
             try:
@@ -477,25 +488,27 @@ class CopilotChatService:
                     raise
         more = False
         if len(rows) == limit and offset + limit <= 10000:
-            more = bool(await self._db("list_conversations", user.sub, limit=1, offset=offset + limit))
+            more = bool(await self._db("list_conversations", user.sub, limit=1, offset=offset + limit, **filters))
         return {"conversations": metadata, "has_more": more}
 
-    async def get_conversation(self, user, cid):
+    async def get_conversation(self, user, cid, agent=None):
         _human(user)
+        _agent_filter(agent)
         row = await self._db("get", cid, user.sub)
-        if row is None:
+        if row is None or (agent is not None and row["agent"] != agent):
             raise CopilotChatError(404, "Copilot conversation was not found")
         metadata = await self._metadata(user, row)
         events = await self._db("events", cid, user.sub)
         await self._history_authorize(user, row["agent"])
         return {"conversation": metadata, "events": events}
 
-    async def resume(self, user, cid, expected_revision):
+    async def resume(self, user, cid, expected_revision, agent=None):
         _human(user)
+        _agent_filter(agent)
         if type(expected_revision) is not int or expected_revision < 1:
             raise CopilotChatError(422, "A conversation revision is required")
         row = await self._db("get", cid, user.sub)
-        if row is None:
+        if row is None or (agent is not None and row["agent"] != agent):
             raise CopilotChatError(404, "Copilot conversation was not found")
         await self._history_authorize(user, row["agent"])
         self._capacity(user)

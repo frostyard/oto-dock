@@ -252,17 +252,21 @@ async def _open_session(request, user, service, operation):
 async def list_conversations(request: Request,
                              limit: Annotated[int, Query(ge=1, le=100)] = 20,
                              offset: Annotated[int, Query(ge=0, le=10000)] = 0,
+                             agent: Annotated[str | None, Query(min_length=1, max_length=64)] = None,
                              user: UserContext | None = Depends(get_current_user)):
     user = _human(request, user)
-    result = await _call(_history_read(_service(request).list_conversations(user, limit=limit, offset=offset)))
+    filters = {"agent": agent} if agent is not None else {}
+    result = await _call(_history_read(_service(request).list_conversations(user, limit=limit, offset=offset, **filters)))
     return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
 
 @router.get("/conversations/{conversation_id}")
 async def get_conversation(conversation_id: UUID, request: Request,
+                           agent: Annotated[str | None, Query(min_length=1, max_length=64)] = None,
                            user: UserContext | None = Depends(get_current_user)):
     user = _human(request, user)
-    result = await _call(_history_read(_service(request).get_conversation(user, str(conversation_id))))
+    filters = {"agent": agent} if agent is not None else {}
+    result = await _call(_history_read(_service(request).get_conversation(user, str(conversation_id), **filters)))
     return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
 
@@ -274,11 +278,13 @@ async def _history_read(operation):
 
 @router.post("/conversations/{conversation_id}/resume", status_code=201)
 async def resume(conversation_id: UUID, req: ResumeRequest, request: Request,
+                 agent: Annotated[str | None, Query(min_length=1, max_length=64)] = None,
                  user: UserContext | None = Depends(get_current_user)):
     user = _human(request, user)
     _mutation(request)
     service = _service(request)
-    return await _open_session(request, user, service, service.resume(user, str(conversation_id), req.revision))
+    filters = {"agent": agent} if agent is not None else {}
+    return await _open_session(request, user, service, service.resume(user, str(conversation_id), req.revision, **filters))
 
 
 @router.post("/sessions/{session_id}/turn")

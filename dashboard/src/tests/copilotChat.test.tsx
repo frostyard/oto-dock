@@ -1,11 +1,15 @@
 import { beforeEach, expect, it, vi } from 'vitest'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { MemoryRouter, Route, Routes } from 'react-router-dom'
 const { apiFetch, auth } = vi.hoisted(() => ({ apiFetch: vi.fn(), auth: { user: { sub: 'alice', role: 'member' } } }))
 vi.mock('@/api/auth', () => ({ apiFetch }))
 vi.mock('@/contexts/AuthContext', () => ({ useAuth: () => auth }))
 import * as chat from '@/api/copilotChat'
 import { CopilotChatPreview } from '@/pages/UserSettings.copilotChat'
+class ObserverStub { observe() {} unobserve() {} disconnect() {} }
+vi.stubGlobal('ResizeObserver', ObserverStub)
+vi.stubGlobal('IntersectionObserver', ObserverStub)
 const json = (data: unknown, status = 200) => ({ ok: status < 400, status, json: vi.fn(async () => data) })
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(r => { resolve = r }); return { promise, resolve } }
 function stream(chunks: string[]) {
@@ -29,7 +33,7 @@ beforeEach(() => {
 })
 function mount() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(<QueryClientProvider client={client}><CopilotChatPreview /></QueryClientProvider>)
+  return render(<QueryClientProvider client={client}><MemoryRouter><CopilotChatPreview /></MemoryRouter></QueryClientProvider>)
 }
 async function send(text = 'Please help') {
   const button = await screen.findByRole('button', { name: 'Send' })
@@ -106,7 +110,7 @@ it('resets history and closes the prior session when user changes', async () => 
   const page = mount(); await send(); await screen.findByText('Hello from Copilot')
   auth.user = { sub: 'bob', role: 'member' }
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  page.rerender(<QueryClientProvider client={client}><CopilotChatPreview /></QueryClientProvider>)
+  page.rerender(<QueryClientProvider client={client}><MemoryRouter><CopilotChatPreview /></MemoryRouter></QueryClientProvider>)
   expect(screen.queryByText('Hello from Copilot')).not.toBeInTheDocument()
   await waitFor(() => expect(apiFetch.mock.calls.some(([url, opts]) => url.endsWith('/session-1') && opts.method === 'DELETE')).toBe(true))
 })
@@ -198,7 +202,7 @@ it('renders tool output without exposing transport IDs', async () => {
     emit({ type: 'tool_result', name: 'view', tool_id: 'internal-transport-id', is_error: false, result_content: 'File contents from the workspace' })
   })
   mount(); await send()
-  expect(await screen.findByText(/view finished/)).toHaveTextContent('File contents from the workspace')
+  expect(await screen.findByText('File contents from the workspace')).toBeInTheDocument()
   expect(screen.queryByText(/internal-transport-id/)).not.toBeInTheDocument()
 })
 it('closing an unanswered question never labels it answered', async () => {
@@ -293,11 +297,11 @@ it('user change isolates list caches, discards history and disposes a late resum
   const row = savedFixture(), resumed = deferred<chat.CopilotChatOwner>()
   vi.spyOn(chat, 'resumeCopilotConversation').mockReturnValue(resumed.promise)
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  const page = render(<QueryClientProvider client={client}><CopilotChatPreview /></QueryClientProvider>)
+  const page = render(<QueryClientProvider client={client}><MemoryRouter><CopilotChatPreview /></MemoryRouter></QueryClientProvider>)
   await selectSaved(); fireEvent.click(screen.getByRole('button', { name: 'Resume conversation' }))
   auth.user = { sub: 'bob', role: 'member' }
   vi.mocked(chat.listCopilotConversations).mockResolvedValue({ conversations: [], has_more: false })
-  page.rerender(<QueryClientProvider client={client}><CopilotChatPreview /></QueryClientProvider>)
+  page.rerender(<QueryClientProvider client={client}><MemoryRouter><CopilotChatPreview /></MemoryRouter></QueryClientProvider>)
   expect(screen.queryByText('Saved response')).not.toBeInTheDocument()
   expect(await screen.findByText('No saved conversations on this page.')).toBeInTheDocument()
   await act(async () => resumed.resolve({ session_id: 'alice-late-owner', conversation_id: row.id }))
@@ -329,7 +333,7 @@ it('pages the owned list in bounded increments without starting sessions', async
   expect(screen.getByRole('button', { name: 'Previous conversations' })).toBeDisabled()
   fireEvent.click(screen.getByRole('button', { name: 'Next conversations' }))
   await screen.findByRole('button', { name: /Older work/ })
-  expect(listing).toHaveBeenCalledWith(20)
+  expect(listing).toHaveBeenCalledWith(20, undefined)
   expect(screen.getByRole('button', { name: 'Next conversations' })).toBeDisabled()
   fireEvent.click(screen.getByRole('button', { name: 'Previous conversations' }))
   await screen.findByRole('button', { name: /Saved work/ })
@@ -409,11 +413,36 @@ it('reads and displays a full stored payload budget with added sequence and arra
   // Exercise the real API validation and archived display budget together.
   mount(); await selectSaved()
   expect(screen.queryByRole('alert')).not.toBeInTheDocument()
-  expect(screen.getByLabelText('Copilot conversation').querySelector('pre')?.textContent?.length).toBe(4 * (frameBytes - overhead))
+  expect([...screen.getByLabelText('Copilot conversation').querySelectorAll('p')].find(node => node.textContent?.startsWith('xxxx'))?.textContent?.length).toBe(4 * (frameBytes - overhead))
   expect(screen.getByRole('button', { name: 'Resume conversation' })).toBeEnabled()
 })
 it('rejects archived responses above bounded framing headroom', async () => {
   const row = savedConversation()
   apiFetch.mockResolvedValue(json({ conversation: row, events: [{ seq: 1, type: 'text', content: 'x'.repeat(1048576 + 65536) }] }))
   await expect(chat.getCopilotConversation(row.id)).rejects.toThrow(chat.CopilotChatError)
+})
+it('offers the routed agent chat from reachable settings, preserving a selected saved conversation', async () => {
+  savedFixture()
+  mount()
+  await waitFor(() => expect(screen.getByRole('link', { name: 'Open Copilot chat for this agent' })).toHaveAttribute('href', '/chat/demo/copilot'))
+  await selectSaved()
+  expect(screen.getByRole('link', { name: 'Open Copilot chat for this agent' })).toHaveAttribute('href', '/chat/demo/copilot/conversation-a')
+})
+
+it('settings navigation waits for idle owner close before opening its saved route', async () => {
+  const disposed = deferred<void>()
+  const closeOwner = vi.spyOn(chat, 'closeCopilotChat').mockReturnValue(disposed.promise)
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  render(<QueryClientProvider client={client}><MemoryRouter initialEntries={['/user-settings']}>
+    <Routes><Route path="/user-settings" element={<CopilotChatPreview />} /><Route path="/chat/:agent/copilot/:id" element={<p>Routed conversation destination</p>} /></Routes>
+  </MemoryRouter></QueryClientProvider>)
+  await send(); await screen.findByText('Hello from Copilot')
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Close chat' })).toBeEnabled())
+  fireEvent.click(screen.getByRole('button', { name: 'Open Copilot chat for this agent' }))
+  expect(closeOwner).toHaveBeenCalledExactlyOnceWith('session-1')
+  expect(screen.queryByText('Routed conversation destination')).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Open Copilot chat for this agent' })).toBeDisabled()
+  await act(async () => disposed.resolve())
+  expect(await screen.findByText('Routed conversation destination')).toBeInTheDocument()
+  expect(closeOwner).toHaveBeenCalledOnce()
 })
