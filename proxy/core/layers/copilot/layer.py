@@ -46,6 +46,7 @@ class _Entry:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     owner: CopilotLocalSession | CopilotCatalogOwner | None = None
     catalog: bool = False
+    usage_observer: object = None
     context: object = None
     registration_started: bool = False
     startup: asyncio.Task | None = None
@@ -131,8 +132,8 @@ class CopilotExecutionLayer(ExecutionLayer):
             config.model, config.enabled_tools, config.system_prompt, config.effort or None,
         )
 
-    async def start_session(self, session_id, config):
-        await self._open_entry(session_id, config)
+    async def start_session(self, session_id, config, *, usage_observer=None):
+        await self._open_entry(session_id, config, usage_observer=usage_observer)
 
     async def list_models(self, session_id, config):
         """One selected-account inventory, returned only after owned disposal."""
@@ -143,7 +144,7 @@ class CopilotExecutionLayer(ExecutionLayer):
             await self._close_entry(entry)
         return rows
 
-    async def _open_entry(self, session_id, config, *, catalog=False):
+    async def _open_entry(self, session_id, config, *, catalog=False, usage_observer=None):
         if self._closing is not None:
             raise CopilotLayerError("Copilot execution layer is closed")
         failed = False
@@ -161,7 +162,7 @@ class CopilotExecutionLayer(ExecutionLayer):
         if (session_id in _claims or state.get_session_security(session_id) is not None
                 or has_legacy_session(session_id)):
             raise CopilotLayerError("Copilot platform session is already owned")
-        entry = _Entry(session_id, config, catalog=catalog)
+        entry = _Entry(session_id, config, catalog=catalog, usage_observer=usage_observer)
         entry.claim = register_owned_session(
             session_id=session_id, engine="copilot-cli", agent=config.agent_name,
             user_sub=config.user_sub, username=config.security_context.mount_username,
@@ -230,6 +231,8 @@ class CopilotExecutionLayer(ExecutionLayer):
             entry.owner = await CopilotLocalSession.open(
                 local, builder=builder, runtime_path=self._runtime_path,
                 records=self._records, resume=config.resume,
+                on_owner=lambda owner: setattr(entry, "owner", owner),
+                **({"usage_observer": entry.usage_observer} if entry.usage_observer is not None else {}),
             )
         if asyncio.current_task().cancelling():
             raise asyncio.CancelledError
@@ -386,6 +389,19 @@ class CopilotExecutionLayer(ExecutionLayer):
         # Unusable does not imply dead. Startup, revocation and cleanup may
         # still own processes. Failed cleanup retains its claim as a tombstone.
         return session_id not in _claims
+
+    async def is_usage_source_closed(self, session_id):
+        """Prove callback transport shutdown without releasing failed claims."""
+        entry = self._sessions.get(session_id)
+        claimed = _claims.get(session_id)
+        if entry is None:
+            return claimed is None
+        if claimed is not entry or entry.owner is None or entry.catalog:
+            return False
+        try:
+            return entry.owner.usage_source_closed is True
+        except Exception:
+            return False
 
     async def prepare_resume(self, session_id):
         if await self.is_session_alive(session_id):

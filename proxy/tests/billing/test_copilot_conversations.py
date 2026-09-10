@@ -497,3 +497,84 @@ def test_validation_reasoning_effort_rejects_before_database(monkeypatch, effort
         store.create(identifier(), OWNER, agent='agent', account_id=identifier(), model='model',
                      permission_mode='default', platform_session_id=identifier(), generation=identifier(),
                      reasoning_effort=effort)
+
+
+def usage_report():
+    return dict(type='usage', event_id=identifier(), reported_model='actual-reported-model',
+                input_tokens=0, output_tokens=12, cache_read_tokens=None, cache_write_tokens=None,
+                reasoning_tokens=3, reported_nano_aiu=1.25)
+
+
+def test_usage_after_completed_turn_preserves_completion_and_owned_attribution(conversation):
+    begin(conversation)
+    append(conversation)
+    finished = finish(conversation)
+    report = usage_report()
+    assert store.append_usage(conversation['id'], OWNER, conversation['generation'], report) is True
+    row = store.get(conversation['id'], OWNER)
+    assert not row['turn_active'] and row['last_turn_complete']
+    assert row['revision'] == finished['revision'] + 1
+    for key in ('user_sub', 'agent', 'account_id', 'model', 'platform_session_id', 'generation'):
+        assert row[key] == conversation[key]
+    assert store.events(row['id'], OWNER)[-1] == {**report, 'seq': row['event_count']}
+    closed = store.finish_close(row['id'], OWNER, row['generation'], True)
+    assert closed['state'] == 'closed'
+    with pytest.raises(store.CopilotConversationConflict):
+        store.append_usage(row['id'], OWNER, row['generation'], usage_report())
+
+
+def test_concurrent_duplicate_usage_has_one_atomic_insert(conversation):
+    report = usage_report()
+    barrier = threading.Barrier(2)
+
+    def writer():
+        barrier.wait(timeout=3)
+        return store.append_usage(conversation['id'], OWNER, conversation['generation'], report)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: writer(), range(2)))
+    assert sorted(results) == [False, True]
+    row = store.get(conversation['id'], OWNER)
+    assert row['event_count'] == 1 and row['revision'] == conversation['revision'] + 1
+    assert store.events(row['id'], OWNER) == [{**report, 'seq': 1}]
+    with pytest.raises(store.CopilotConversationConflict):
+        store.append_usage(row['id'], OWNER, row['generation'], {**report, 'input_tokens': 1})
+    assert store.get(row['id'], OWNER) == row
+
+
+def test_usage_dedup_survives_resume_and_rejects_other_owner_or_generation(conversation):
+    report = usage_report()
+    assert store.append_usage(conversation['id'], OWNER, conversation['generation'], report)
+    closed = ready(conversation)
+    resumed = store.claim_resume(closed['id'], OWNER, closed['revision'], identifier())
+    assert store.append_usage(resumed['id'], OWNER, resumed['generation'], report) is False
+    assert store.get(resumed['id'], OWNER) == resumed
+    with pytest.raises(store.CopilotConversationConflict):
+        store.append_usage(resumed['id'], OWNER, conversation['generation'], usage_report())
+    with pytest.raises(store.CopilotConversationNotFound):
+        store.append_usage(resumed['id'], OTHER, resumed['generation'], usage_report())
+    assert len([event for event in store.events(resumed['id'], OWNER) if event['type'] == 'usage']) == 1
+
+
+def test_usage_shares_history_bound_and_duplicate_does_not_consume_capacity(conversation, monkeypatch):
+    monkeypatch.setattr(store, 'MAX_EVENTS', 1)
+    report = usage_report()
+    assert store.append_usage(conversation['id'], OWNER, conversation['generation'], report)
+    saved = store.get(conversation['id'], OWNER)
+    assert store.append_usage(conversation['id'], OWNER, conversation['generation'], report) is False
+    with pytest.raises(store.CopilotConversationLimit):
+        store.append_usage(conversation['id'], OWNER, conversation['generation'], usage_report())
+    assert store.get(conversation['id'], OWNER) == saved
+
+
+@pytest.mark.parametrize('fields', [
+    {'input_tokens': True}, {'input_tokens': -1}, {'output_tokens': 1.5},
+    {'reported_nano_aiu': float('nan')}, {'reported_nano_aiu': float('inf')},
+    {'event_id': 'invalid'}, {'seq': 1}, {'account_id': 'untrusted'}, {'cost_usd': 0},
+])
+def test_validation_usage_rejects_before_database(monkeypatch, fields):
+    def forbidden():
+        pytest.fail('Invalid usage must not reach the database')
+    monkeypatch.setattr(store, 'get_conn', forbidden)
+    with pytest.raises(store.CopilotConversationError):
+        store.append_usage(identifier(), OWNER, identifier(), {**usage_report(), **fields})

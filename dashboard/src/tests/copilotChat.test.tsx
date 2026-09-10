@@ -6,6 +6,7 @@ const { apiFetch, auth } = vi.hoisted(() => ({ apiFetch: vi.fn(), auth: { user: 
 vi.mock('@/api/auth', () => ({ apiFetch }))
 vi.mock('@/contexts/AuthContext', () => ({ useAuth: () => auth }))
 import * as chat from '@/api/copilotChat'
+import { CopilotUsageError } from '@/lib/copilotUsage'
 import { CopilotChatPreview } from '@/pages/UserSettings.copilotChat'
 class ObserverStub { observe() {} unobserve() {} disconnect() {} }
 vi.stubGlobal('ResizeObserver', ObserverStub)
@@ -474,4 +475,115 @@ it('normalizes omitted saved effort to model default and rejects unknown persist
   expect((await chat.getCopilotConversation(legacy.id)).conversation.reasoning_effort).toBeNull()
   apiFetch.mockResolvedValueOnce(json({ conversation: { ...legacy, reasoning_effort: 'ultra' }, events: [] }))
   await expect(chat.getCopilotConversation(legacy.id)).rejects.toThrow(chat.CopilotChatError)
+})
+const usageFrame = (id: string, input: number | null = 10) => ({
+  type: 'usage', event_id: id, reported_model: 'native-reported-model', input_tokens: input, output_tokens: 0,
+  cache_read_tokens: null, cache_write_tokens: null, reasoning_tokens: null, reported_nano_aiu: null,
+})
+const usageOne = '10000000-0000-0000-0000-000000000001', usageTwo = '10000000-0000-0000-0000-000000000002'
+it('merges live, saved and late idle usage by identity without replacing the transcript', async () => {
+  const row = savedFixture(savedConversation(), [{ seq: 1, ...usageFrame(usageOne) }, { seq: 2, type: 'text', content: 'Saved response' }])
+  vi.spyOn(chat, 'resumeCopilotConversation').mockResolvedValue({ session_id: 'fresh-owner', conversation_id: row.id })
+  vi.spyOn(chat, 'streamCopilotTurn').mockImplementation(async (_sid, _text, _signal, emit) => {
+    emit(usageFrame(usageOne)); emit({ type: 'text', content: 'New response retained' })
+  })
+  mount(); await selectSaved()
+  const inputValue = () => screen.getByText('Input tokens').parentElement!.textContent
+  expect(inputValue()).toBe('Input tokens10')
+  fireEvent.click(screen.getByRole('button', { name: 'Resume conversation' }))
+  await waitFor(() => expect(screen.getByLabelText('Message')).toBeEnabled())
+  await send('Continue')
+  await screen.findByText('New response retained')
+  expect(inputValue()).toBe('Input tokens10')
+  vi.mocked(chat.getCopilotConversation).mockResolvedValue({ conversation: row, events: [
+    { seq: 1, ...usageFrame(usageOne) }, { seq: 2, ...usageFrame(usageTwo, 7) }, { seq: 3, type: 'text', content: 'Server history must not overwrite live text' },
+  ] })
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Close chat' })).toBeEnabled())
+  fireEvent.click(screen.getByRole('button', { name: 'Close chat' }))
+  await waitFor(() => expect(inputValue()).toBe('Input tokens17'))
+  expect(screen.getByText('New response retained')).toBeInTheDocument()
+  expect(screen.queryByText('Server history must not overwrite live text')).not.toBeInTheDocument()
+  await waitFor(() => expect(screen.getByRole('button', { name: 'New chat' })).toBeEnabled())
+  fireEvent.click(screen.getByRole('button', { name: 'New chat' }))
+  await waitFor(() => expect(screen.queryByRole('region', { name: 'Reported usage' })).not.toBeInTheDocument())
+})
+it('conflicting usage replay invalidates reporting and closes an active turn', async () => {
+  vi.spyOn(chat, 'streamCopilotTurn').mockImplementation(async (_sid, _text, _signal, emit) => {
+    emit(usageFrame(usageOne)); emit(usageFrame(usageOne, 11))
+  })
+  mount(); await send()
+  expect(await screen.findByText('Reported usage is unavailable.')).toBeInTheDocument()
+  await waitFor(() => expect(apiFetch.mock.calls.some(([url, options]) => url.endsWith('/session-1') && options?.method === 'DELETE')).toBe(true))
+  expect(screen.queryByText('Input tokens')).not.toBeInTheDocument()
+})
+it('a stale history refresh cannot add usage to a newly selected conversation', async () => {
+  const row = savedFixture(), pending = deferred<{ conversation: chat.CopilotConversation; events: chat.ChatEvent[] }>()
+  vi.spyOn(chat, 'resumeCopilotConversation').mockResolvedValue({ session_id: 'fresh-owner', conversation_id: row.id })
+  vi.mocked(chat.getCopilotConversation).mockResolvedValueOnce({ conversation: row, events: [] }).mockReturnValue(pending.promise)
+  mount(); await selectSaved(); fireEvent.click(screen.getByRole('button', { name: 'Resume conversation' }))
+  await waitFor(() => expect(screen.getByLabelText('Message')).toBeEnabled())
+  fireEvent.click(screen.getByRole('button', { name: 'New chat' }))
+  await waitFor(() => expect(screen.queryByRole('button', { name: 'Resume conversation' })).not.toBeInTheDocument())
+  await act(async () => pending.resolve({ conversation: row, events: [{ seq: 1, ...usageFrame(usageOne) }] }))
+  expect(screen.queryByRole('region', { name: 'Reported usage' })).not.toBeInTheDocument()
+})
+it('validates persisted usage schema without conflating storage sequence with provider identity', async () => {
+  const row = savedConversation(), events = [{ seq: 1, ...usageFrame(usageOne) }]
+  apiFetch.mockResolvedValueOnce(json({ conversation: row, events }))
+  expect((await chat.getCopilotConversation(row.id)).events).toEqual(events)
+  apiFetch.mockResolvedValueOnce(json({ conversation: row, events: [{ ...events[0], input_tokens: '10' }] }))
+  await expect(chat.getCopilotConversation(row.id)).rejects.toThrow(CopilotUsageError)
+})
+it('invalidates valid live usage when a current history refresh contains a malformed report', async () => {
+  const pending = deferred<ReturnType<typeof json>>(), base = apiFetch.getMockImplementation()!
+  apiFetch.mockImplementation((url, options) => url.endsWith('/conversations/conversation-1') ? pending.promise : base(url, options))
+  vi.spyOn(chat, 'streamCopilotTurn').mockImplementation(async (_sid, _text, _signal, emit) => { emit(usageFrame(usageOne)) })
+  mount(); await send()
+  await waitFor(() => expect(screen.getByText('Input tokens').parentElement).toHaveTextContent('Input tokens10'))
+  await act(async () => pending.resolve(json({ conversation: savedConversation({ id: 'conversation-1' }), events: [{ seq: 1, ...usageFrame(usageTwo), output_tokens: 'bad' }] })))
+  expect(await screen.findByText('Reported usage is unavailable.')).toBeInTheDocument()
+  expect(screen.queryByText('Input tokens')).not.toBeInTheDocument()
+})
+it('does not let a stale malformed refresh poison a new conversation', async () => {
+  const pending = deferred<ReturnType<typeof json>>(), base = apiFetch.getMockImplementation()!
+  apiFetch.mockImplementation((url, options) => url.endsWith('/conversations/conversation-1') ? pending.promise : base(url, options))
+  vi.spyOn(chat, 'streamCopilotTurn').mockImplementation(async (_sid, _text, _signal, emit) => { emit(usageFrame(usageOne)) })
+  mount(); await send()
+  await waitFor(() => expect(screen.getByText('Input tokens').parentElement).toHaveTextContent('Input tokens10'))
+  await waitFor(() => expect(screen.getByRole('button', { name: 'New chat' })).toBeEnabled())
+  fireEvent.click(screen.getByRole('button', { name: 'New chat' }))
+  await waitFor(() => expect(screen.queryByRole('region', { name: 'Reported usage' })).not.toBeInTheDocument())
+  await act(async () => pending.resolve(json({ conversation: savedConversation({ id: 'conversation-1' }), events: [{ seq: 1, ...usageFrame(usageTwo), output_tokens: 'bad' }] })))
+  expect(screen.queryByRole('region', { name: 'Reported usage' })).not.toBeInTheDocument()
+})
+it('keeps valid observed usage through a transient history refresh failure', async () => {
+  const base = apiFetch.getMockImplementation()!
+  apiFetch.mockImplementation((url, options) => url.endsWith('/conversations/conversation-1') ? Promise.resolve(json({}, 503)) : base(url, options))
+  vi.spyOn(chat, 'streamCopilotTurn').mockImplementation(async (_sid, _text, _signal, emit) => { emit(usageFrame(usageOne)) })
+  mount(); await send()
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Close chat' })).toBeEnabled())
+  expect(screen.getByText('Input tokens').parentElement).toHaveTextContent('Input tokens10')
+  expect(screen.queryByText('Reported usage is unavailable.')).not.toBeInTheDocument()
+})
+it('marks malformed archived usage unavailable without starting a runtime', async () => {
+  const row = savedConversation(), base = apiFetch.getMockImplementation()!
+  vi.spyOn(chat, 'listCopilotConversations').mockResolvedValue({ conversations: [row], has_more: false })
+  apiFetch.mockImplementation((url, options) => url.endsWith('/conversations/' + row.id)
+    ? Promise.resolve(json({ conversation: row, events: [{ seq: 1, ...usageFrame(usageOne), input_tokens: -1 }] })) : base(url, options))
+  mount(); await selectSaved()
+  expect(screen.getByText('Reported usage is unavailable.')).toBeInTheDocument()
+  expect(apiFetch.mock.calls.some(([url]) => url.endsWith('/sessions'))).toBe(false)
+})
+it('loads usage reported after transport completion and clears it on a user change', async () => {
+  const row = savedConversation({ id: 'conversation-1' })
+  vi.spyOn(chat, 'getCopilotConversation').mockResolvedValue({ conversation: row, events: [{ seq: 1, ...usageFrame(usageOne, 23) }] })
+  // The normal SSE fixture has no usage frame: only the subsequent history
+  // refresh can observe this provider report.
+  const page = mount(); await send(); await screen.findByText('Hello from Copilot')
+  await waitFor(() => expect(screen.getByText('Input tokens').parentElement).toHaveTextContent('Input tokens23'))
+  auth.user = { sub: 'bob', role: 'member' }
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  page.rerender(<QueryClientProvider client={client}><MemoryRouter><CopilotChatPreview /></MemoryRouter></QueryClientProvider>)
+  expect(screen.queryByRole('region', { name: 'Reported usage' })).not.toBeInTheDocument()
+  await waitFor(() => expect(apiFetch.mock.calls.some(([url, options]) => url.endsWith('/session-1') && options.method === 'DELETE')).toBe(true))
 })

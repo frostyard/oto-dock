@@ -14,6 +14,7 @@ import uuid
 
 import config
 from core.layers.copilot.reasoning import valid_reasoning_effort
+from core.layers.copilot.usage import validate_usage_frame
 from storage.pg import get_conn
 
 
@@ -258,6 +259,33 @@ def append_event(cid, owner, generation, event):
         row = _row(conn, cid, owner, generation)
         _open(row, active=True)
         return _update(conn, row, **_append(conn, row, event))
+
+
+@_safe
+def append_usage(cid, owner, generation, event):
+    """Persist an observed report while active or idle, under its original owner.
+
+    Native usage has no reliable user-turn association. The conversation and
+    writer generation supply attribution; event UUIDs deduplicate reports across
+    runtime replacement. This operation never changes turn completion state.
+    """
+    _identity(cid, owner, generation)
+    validate_usage_frame(event)
+    with _connection() as conn:
+        row = _row(conn, cid, owner, generation)
+        if row["state"] != "open":
+            raise CopilotConversationConflict()
+        previous = conn.execute(
+            """SELECT payload FROM copilot_conversation_events
+               WHERE conversation_id=%s AND payload::jsonb->>'type'='usage'
+               AND payload::jsonb->>'event_id'=%s""", (cid, event["event_id"]),
+        ).fetchone()
+        if previous is not None:
+            if json.loads(previous["payload"]) != event:
+                raise CopilotConversationConflict()
+            return False
+        _update(conn, row, **_append(conn, row, event))
+        return True
 
 
 @_safe

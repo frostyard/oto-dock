@@ -9,6 +9,7 @@ import uuid
 
 import config
 from core.layers.copilot.reasoning import valid_reasoning_effort
+from core.layers.copilot.usage import validate_usage_frame
 from auth.providers import UserContext
 from core.concurrency import acquire_chat_slot, release_chat_slot
 from core.config.copilot_config_builder import authorize_copilot_history, build_copilot_agent_config
@@ -89,6 +90,10 @@ class _Entry:
     last_activity: float = 0
     pending: dict = field(default_factory=dict)
     questions: dict = field(default_factory=dict)
+    usage_queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=128))
+    usage_task: asyncio.Task | None = None
+    usage_failed: bool = False
+    usage_sealed: bool = False
 
 
 _END = object()
@@ -178,6 +183,7 @@ class CopilotChatTurn:
                 raise ValueError()
             self._prompts.cancel()
             await asyncio.gather(self._prompts, return_exceptions=True)
+            await self._service._flush_usage(self._entry)
             await self._service._mutation(self._entry, "finish_turn",
                                           success=lambda: setattr(self, "_durable_finished", True))
             await self._queue.put({"type": "turn_complete"})
@@ -392,6 +398,63 @@ class CopilotChatService:
         return await self._db(operation, entry.cid, entry.user.sub, entry.handle, *args,
                               entry=entry, success=success)
 
+    def _receive_usage(self, entry, frame):
+        """Synchronous native observer; retain the captured owner through close."""
+        try:
+            if (self._entries.get(entry.sid) is not entry or entry.usage_sealed
+                    or entry.usage_failed or entry.usage_task is None or entry.usage_task.done()):
+                raise ValueError()
+            validate_usage_frame(frame)
+            entry.usage_queue.put_nowait(deepcopy(frame))
+        except Exception:
+            entry.usage_failed = True
+            self._begin_close(entry)
+            raise ValueError("Copilot usage observation is unavailable") from None
+
+    async def _record_usage(self, entry):
+        try:
+            while True:
+                frame = await entry.usage_queue.get()
+                try:
+                    if frame is _END:
+                        return
+                    recorded = await self._mutation(entry, "append_usage", frame)
+                    turn = entry.turn
+                    # Delivery is optional while idle/closing. The durable
+                    # report is conversation-level and remains readable later.
+                    if (recorded and turn is not None and not turn._durable_finished
+                            and not turn._failed and entry.closing is None):
+                        turn._bytes += len(json.dumps(frame, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+                        if turn._bytes > 1024 * 1024:
+                            raise ValueError()
+                        turn._queue.put_nowait(deepcopy(frame))
+                finally:
+                    entry.usage_queue.task_done()
+        except (Exception, asyncio.CancelledError):
+            entry.usage_failed = True
+            self._begin_close(entry)
+            # Wake a turn waiting for drainage; it observes usage_failed.
+            while not entry.usage_queue.empty():
+                entry.usage_queue.get_nowait()
+                entry.usage_queue.task_done()
+
+    async def _flush_usage(self, entry):
+        if entry.usage_task is not None:
+            async with asyncio.timeout(self.database_timeout):
+                await entry.usage_queue.join()
+        if entry.usage_failed:
+            raise CopilotChatError(503, "Copilot usage could not be recorded")
+
+    async def _finish_usage(self, entry):
+        # Called only after native shutdown has joined every callback source.
+        entry.usage_sealed = True
+        if entry.usage_task is not None and not entry.usage_task.done():
+            async with asyncio.timeout(self.database_timeout):
+                await entry.usage_queue.put(_END)
+            _, pending = await asyncio.wait({entry.usage_task}, timeout=self.database_timeout)
+            if pending:
+                raise CopilotChatError(503, "Copilot usage cleanup is incomplete")
+
     def _capacity(self, user):
         if self._closing is not None:
             raise CopilotChatError(503, "Copilot preview is shutting down")
@@ -420,8 +483,9 @@ class CopilotChatService:
             raise CopilotChatError(429, "Local session capacity is unavailable")
         config = deepcopy(entry.config)
         config.resume = entry.resume
+        entry.usage_task = asyncio.create_task(self._record_usage(entry))
         entry.layer_start_attempted = True
-        await self.layer.start_session(entry.sid, config)
+        await self.layer.start_session(entry.sid, config, usage_observer=lambda frame: self._receive_usage(entry, frame))
         self._check(entry)
         entry.last_activity = asyncio.get_running_loop().time()
 
@@ -707,9 +771,13 @@ class CopilotChatService:
                     entry.turn._failed = True
                 cleanup.append(entry.turn._stop())
             results = await asyncio.gather(*cleanup, return_exceptions=True)
-            if any(isinstance(result, BaseException) for result in results):
-                raise ValueError()
-            if entry.layer_start_attempted and not await self.layer.is_session_process_dead(entry.sid):
+            native_dead = (not entry.layer_start_attempted
+                           or await self.layer.is_session_process_dead(entry.sid))
+            # Failed native cleanup may still have joined the callback source.
+            # Drain its writer in that case, but retain the failed owner below.
+            if native_dead or await self.layer.is_usage_source_closed(entry.sid):
+                await self._finish_usage(entry)
+            if not native_dead or any(isinstance(result, BaseException) for result in results):
                 raise ValueError()
             if entry.mutations:
                 _, pending = await asyncio.wait(tuple(entry.mutations), timeout=min(5, self.database_timeout))
@@ -719,7 +787,7 @@ class CopilotChatService:
                 row = await self._db("get", entry.cid, entry.user.sub)
                 # A losing CAS must never quarantine the winning generation.
                 if row is not None and row["generation"] == entry.handle:
-                    delivered = (not entry.uncertain_delivery
+                    delivered = (not entry.uncertain_delivery and not entry.usage_failed
                                  and (entry.turn is None or (entry.turn._complete and not entry.turn._failed)))
                     ready = (entry.layer_start_attempted and delivered
                              and await self.layer.history_ready(entry.sid, entry.user.sub))

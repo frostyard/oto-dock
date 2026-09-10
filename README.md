@@ -244,7 +244,7 @@ See all features at [otodock.io/features](https://otodock.io/features).
 **Frostyard fork:** Copilot support is under development, with an opt-in
 [local chat preview](docs/plans/copilot-chat-preview-contract.md) for personal
 GitHub accounts, with account model discovery, per-conversation reasoning effort,
-agent chat navigation, saved conversations, and explicit clean resume. Full engine
+observed usage, agent chat navigation, saved conversations, and explicit clean resume. Full engine
 parity remains incomplete. Use the
 [Frostyard source-build instructions](docs/development/frostyard-releases.md).
 The installer in this fork is disabled pending release qualification. The quick

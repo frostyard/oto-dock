@@ -14,6 +14,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum
 import hashlib
+import inspect
 import json
 import math
 from pathlib import Path, PurePosixPath
@@ -29,6 +30,7 @@ from core.layers.copilot.permissions import bind_platform_authority, _text
 from core.layers.copilot.runtime import SandboxedCopilotRuntime
 from core.layers.copilot.session_records import CopilotSessionProfile, CopilotSessionRecords
 from core.layers.copilot.supervisor import CopilotSessionSupervisor
+from core.layers.copilot.usage import CopilotUsageObserver
 
 
 class CopilotLocalSessionError(RuntimeError):
@@ -82,10 +84,14 @@ class CopilotLocalSession:
 
     @classmethod
     async def open(cls, config: CopilotLocalSessionConfig, *, builder, runtime_path: Path,
-                   records: CopilotSessionRecords, resume: bool = False, turn_timeout: float = 300):
+                   records: CopilotSessionRecords, resume: bool = False, turn_timeout: float = 300,
+                   usage_observer=None, on_owner=None):
         instance = object.__new__(cls)
         instance._config = config
         instance._guard = None
+        instance._usage = None
+        instance._usage_failed = False
+        instance._usage_source_closed = False
         instance._record = None
         instance._runtime = None
         instance._runtime_started = False
@@ -104,6 +110,19 @@ class CopilotLocalSession:
         instance._startup_deadline = asyncio.get_running_loop().time() + 60
         failed = False
         try:
+            # Publish the initialized owner before startup can acquire resources.
+            # A failed rollback must remain reachable by the layer even though
+            # open() cannot return a usable session.
+            if on_owner is not None:
+                if not callable(on_owner) or inspect.iscoroutinefunction(on_owner):
+                    raise ValueError("Copilot ownership observer must be synchronous")
+                result = on_owner(instance)
+                if result is not None:
+                    if inspect.iscoroutine(result):
+                        result.close()
+                    raise ValueError("Copilot ownership observer must return synchronously")
+            if usage_observer is not None:
+                instance._usage = CopilotUsageObserver(usage_observer)
             async with asyncio.timeout(60):
                 await instance._open(builder, runtime_path, records, resume, turn_timeout)
             return instance
@@ -134,7 +153,7 @@ class CopilotLocalSession:
         if not self._opened and asyncio.get_running_loop().time() >= self._startup_deadline:
             raise CopilotLocalSessionError("Copilot local session startup exceeded its deadline")
         if (self._invalid or self._close_task is not None or not self._context_valid()
-                or self._provider_error
+                or self._provider_error or self._usage_failed
                 or (self._supervisor is not None and self._supervisor.failure_detected)
                 or (self._runtime_started and not self._runtime.alive)
                 or (self._guard is not None and not self._guard.valid)):
@@ -179,16 +198,29 @@ class CopilotLocalSession:
     def _receive_event(self, event):
         try:
             raw = event if isinstance(event, dict) else event.to_dict()
+            if raw.get("type") == "assistant.usage":
+                # Ephemeral metrics can arrive after idle or during shutdown.
+                # They are not turn work and must never alter coordinator idle
+                # proof or leak into the next turn's ordinary event queue.
+                if self._usage is not None:
+                    try:
+                        self._usage.observe(raw)
+                    except (asyncio.CancelledError, Exception):
+                        self._usage_failed = True
+                        raise
+                return
             if raw.get("type") == "session.error":
                 self._uncertain = True
                 self._provider_error = True
                 raw = {**raw, "data": {"message": "Copilot provider request failed"}}
             self._supervisor.receive_event(raw)
-        except Exception:
+        except (asyncio.CancelledError, Exception):
             self._uncertain = True
             # Invalid conversion is a transport failure, not a callback exception
             # the SDK may swallow while continuing to admit work.
             self._supervisor.receive_event({})
+            if self._opened:
+                self._begin_close()
     async def _open(self, builder, runtime_path, records, resume, turn_timeout):
         from auth.path_policy import SecurityContext
         from core.sandbox.sandbox import SandboxBuilder
@@ -395,6 +427,14 @@ class CopilotLocalSession:
             return False
 
     @property
+    def usage_source_closed(self) -> bool:
+        """The callback transport was joined, independently of cleanup success.
+
+        This is not permission to release session ownership or resume history.
+        """
+        return self._usage_source_closed
+
+    @property
     def closed(self) -> bool:
         """Cleanup has finished, including failure; wait_closed reports its result.
 
@@ -438,8 +478,15 @@ class CopilotLocalSession:
             if owned is not None:
                 try:
                     await owned.close()
+                    if owned is self._runtime and owned.alive is False:
+                        self._usage_source_closed = True
                 except (asyncio.CancelledError, Exception):
                     failed = True
+        failed = failed or self._usage_failed
+        if self._runtime is None:
+            self._usage_source_closed = True
+        if self._usage_source_closed:
+            self._usage = None
         if self._record is not None:
             try:
                 if (not failed and self._opened and self._completed and not self._streaming

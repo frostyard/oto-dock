@@ -1,4 +1,5 @@
 import { apiFetch } from './auth'
+import { CopilotUsageError, parseCopilotUsage } from '../lib/copilotUsage'
 
 const root = '/v1/copilot/chat'
 const failure = 'Copilot chat is unavailable. Close this chat and try again.'
@@ -116,11 +117,15 @@ export async function getCopilotConversation(id: string, agent?: string): Promis
           || !Number.isSafeInteger(event.seq) || event.seq <= previous) throw new Error()
       previous = event.seq
       const { seq: _sequence, ...payload } = event
+      if (event.type === 'usage') parseCopilotUsage(payload)
       payloadBytes += new TextEncoder().encode(JSON.stringify(payload)).length
       if (payloadBytes > 1048576) throw new Error()
     }
     return { conversation: metadata, events: data.events }
-  } catch { throw new CopilotChatError(failure) }
+  } catch (error) {
+    if (error instanceof CopilotUsageError) throw error
+    throw new CopilotChatError(failure)
+  }
 }
 export async function resumeCopilotConversation(id: string, revision: number, agent?: string) {
   if (!Number.isSafeInteger(revision) || revision < 1) throw new CopilotChatError(failure)
