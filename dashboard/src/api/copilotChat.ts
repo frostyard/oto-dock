@@ -3,8 +3,39 @@ import { apiFetch } from './auth'
 const root = '/v1/copilot/chat'
 const failure = 'Copilot chat is unavailable. Close this chat and try again.'
 export class CopilotChatError extends Error {}
+export class CopilotChatCleanupError extends CopilotChatError {}
 export type ChatEvent = Record<string, unknown> & { type: string }
 export type ChatMode = 'default' | 'acceptEdits' | 'plan' | 'dontAsk'
+export interface CopilotConversation {
+  id: string; agent: string; account_id: string; model: string; permission_mode: ChatMode
+  title: string; created_at: string | number; updated_at: string | number
+  state: 'open' | 'closed' | 'incomplete'; revision: number; can_resume: boolean; reason: string
+}
+export interface CopilotChatOwner { session_id: string; conversation_id: string }
+const identifier = (value: unknown): value is string => typeof value === 'string' && /^[a-zA-Z0-9-]{1,128}$/.test(value)
+const bounded = (value: unknown, limit = 256): value is string => typeof value === 'string' && value.length > 0 && value.length <= limit
+function conversation(value: unknown): CopilotConversation {
+  const row = value as CopilotConversation | null
+  const timestamp = (v: unknown) => typeof v === 'number' ? Number.isFinite(v) : bounded(v, 128)
+  if (!row || !identifier(row.id) || !bounded(row.agent) || !bounded(row.account_id)
+      || !bounded(row.model) || !['default', 'acceptEdits', 'plan', 'dontAsk'].includes(row.permission_mode)
+      || typeof row.title !== 'string' || row.title.length > 512 || !timestamp(row.created_at) || !timestamp(row.updated_at)
+      || !['open', 'closed', 'incomplete'].includes(row.state) || !Number.isSafeInteger(row.revision) || row.revision < 1
+      || typeof row.can_resume !== 'boolean' || typeof row.reason !== 'string' || row.reason.length > 1024) throw new CopilotChatError(failure)
+  return row
+}
+async function owner(response: Response): Promise<CopilotChatOwner> {
+  let sessionId: string | undefined
+  try {
+    const data = await response.json()
+    if (identifier(data.session_id)) sessionId = data.session_id
+    if (!identifier(data.session_id) || !identifier(data.conversation_id)) throw new Error()
+    return { session_id: data.session_id, conversation_id: data.conversation_id }
+  } catch {
+    if (sessionId) await closeCopilotChat(sessionId)
+    throw new CopilotChatError(failure)
+  }
+}
 
 async function request(path: string, options: RequestInit = {}) {
   try {
@@ -23,18 +54,48 @@ export async function copilotChatAvailable(): Promise<boolean> {
 }
 export async function createCopilotChat(body: { agent: string; account_id: string; model: string; permission_mode: ChatMode }) {
   const response = await request('/sessions', { method: 'POST', body: JSON.stringify(body) })
+  return owner(response)
+}
+export async function listCopilotConversations(offset = 0): Promise<{ conversations: CopilotConversation[]; has_more: boolean }> {
+  if (!Number.isSafeInteger(offset) || offset < 0) throw new CopilotChatError(failure)
+  const response = await request(`/conversations?limit=20&offset=${offset}`)
   try {
     const data = await response.json()
-    if (typeof data.session_id !== 'string' || !/^[a-zA-Z0-9-]{1,128}$/.test(data.session_id)) throw new Error()
-    return data.session_id as string
+    if (!Array.isArray(data.conversations) || data.conversations.length > 20 || typeof data.has_more !== 'boolean') throw new Error()
+    return { conversations: data.conversations.map(conversation), has_more: data.has_more }
   } catch { throw new CopilotChatError(failure) }
+}
+export async function getCopilotConversation(id: string): Promise<{ conversation: CopilotConversation; events: ChatEvent[] }> {
+  const response = await request(`/conversations/${encodeURIComponent(id)}`)
+  try {
+    const data = await response.json(), metadata = conversation(data.conversation)
+    // Storage bounds the payloads before adding sequence fields and array
+    // framing. Allow bounded transport overhead for at most 1,000 events.
+    if (metadata.id !== id || !Array.isArray(data.events) || data.events.length > 1000
+        || new TextEncoder().encode(JSON.stringify(data.events)).length > 1048576 + 65536) throw new Error()
+    let previous = 0
+    let payloadBytes = 0
+    for (const event of data.events) {
+      if (!event || Array.isArray(event) || typeof event.type !== 'string'
+          || !Number.isSafeInteger(event.seq) || event.seq <= previous) throw new Error()
+      previous = event.seq
+      const { seq: _sequence, ...payload } = event
+      payloadBytes += new TextEncoder().encode(JSON.stringify(payload)).length
+      if (payloadBytes > 1048576) throw new Error()
+    }
+    return { conversation: metadata, events: data.events }
+  } catch { throw new CopilotChatError(failure) }
+}
+export async function resumeCopilotConversation(id: string, revision: number) {
+  if (!Number.isSafeInteger(revision) || revision < 1) throw new CopilotChatError(failure)
+  return owner(await request(`/conversations/${encodeURIComponent(id)}/resume`, { method: 'POST', body: JSON.stringify({ revision }) }))
 }
 const path = (sid: string) => `/sessions/${encodeURIComponent(sid)}`
 export async function closeCopilotChat(sid: string) {
   try {
     const response = await apiFetch(root + path(sid), { method: 'DELETE', keepalive: true })
     if (!response.ok && response.status !== 404) throw new Error()
-  } catch { throw new CopilotChatError('Chat cleanup could not be confirmed. Refresh before opening another chat.') }
+  } catch { throw new CopilotChatCleanupError('Chat cleanup could not be confirmed. Refresh before opening another chat.') }
 }
 export async function respondCopilotPermission(sid: string, requestId: string, approved: boolean) {
   await request(path(sid) + '/permission', { method: 'POST', body: JSON.stringify({ request_id: requestId, approved }) })

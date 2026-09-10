@@ -236,6 +236,75 @@ class CopilotSessionRecords:
             handle.close()
         raise error("Copilot session resume provenance could not be established")
 
+    def is_ready(self, platform_session_id: str, owner_sub: str) -> bool:
+        """Read-only personal-history candidate check; never authorizes resume.
+
+        Only an exact known ID is inspected. No lock/state files are created,
+        no status changes, and no native identifiers or host paths are exposed.
+        The final open() still owns exclusive-lock/current-profile admission.
+        """
+        descriptor = lock = None
+        allocation = None
+        try:
+            if not _text(platform_session_id, 256) or not _text(owner_sub, 256):
+                return False
+            if (self._directory_identity(self.root) != self._root_identity
+                    or self._directory_identity(self.state_root) != self._state_root_identity):
+                return False
+            key = hashlib.sha256(platform_session_id.encode()).hexdigest()
+            descriptor = _open_directory(self.root)
+            lock = os.open(key + ".lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                           dir_fd=descriptor)
+            if not _private_file(os.fstat(lock)):
+                return False
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            document = _read_document(descriptor, key)
+            raw = document["profile"]
+            scope = CopilotAccountScope(AccountScopeKind(raw["scope"]["kind"]), raw["scope"]["user_sub"])
+            profile = CopilotSessionProfile(**{**raw, "scope": scope,
+                "credential_kind": CredentialKind(raw["credential_kind"]),
+                "enabled_tools": frozenset(raw["enabled_tools"])})
+            if (profile._document() != raw or profile.platform_session_id != platform_session_id
+                    or profile.user_sub != owner_sub or scope != CopilotAccountScope.personal(owner_sub)
+                    or document["status"] != "ready"):
+                return False
+            allocation = PrivateCopilotSessionState.reopen(self.state_root, SessionStateAllocation(**document["allocation"]))
+            current_lock = os.stat(key + ".lock", dir_fd=descriptor, follow_symlinks=False)
+            return (self._directory_identity(self.root) == self._root_identity
+                    and self._directory_identity(self.state_root) == self._state_root_identity
+                    and _private_file(current_lock) and _identity(current_lock) == _identity(os.fstat(lock)))
+        except Exception:
+            return False
+        finally:
+            if allocation is not None:
+                allocation.detach()
+            if lock is not None:
+                os.close(lock)
+            if descriptor is not None:
+                os.close(descriptor)
+
+
+def _read_document(parent, key):
+    descriptor = os.open(key + ".json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)
+    try:
+        info = os.fstat(descriptor)
+        if not _private_file(info) or not 0 < info.st_size <= _MAX_RECORD:
+            raise ValueError()
+        with os.fdopen(os.dup(descriptor), "rb") as stream:
+            document = json.loads(stream.read(_MAX_RECORD + 1), object_pairs_hook=_unique_object)
+    finally:
+        os.close(descriptor)
+    if (not isinstance(document, dict)
+            or document.keys() != {"version", "status", "profile", "native_session_id", "allocation"}
+            or type(document["version"]) is not int or document["version"] != 1
+            or document["status"] not in ("active", "ready")
+            or not isinstance(document["profile"], dict)
+            or not isinstance(document["allocation"], dict)
+            or not _text(document["native_session_id"], 256)):
+        raise ValueError()
+    SessionStateAllocation(**document["allocation"])
+    return document
+
 
 class LockedCopilotSessionRecord:
     """One exclusive runtime owner; close retains history and current status."""
@@ -256,26 +325,7 @@ class LockedCopilotSessionRecord:
 
     def _read(self):
         self._validate()
-        descriptor = os.open(self._key + ".json", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                             dir_fd=self._root_fd)
-        try:
-            info = os.fstat(descriptor)
-            if not _private_file(info) or not 0 < info.st_size <= _MAX_RECORD:
-                raise ValueError()
-            with os.fdopen(os.dup(descriptor), "rb") as stream:
-                document = json.loads(stream.read(_MAX_RECORD + 1), object_pairs_hook=_unique_object)
-        finally:
-            os.close(descriptor)
-        if (not isinstance(document, dict)
-                or document.keys() != {"version", "status", "profile", "native_session_id", "allocation"}
-                or type(document["version"]) is not int or document["version"] != 1
-                or document["status"] not in ("active", "ready")
-                or not isinstance(document["profile"], dict)
-                or not isinstance(document["allocation"], dict)
-                or not _text(document["native_session_id"], 256)):
-            raise ValueError()
-        SessionStateAllocation(**document["allocation"])
-        return document
+        return _read_document(self._root_fd, self._key)
 
     def _write(self, document):
         self._validate()

@@ -20,7 +20,8 @@ beforeEach(() => {
     if (url.endsWith('/status')) return json({ available: true })
     if (url === '/v1/agents') return json({ agents: [{ name: 'demo', display_name: 'Demo agent' }] })
     if (url === '/v1/copilot/accounts') return json({ accounts: [{ id: 'account-1', label: 'My account', principal_id: 'github:user:1', revision: 'r1', status: 'active', use_personal: true, contribute_platform: false, expires_at: null, auth_kind: 'user_token' }] })
-    if (url.endsWith('/sessions')) return json({ session_id: 'session-1' })
+    if (url.includes('/conversations?')) return json({ conversations: [], has_more: false })
+    if (url.endsWith('/sessions')) return json({ session_id: 'session-1', conversation_id: 'conversation-1' })
     if (options.method === 'DELETE') return json(null, 204)
     if (url.endsWith('/turn')) return stream([frame({ type: 'text', content: 'Hello from Copilot' }), frame({ type: 'done' }), frame({ type: 'turn_complete' })]).response
     return json({})
@@ -95,9 +96,9 @@ it('correlates permission and question replies without creating another turn', a
   await act(async () => finish.resolve())
 })
 it('deletes late creation after unmount', async () => {
-  const created = deferred<string>(); vi.spyOn(chat, 'createCopilotChat').mockReturnValue(created.promise)
+  const created = deferred<chat.CopilotChatOwner>(); vi.spyOn(chat, 'createCopilotChat').mockReturnValue(created.promise)
   const page = mount(); await send(); page.unmount()
-  await act(async () => created.resolve('late-session'))
+  await act(async () => created.resolve({ session_id: 'late-session', conversation_id: 'conversation-1' }))
   await waitFor(() => expect(apiFetch.mock.calls.some(([url, opts]) => url.endsWith('/late-session') && opts.method === 'DELETE')).toBe(true))
   expect(apiFetch.mock.calls.some(([url]) => url.endsWith('/turn'))).toBe(false)
 })
@@ -116,13 +117,13 @@ it('closes on incomplete stream failure', async () => {
   await waitFor(() => expect(apiFetch.mock.calls.some(([url, opts]) => url.endsWith('/session-1') && opts.method === 'DELETE')).toBe(true))
 })
 it('stopping pending creation waits for its late owner cleanup before another chat', async () => {
-  const created = deferred<string>(), disposed = deferred<void>()
+  const created = deferred<chat.CopilotChatOwner>(), disposed = deferred<void>()
   vi.spyOn(chat, 'createCopilotChat').mockReturnValue(created.promise)
   vi.spyOn(chat, 'closeCopilotChat').mockReturnValue(disposed.promise)
   mount(); await send()
   fireEvent.click(screen.getByRole('button', { name: 'Stop and close' }))
   expect(screen.getByRole('button', { name: 'New chat' })).toBeDisabled()
-  await act(async () => created.resolve('late-session'))
+  await act(async () => created.resolve({ session_id: 'late-session', conversation_id: 'conversation-1' }))
   expect(chat.closeCopilotChat).toHaveBeenCalledWith('late-session')
   expect(screen.getByRole('button', { name: 'New chat' })).toBeDisabled()
   await act(async () => disposed.resolve())
@@ -211,4 +212,208 @@ it('closing an unanswered question never labels it answered', async () => {
   expect(await screen.findByText('Question closed.')).toBeInTheDocument()
   expect(screen.queryByText('Questions answered')).not.toBeInTheDocument()
   await act(async () => finish.resolve())
+})
+
+const savedConversation = (overrides: Partial<chat.CopilotConversation> = {}): chat.CopilotConversation => ({
+  id: 'conversation-a', agent: 'demo', account_id: 'account-1', model: 'saved-model', permission_mode: 'plan',
+  title: 'Saved work', created_at: 100, updated_at: 200, state: 'closed', revision: 7, can_resume: true, reason: '', ...overrides,
+})
+function savedFixture(row = savedConversation(), events: chat.ChatEvent[] = [{ seq: 1, type: 'text', content: 'Saved response' }]) {
+  vi.spyOn(chat, 'listCopilotConversations').mockResolvedValue({ conversations: [row], has_more: false })
+  vi.spyOn(chat, 'getCopilotConversation').mockResolvedValue({ conversation: row, events })
+  return row
+}
+async function selectSaved(title = 'Saved work') {
+  fireEvent.click(await screen.findByRole('button', { name: new RegExp(title) }))
+  await waitFor(() => expect(screen.queryByText('Loading saved transcript…')).not.toBeInTheDocument())
+}
+it('opens saved history without inference and keeps archived prompts inert', async () => {
+  savedFixture(undefined, [
+    { seq: 1, type: 'user', content: 'Original user message' },
+    { seq: 2, type: 'text', content: 'Saved response' },
+    { seq: 3, type: 'permission_prompt', request_id: 'old-permission', tool_name: 'Bash', tool_input: { command: 'ls' } },
+    { seq: 4, type: 'question_prompt', request_id: 'old-question', tool_input: { questions: [{ id: 'old-choice', question: 'Old question?', options: [{ label: 'Yes' }] }] } },
+  ])
+  mount(); await selectSaved()
+  expect(await screen.findByText('Original user message')).toBeInTheDocument()
+  expect(screen.getByText('Saved response')).toBeInTheDocument()
+  expect(screen.getByText(/Saved permission request \(read-only\)/)).toBeInTheDocument()
+  expect(screen.getByText(/Saved question \(read-only\)/)).toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: 'Allow' })).not.toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: /Submit/ })).not.toBeInTheDocument()
+  expect(screen.getByLabelText('Message')).toBeDisabled()
+  expect(apiFetch.mock.calls.some(([url]) => /\/sessions|\/resume$|\/permission$|\/question$/.test(url))).toBe(false)
+})
+it('explicitly resumes the stored revision with a fresh handle and fixed configuration', async () => {
+  const row = savedFixture(), base = apiFetch.getMockImplementation()!
+  apiFetch.mockImplementation((url, options) => url.endsWith('/resume') ? Promise.resolve(json({ session_id: 'fresh-owner', conversation_id: row.id })) : base(url, options))
+  mount(); await selectSaved()
+  expect(screen.getByLabelText('Model ID (preview)')).toHaveValue('saved-model')
+  expect(screen.getByLabelText('Permission mode')).toHaveValue('plan')
+  expect(screen.getByLabelText('Personal Copilot account')).toBeDisabled()
+  fireEvent.click(screen.getByRole('button', { name: 'Resume conversation' }))
+  await waitFor(() => expect(screen.getByLabelText('Message')).toBeEnabled())
+  const call = apiFetch.mock.calls.find(([url]) => url.endsWith('/resume'))!
+  expect(call[0]).toBe('/v1/copilot/chat/conversations/conversation-a/resume')
+  expect(JSON.parse(call[1].body)).toEqual({ revision: 7 })
+  await send('Continue saved work')
+  expect(await screen.findByText('Hello from Copilot')).toBeInTheDocument()
+  expect(apiFetch.mock.calls.some(([url]) => url.endsWith('/fresh-owner/turn'))).toBe(true)
+  expect(apiFetch.mock.calls.some(([url]) => url.endsWith('/sessions'))).toBe(false)
+  expect(vi.mocked(chat.listCopilotConversations).mock.calls.length).toBeGreaterThan(1)
+})
+it('ignores an older history response after a different selection', async () => {
+  const first = savedConversation(), second = savedConversation({ id: 'conversation-b', title: 'Other work' })
+  const delayed = deferred<{ conversation: chat.CopilotConversation; events: chat.ChatEvent[] }>()
+  vi.spyOn(chat, 'listCopilotConversations').mockResolvedValue({ conversations: [first, second], has_more: false })
+  vi.spyOn(chat, 'getCopilotConversation').mockImplementation(id => id === first.id ? delayed.promise : Promise.resolve({ conversation: second, events: [{ seq: 1, type: 'text', content: 'Second transcript' }] }))
+  mount(); fireEvent.click(await screen.findByRole('button', { name: /Saved work/ }))
+  fireEvent.click(screen.getByRole('button', { name: /Other work/ }))
+  expect(await screen.findByText('Second transcript')).toBeInTheDocument()
+  await act(async () => delayed.resolve({ conversation: first, events: [{ seq: 1, type: 'text', content: 'Stale first transcript' }] }))
+  expect(screen.queryByText('Stale first transcript')).not.toBeInTheDocument()
+  expect(screen.getByText('Second transcript')).toBeInTheDocument()
+})
+it('stopping a pending resume waits for disposal of its fresh late owner', async () => {
+  const row = savedFixture(), resumed = deferred<chat.CopilotChatOwner>(), disposed = deferred<void>()
+  vi.spyOn(chat, 'resumeCopilotConversation').mockReturnValue(resumed.promise)
+  vi.spyOn(chat, 'closeCopilotChat').mockReturnValue(disposed.promise)
+  mount(); await selectSaved()
+  fireEvent.click(screen.getByRole('button', { name: 'Resume conversation' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Stop and close' }))
+  expect(screen.getByRole('button', { name: 'New chat' })).toBeDisabled()
+  await act(async () => resumed.resolve({ session_id: 'late-resume-owner', conversation_id: row.id }))
+  expect(chat.closeCopilotChat).toHaveBeenCalledExactlyOnceWith('late-resume-owner')
+  expect(screen.getByRole('button', { name: 'New chat' })).toBeDisabled()
+  await act(async () => disposed.resolve())
+  await waitFor(() => expect(screen.getByRole('button', { name: 'New chat' })).toBeEnabled())
+  expect(apiFetch.mock.calls.some(([url]) => url.endsWith('/turn'))).toBe(false)
+})
+it('user change isolates list caches, discards history and disposes a late resume owner', async () => {
+  const row = savedFixture(), resumed = deferred<chat.CopilotChatOwner>()
+  vi.spyOn(chat, 'resumeCopilotConversation').mockReturnValue(resumed.promise)
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  const page = render(<QueryClientProvider client={client}><CopilotChatPreview /></QueryClientProvider>)
+  await selectSaved(); fireEvent.click(screen.getByRole('button', { name: 'Resume conversation' }))
+  auth.user = { sub: 'bob', role: 'member' }
+  vi.mocked(chat.listCopilotConversations).mockResolvedValue({ conversations: [], has_more: false })
+  page.rerender(<QueryClientProvider client={client}><CopilotChatPreview /></QueryClientProvider>)
+  expect(screen.queryByText('Saved response')).not.toBeInTheDocument()
+  expect(await screen.findByText('No saved conversations on this page.')).toBeInTheDocument()
+  await act(async () => resumed.resolve({ session_id: 'alice-late-owner', conversation_id: row.id }))
+  await waitFor(() => expect(apiFetch.mock.calls.some(([url, options]) => url.endsWith('/alice-late-owner') && options.method === 'DELETE')).toBe(true))
+  expect(client.getQueryData(['copilot-conversations', 'alice', 0])).toBeDefined()
+  expect(client.getQueryData(['copilot-conversations', 'bob', 0])).toEqual({ conversations: [], has_more: false })
+})
+it('does not substitute another account when the saved account is unavailable', async () => {
+  savedFixture(savedConversation({ account_id: 'removed-account' }))
+  const resume = vi.spyOn(chat, 'resumeCopilotConversation')
+  mount(); await selectSaved()
+  expect(screen.getByLabelText('Personal Copilot account')).toHaveValue('removed-account')
+  expect(screen.getByRole('button', { name: 'Resume conversation' })).toBeDisabled()
+  expect(screen.getByText(/different account will not be substituted/)).toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: 'Resume conversation' }))
+  expect(resume).not.toHaveBeenCalled()
+})
+it('keeps partial history readable and disables unsafe resume', async () => {
+  savedFixture(savedConversation({ state: 'incomplete', can_resume: false, reason: 'The previous turn did not finish cleanly.' }), [{ seq: 1, type: 'text', content: 'Partial response retained' }])
+  mount(); await selectSaved()
+  expect(screen.getByText('Partial response retained')).toBeInTheDocument()
+  expect(screen.getByText('The previous turn did not finish cleanly.')).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Resume conversation' })).toBeDisabled()
+  expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+})
+it('pages the owned list in bounded increments without starting sessions', async () => {
+  const listing = vi.spyOn(chat, 'listCopilotConversations').mockImplementation(async offset => ({ conversations: offset === 20 ? [savedConversation({ title: 'Older work' })] : [savedConversation()], has_more: offset === 0 }))
+  mount(); await screen.findByRole('button', { name: /Saved work/ })
+  expect(screen.getByRole('button', { name: 'Previous conversations' })).toBeDisabled()
+  fireEvent.click(screen.getByRole('button', { name: 'Next conversations' }))
+  await screen.findByRole('button', { name: /Older work/ })
+  expect(listing).toHaveBeenCalledWith(20)
+  expect(screen.getByRole('button', { name: 'Next conversations' })).toBeDisabled()
+  fireEvent.click(screen.getByRole('button', { name: 'Previous conversations' }))
+  await screen.findByRole('button', { name: /Saved work/ })
+  expect(apiFetch.mock.calls.some(([url]) => url.endsWith('/sessions'))).toBe(false)
+})
+it('reports stale resume without a new session or silently retrying', async () => {
+  savedFixture(); const base = apiFetch.getMockImplementation()!, response = json({ detail: 'private response' }, 409)
+  apiFetch.mockImplementation((url, options) => url.endsWith('/resume') ? Promise.resolve(response) : base(url, options))
+  mount(); await selectSaved(); fireEvent.click(screen.getByRole('button', { name: 'Resume conversation' }))
+  expect(await screen.findByRole('alert')).toHaveTextContent('busy')
+  expect(response.json).not.toHaveBeenCalled()
+  expect(apiFetch.mock.calls.filter(([url]) => url.endsWith('/resume'))).toHaveLength(1)
+  expect(screen.getByLabelText('Message')).toBeDisabled()
+})
+it('validates saved sequence ordering and transcript bounds before returning history', async () => {
+  const row = savedConversation()
+  for (const events of [
+    [{ seq: 2, type: 'text' }, { seq: 1, type: 'text' }],
+    [{ seq: 1, type: 'text' }, { seq: 1, type: 'text' }],
+    [{ seq: 1, type: 'text', content: 'x'.repeat(1048576) }],
+  ]) {
+    apiFetch.mockResolvedValue(json({ conversation: row, events }))
+    await expect(chat.getCopilotConversation(row.id)).rejects.toThrow(chat.CopilotChatError)
+  }
+})
+it('a late metadata refresh never overwrites live response text', async () => {
+  const row = savedFixture(), delayed = deferred<{ conversation: chat.CopilotConversation; events: chat.ChatEvent[] }>()
+  vi.spyOn(chat, 'resumeCopilotConversation').mockResolvedValue({ session_id: 'fresh-owner', conversation_id: row.id })
+  vi.mocked(chat.getCopilotConversation).mockResolvedValueOnce({ conversation: row, events: [{ seq: 1, type: 'text', content: 'Saved response' }] }).mockReturnValue(delayed.promise)
+  mount(); await selectSaved(); fireEvent.click(screen.getByRole('button', { name: 'Resume conversation' }))
+  await waitFor(() => expect(screen.getByLabelText('Message')).toBeEnabled())
+  await send(); await screen.findByText('Hello from Copilot')
+  await act(async () => delayed.resolve({ conversation: row, events: [{ seq: 1, type: 'text', content: 'Stale server transcript' }] }))
+  expect(screen.getByText('Hello from Copilot')).toBeInTheDocument()
+  expect(screen.queryByText('Stale server transcript')).not.toBeInTheDocument()
+})
+it('new chat invalidates a pending read-only history request', async () => {
+  const row = savedFixture(), delayed = deferred<{ conversation: chat.CopilotConversation; events: chat.ChatEvent[] }>()
+  vi.mocked(chat.getCopilotConversation).mockReturnValue(delayed.promise)
+  mount(); fireEvent.click(await screen.findByRole('button', { name: /Saved work/ }))
+  fireEvent.click(screen.getByRole('button', { name: 'New chat' }))
+  await waitFor(() => expect(screen.getByLabelText('Message')).toBeEnabled())
+  await act(async () => delayed.resolve({ conversation: row, events: [{ seq: 1, type: 'text', content: 'Late history' }] }))
+  expect(screen.queryByText('Late history')).not.toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: 'Resume conversation' })).not.toBeInTheDocument()
+})
+it('retains the cleanup barrier if a malformed owner response cannot be disposed', async () => {
+  const base = apiFetch.getMockImplementation()!
+  apiFetch.mockImplementation((url, options = {}) => url.endsWith('/sessions')
+    ? Promise.resolve(json({ session_id: 'malformed-owner', conversation_id: null }))
+    : options.method === 'DELETE' ? Promise.resolve(json({}, 503)) : base(url, options))
+  mount(); await send()
+  expect(await screen.findByRole('alert')).toHaveTextContent('cleanup could not be confirmed')
+  expect(apiFetch.mock.calls.some(([url, options]) => url.endsWith('/malformed-owner') && options.method === 'DELETE')).toBe(true)
+  expect(screen.getByRole('button', { name: 'New chat' })).toBeDisabled()
+  expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+})
+it('loads the exact bounded history API shape and paged URL', async () => {
+  const row = savedConversation(), events = [{ seq: 1, type: 'user', content: 'saved input' }, { seq: 2, type: 'text', content: 'saved output' }]
+  apiFetch.mockResolvedValueOnce(json({ conversations: [row], has_more: true }))
+  expect(await chat.listCopilotConversations(20)).toEqual({ conversations: [row], has_more: true })
+  expect(apiFetch.mock.calls[0][0]).toBe('/v1/copilot/chat/conversations?limit=20&offset=20')
+  apiFetch.mockResolvedValueOnce(json({ conversation: row, events }))
+  expect(await chat.getCopilotConversation(row.id)).toEqual({ conversation: row, events })
+})
+it('reads and displays a full stored payload budget with added sequence and array framing', async () => {
+  const row = savedConversation()
+  const frameBytes = 262144, overhead = JSON.stringify({ type: 'text', content: '' }).length
+  const payloads = Array.from({ length: 4 }, () => ({ type: 'text', content: 'x'.repeat(frameBytes - overhead) }))
+  const events = payloads.map((payload, index) => ({ ...payload, seq: index + 1 }))
+  expect(payloads.reduce((sum, payload) => sum + new TextEncoder().encode(JSON.stringify(payload)).length, 0)).toBe(1048576)
+  expect(new TextEncoder().encode(JSON.stringify(events)).length).toBeGreaterThan(1048576)
+  const base = apiFetch.getMockImplementation()!
+  apiFetch.mockImplementation((url, options) => url.includes('/conversations?')
+    ? Promise.resolve(json({ conversations: [row], has_more: false }))
+    : url.endsWith('/conversations/' + row.id) ? Promise.resolve(json({ conversation: row, events })) : base(url, options))
+  // Exercise the real API validation and archived display budget together.
+  mount(); await selectSaved()
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  expect(screen.getByLabelText('Copilot conversation').querySelector('pre')?.textContent?.length).toBe(4 * (frameBytes - overhead))
+  expect(screen.getByRole('button', { name: 'Resume conversation' })).toBeEnabled()
+})
+it('rejects archived responses above bounded framing headroom', async () => {
+  const row = savedConversation()
+  apiFetch.mockResolvedValue(json({ conversation: row, events: [{ seq: 1, type: 'text', content: 'x'.repeat(1048576 + 65536) }] }))
+  await expect(chat.getCopilotConversation(row.id)).rejects.toThrow(chat.CopilotChatError)
 })

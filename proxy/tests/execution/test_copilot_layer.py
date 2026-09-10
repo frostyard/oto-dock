@@ -901,3 +901,45 @@ async def test_close_all_blocks_existing_turn_before_deferred_cleanup_runs(harne
     assert owner.messages == []
     release.set()
     await closing
+
+
+@pytest.mark.asyncio
+async def test_history_readiness_never_inspects_record_while_runtime_claimed(harness, monkeypatch):
+    layer, sid, _ = await start(harness)
+    calls = []
+    monkeypatch.setattr(harness.records, "is_ready", lambda *args: calls.append(args) or True)
+    assert not await layer.history_ready(sid, "alice")
+    assert not calls
+    await layer.close_session(sid)
+    assert await layer.history_ready(sid, "alice")
+    assert calls == [(sid, "alice")]
+
+
+@pytest.mark.asyncio
+async def test_history_readiness_rechecks_new_claim_after_thread_read(harness, monkeypatch):
+    import threading
+    from core.session import owned_sessions
+
+    layer, sid = harness.layer(), harness.identity()
+    entered, release = threading.Event(), threading.Event()
+
+    def read(*args):
+        entered.set()
+        assert release.wait(2)
+        return True
+
+    monkeypatch.setattr(harness.records, "is_ready", read)
+    task = asyncio.create_task(layer.history_ready(sid, "alice"))
+    async with asyncio.timeout(1):
+        while not entered.is_set():
+            await asyncio.sleep(0.001)
+    async def close():
+        pass
+    claim = owned_sessions.register_owned_session(session_id=sid, engine="copilot-cli", agent="demo",
+                user_sub="alice", username="alice", active=lambda: True, close=close)
+    try:
+        release.set()
+        assert not await task
+    finally:
+        release.set()
+        owned_sessions.release_owned_session(claim)

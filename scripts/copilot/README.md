@@ -17,11 +17,13 @@ python scripts/copilot/chat_api_probe.py \
 ```
 
 This spends up to three model turns, approves only an exact temporary native file
-write, checks warm recall, disconnect cleanup, cross-user/origin rejection and
-idle role revocation. It uses real runtime assets and retained private history,
-but controlled user, agent, account and network-discovery reads; it does not
-modify an existing deployment or use PostgreSQL. See the
-[results and limits](../../docs/plans/copilot-chat-preview-results.md).
+write, checks saved reads, cold recall after service/layer replacement, fresh
+control handles, stale revisions, interrupted-history quarantine, cross-user/
+origin rejection and idle role revocation. It uses real runtime assets and
+retained private history, but controlled user, agent, account and network-discovery
+reads plus an in-memory conversation store. It does not modify an existing
+deployment or use PostgreSQL. See the
+[history results and limits](../../docs/plans/copilot-conversation-history-results.md).
 
 ## Explicit local setup
 

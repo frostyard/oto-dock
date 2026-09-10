@@ -189,7 +189,7 @@ class CopilotLocalSession:
     async def _open(self, builder, runtime_path, records, resume, turn_timeout):
         from auth.path_policy import SecurityContext
         from core.sandbox.sandbox import SandboxBuilder
-        from core.session.session_state import get_session_security
+        from core.session.session_state import get_session_security, get_session_mode
 
         if (type(self._config) is not CopilotLocalSessionConfig or type(resume) is not bool
                 or type(builder) is not SandboxBuilder or type(records) is not CopilotSessionRecords
@@ -237,6 +237,7 @@ class CopilotLocalSession:
         digest = hashlib.sha256(json.dumps(_canonical({
             "sandbox": cfg, "context": context, "system_prompt": self._config.system_prompt,
             "runtime_path": runtime_path, "cwd": cwd,
+            "permission_mode": get_session_mode(self._config.platform_session_id),
         }), sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
         self._check()
         self._guard = await CopilotLeaseGuard.acquire(

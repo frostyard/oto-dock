@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useAuth } from '../contexts/AuthContext'
 import { useAgents } from '../api/agents'
 import { useCopilotAccounts } from '../api/copilotAccounts'
 import {
-  CopilotChatError, copilotChatAvailable, createCopilotChat, closeCopilotChat,
+  CopilotChatError, CopilotChatCleanupError, copilotChatAvailable, createCopilotChat, closeCopilotChat,
   streamCopilotTurn, respondCopilotPermission, respondCopilotQuestion, type ChatEvent, type ChatMode,
+  listCopilotConversations, getCopilotConversation, resumeCopilotConversation, type CopilotConversation,
 } from '../api/copilotChat'
 import PermissionDialog from '../components/chat/PermissionDialog'
 import QuestionDialog from '../components/chat/QuestionDialog'
@@ -19,7 +20,11 @@ export function CopilotChatPreview() {
   return user?.sub ? <Preview key={user.sub} userSub={user.sub} /> : null
 }
 function Preview({ userSub }: { userSub: string }) {
+  const queryClient = useQueryClient()
   const status = useQuery({ queryKey: ['copilot-chat-status', userSub], queryFn: copilotChatAvailable, retry: false })
+  const [offset, setOffset] = useState(0)
+  const saved = useQuery({ queryKey: ['copilot-conversations', userSub, offset], queryFn: () => listCopilotConversations(offset), enabled: status.data === true, retry: false })
+  const [selected, setSelected] = useState<CopilotConversation | null>(null), [loading, setLoading] = useState(false)
   const agents = useAgents()
   const accounts = useCopilotAccounts(userSub)
   const [agent, setAgent] = useState(''), [account, setAccount] = useState('')
@@ -27,7 +32,7 @@ function Preview({ userSub }: { userSub: string }) {
   const [prompt, setPrompt] = useState(''), [items, setItems] = useState<Item[]>([])
   const [session, setSession] = useState<string | null>(null), [busy, setBusy] = useState(false)
   const [error, setError] = useState(''), [answering, setAnswering] = useState<string | null>(null)
-  const life = useRef({ mounted: true, epoch: 0, creating: false, sid: null as string | null, busy: false, controller: null as AbortController | null, answer: null as string | null, closing: null as Promise<void> | null, cleanupFailed: false })
+  const life = useRef({ mounted: true, epoch: 0, creating: false, loading: false, cid: null as string | null, sid: null as string | null, busy: false, controller: null as AbortController | null, answer: null as string | null, closing: null as Promise<void> | null, cleanupFailed: false })
   const next = useRef(0)
   const display = useRef({ characters: 0, events: 0 })
   function budget(characters: number) {
@@ -37,8 +42,10 @@ function Preview({ userSub }: { userSub: string }) {
     display.current.characters += characters; display.current.events++
   }
   const eligible = (accounts.data ?? []).filter(a => a.status === 'active' && a.use_personal && (a.expires_at === null || a.expires_at > Date.now() / 1000))
-  const selectedAgent = agent || agents.data?.[0]?.name || ''
-  const selectedAccount = account || eligible[0]?.id || ''
+  const selectedAgent = selected?.agent ?? (agent || agents.data?.[0]?.name || '')
+  const selectedAccount = selected?.account_id ?? (account || eligible[0]?.id || '')
+  const savedAccountAvailable = !!selected && eligible.some(a => a.id === selected.account_id)
+  const savedAgentAvailable = !!selected && !!agents.data?.some(a => a.name === selected.agent)
   useEffect(() => {
     const current = life.current
     current.mounted = true
@@ -48,6 +55,14 @@ function Preview({ userSub }: { userSub: string }) {
     }
   }, [])
   const message = (e: unknown) => e instanceof CopilotChatError ? e.message : 'Copilot chat failed. Close this chat and try again.'
+  function refresh() {
+    void queryClient.invalidateQueries({ queryKey: ['copilot-conversations', userSub] })
+    const current = life.current, cid = current.cid, epoch = current.epoch
+    if (cid) void getCopilotConversation(cid).then(data => {
+      // Metadata refresh must never replace a newer selection or live transcript.
+      if (current.mounted && current.epoch === epoch && current.cid === cid && !current.loading) setSelected(data.conversation)
+    }).catch(() => {})
+  }
   function close(): Promise<void> {
     const current = life.current
     if (current.closing) return current.closing
@@ -61,6 +76,7 @@ function Preview({ userSub }: { userSub: string }) {
         try { await closeCopilotChat(sid) }
         catch (e) { current.cleanupFailed = true; if (current.mounted) setError(message(e)) }
       }
+      if (current.mounted) refresh()
     })()
     const closing = operation.finally(() => {
       if (current.closing === closing) {
@@ -76,13 +92,64 @@ function Preview({ userSub }: { userSub: string }) {
     if (current.busy || current.closing || current.cleanupFailed) return
     await close()
     if (current.mounted && !current.cleanupFailed) {
+      current.epoch++; current.cid = null; current.loading = false
       display.current = { characters: 0, events: 0 }
-      setItems([]); setError(''); setPrompt('')
+      setItems([]); setSelected(null); setLoading(false); setError(''); setPrompt('')
     }
   }
-  function receive(event: ChatEvent) {
-    budget(JSON.stringify(event).length)
-    if (event.type === 'text' && typeof event.content === 'string') {
+  async function openHistory(row: CopilotConversation) {
+    const current = life.current
+    if (current.busy || current.closing || current.cleanupFailed) return
+    if (current.sid) await close()
+    if (!current.mounted || current.cleanupFailed) return
+    const epoch = ++current.epoch
+    current.cid = row.id; current.loading = true
+    setSelected(row); setLoading(true); setItems([]); setPrompt(''); setError('')
+    display.current = { characters: 0, events: 0 }
+    try {
+      const data = await getCopilotConversation(row.id)
+      if (!current.mounted || current.epoch !== epoch) return
+      setSelected(data.conversation)
+      for (const event of data.events) receive(event, true)
+    } catch (e) {
+      if (current.mounted && current.epoch === epoch) { setError(message(e)); setItems([]); setSelected({ ...row, can_resume: false }) }
+    } finally {
+      if (current.mounted && current.epoch === epoch) { current.loading = false; setLoading(false) }
+    }
+  }
+  async function resume() {
+    const current = life.current, row = selected
+    if (!row || !row.can_resume || !savedAccountAvailable || !savedAgentAvailable || current.loading || current.busy || current.closing || current.sid || current.cleanupFailed) return
+    const epoch = current.epoch, valid = () => current.mounted && current.epoch === epoch
+    current.busy = true; current.creating = true; setBusy(true); setError('')
+    try {
+      const owner = await resumeCopilotConversation(row.id, row.revision)
+      if (!valid() || owner.conversation_id !== row.id) {
+        try { await closeCopilotChat(owner.session_id) }
+        catch (e) { current.cleanupFailed = true; if (current.mounted) setError(message(e)) }
+        if (valid()) throw new CopilotChatError('This conversation could not be resumed.')
+        return
+      }
+      current.sid = owner.session_id; setSession(owner.session_id)
+      setSelected({ ...row, state: 'open', can_resume: false })
+      refresh()
+    } catch (e) {
+      if (e instanceof CopilotChatCleanupError) current.cleanupFailed = true
+      if (valid()) { setError(message(e)); refresh() }
+    }
+    finally {
+      current.creating = false
+      if (current.mounted && !current.closing) { current.busy = false; setBusy(false) }
+    }
+  }
+  function receive(event: ChatEvent, archived = false) {
+    // Persisted seq fields are transport framing, outside the stored payload
+    // budget. Keep the same content limit when loading or receiving live data.
+    const { seq: _sequence, ...payload } = event
+    budget(JSON.stringify(archived ? payload : event).length)
+    if (event.type === 'user' && typeof event.content === 'string') {
+      setItems(old => [...old, { key: next.current++, kind: 'user', text: event.content as string }])
+    } else if (event.type === 'text' && typeof event.content === 'string') {
       const content = event.content
       setItems(old => {
         const last = old[old.length - 1]
@@ -95,6 +162,11 @@ function Preview({ userSub }: { userSub: string }) {
         : event.tool_input ? JSON.stringify(event.tool_input, null, 2) : typeof event.summary === 'string' ? event.summary : ''
       setItems(old => [...old, { key: next.current++, kind: 'tool', text: `${name} ${state}${detail ? '\n' + detail : ''}` }])
     } else if (['permission_prompt', 'question_prompt'].includes(event.type)) {
+      if (archived) {
+        const detail = event.tool_input && typeof event.tool_input === 'object' ? JSON.stringify(event.tool_input, null, 2) : ''
+        setItems(old => [...old, { key: next.current++, kind: 'tool', text: `${event.type === 'question_prompt' ? 'Saved question' : 'Saved permission request'} (read-only)${detail ? '\n' + detail : ''}` }])
+        return
+      }
       if (typeof event.request_id !== 'string' || !event.request_id || event.request_id.length > 256
           || !event.tool_input || typeof event.tool_input !== 'object' || Array.isArray(event.tool_input)) throw new Error()
       if (event.type === 'question_prompt') {
@@ -111,7 +183,7 @@ function Preview({ userSub }: { userSub: string }) {
   async function send(event: React.FormEvent) {
     event.preventDefault()
     const current = life.current
-    if (current.busy || current.closing || current.cleanupFailed || !prompt.trim() || !selectedAgent || !selectedAccount) return
+    if (current.loading || (current.cid && !current.sid) || current.busy || current.closing || current.cleanupFailed || !prompt.trim() || !selectedAgent || !selectedAccount) return
     const text = prompt.trim(), epoch = current.epoch
     current.busy = true; setBusy(true); setError(''); setPrompt('')
     const valid = () => current.mounted && current.epoch === epoch
@@ -122,18 +194,22 @@ function Preview({ userSub }: { userSub: string }) {
       if (!sid) {
         // Do not cancel creation and lose its owner ID. Dispose late results.
         current.creating = true
-        try { sid = await createCopilotChat({ agent: selectedAgent, account_id: selectedAccount, model: model.trim(), permission_mode: mode }) }
+        let owner
+        try { owner = await createCopilotChat({ agent: selectedAgent, account_id: selectedAccount, model: model.trim(), permission_mode: mode }); sid = owner.session_id }
         finally { current.creating = false }
         if (!valid()) {
           try { await closeCopilotChat(sid) } catch (e) { current.cleanupFailed = true; if (current.mounted) setError(message(e)) }
           return
         }
+        current.cid = owner.conversation_id
+        setSelected({ id: owner.conversation_id, agent: selectedAgent, account_id: selectedAccount, model: model.trim(), permission_mode: mode, title: text.slice(0, 100), created_at: '', updated_at: '', state: 'open', revision: 1, can_resume: false, reason: '' })
         current.sid = sid; setSession(sid)
       }
       const controller = new AbortController(); current.controller = controller
       await streamCopilotTurn(sid, text, controller.signal, frame => { if (valid()) receive(frame) })
-      if (valid()) setItems(old => old.map(item => ({ ...item, resolved: true })))
+      if (valid()) { setItems(old => old.map(item => ({ ...item, resolved: true }))); refresh() }
     } catch (e) {
+      if (e instanceof CopilotChatCleanupError) current.cleanupFailed = true
       if (valid()) { setError(message(e)); await close() }
     } finally {
       if (valid() || (current.mounted && !current.sid && !current.creating && !current.closing)) { current.busy = false; current.controller = null; setBusy(false) }
@@ -153,13 +229,27 @@ function Preview({ userSub }: { userSub: string }) {
   }
   return <section aria-label="Copilot chat preview" className="border border-p-border-light rounded-xl p-4 space-y-3">
     <h3 className="font-medium text-p-text">Copilot chat preview</h3>
-    <p className="text-sm text-p-text-secondary">Chat using your GitHub account and an agent's local workspace. Native tools follow OtoDock permissions. This preview is separate from your regular chat list. Reloading clears the page transcript; Copilot history is retained on the server. Closing, losing the connection, or five minutes idle ends the session.</p>
+    <p className="text-sm text-p-text-secondary">Chat using your GitHub account and an agent's local workspace. Native tools follow OtoDock permissions. Conversations and Copilot history are saved on this server, separately from your regular chat list. Open a saved transcript to read it; resume a cleanly closed conversation explicitly. Interrupted conversations are read-only. Closing, losing the connection, or five minutes idle ends the session.</p>
     {!status.data ? <p role="status" className="text-sm text-p-text-secondary">{status.isLoading ? 'Checking chat availability…' : 'Copilot chat is not enabled on this server.'}</p> : <>
-      <fieldset disabled={busy || !!session} className="grid gap-2 sm:grid-cols-2 text-sm text-p-text">
-        <label>Agent<select className={input} value={selectedAgent} onChange={e => setAgent(e.target.value)}><option value="">Select an agent</option>{(agents.data ?? []).map(a => <option key={a.name} value={a.name}>{a.display_name || a.name}</option>)}</select></label>
-        <label>Personal Copilot account<select className={input} value={selectedAccount} onChange={e => setAccount(e.target.value)}><option value="">Select an account</option>{eligible.map(a => <option key={a.id} value={a.id}>{a.label || a.principal_id}</option>)}</select></label>
-        <label>Model ID (preview)<input className={input} maxLength={256} value={model} onChange={e => setModel(e.target.value)} /></label>
-        <label>Permission mode<select className={input} value={mode} onChange={e => setMode(e.target.value as ChatMode)}><option value="default">Ask when needed</option><option value="acceptEdits">Accept edits</option><option value="plan">Plan only</option><option value="dontAsk">Deny actions needing approval</option></select></label>
+      <div aria-label="Saved Copilot conversations" className="space-y-2">
+        <h4 className="text-sm font-medium">Saved conversations</h4>
+        {saved.isError ? <p role="alert" className="text-sm text-red-500">Saved conversations could not be loaded.</p> : saved.isLoading ? <p role="status">Loading saved conversations…</p> : !saved.data?.conversations.length ? <p className="text-sm">No saved conversations on this page.</p> : <ul className="space-y-1">
+          {saved.data.conversations.map(row => <li key={row.id}><button type="button" className={button} disabled={busy || life.current.cleanupFailed} aria-pressed={selected?.id === row.id} onClick={() => void openHistory(row)}>{row.title || 'Untitled conversation'} — {row.agent} · {row.state}</button></li>)}
+        </ul>}
+        <div className="flex gap-2"><button type="button" className={button} disabled={offset === 0 || saved.isFetching} onClick={() => setOffset(value => Math.max(0, value - 20))}>Previous conversations</button><button type="button" className={button} disabled={!saved.data?.has_more || saved.isFetching} onClick={() => setOffset(value => value + 20)}>Next conversations</button></div>
+      </div>
+      {selected && !session && <div className="space-y-2 text-sm">
+        <p>{loading ? 'Loading saved transcript…' : `Saved conversation: ${selected.title || 'Untitled conversation'} (${selected.state}). Read-only until resumed.`}</p>
+        {!savedAccountAvailable && <p>The saved personal account is unavailable. A different account will not be substituted.</p>}
+        {!savedAgentAvailable && <p>The saved agent is unavailable.</p>}
+        {!selected.can_resume && selected.reason && <p>{selected.reason}</p>}
+        <button type="button" className={button} disabled={busy || loading || !selected.can_resume || !savedAccountAvailable || !savedAgentAvailable || life.current.cleanupFailed} onClick={() => void resume()}>Resume conversation</button>
+      </div>}
+      <fieldset disabled={busy || loading || !!session || !!selected} className="grid gap-2 sm:grid-cols-2 text-sm text-p-text">
+        <label>Agent<select className={input} value={selectedAgent} onChange={e => setAgent(e.target.value)}><option value="">Select an agent</option>{selected && !savedAgentAvailable && <option value={selected.agent}>Saved agent unavailable</option>}{(agents.data ?? []).map(a => <option key={a.name} value={a.name}>{a.display_name || a.name}</option>)}</select></label>
+        <label>Personal Copilot account<select className={input} value={selectedAccount} onChange={e => setAccount(e.target.value)}><option value="">Select an account</option>{selected && !savedAccountAvailable && <option value={selected.account_id}>Saved account unavailable</option>}{eligible.map(a => <option key={a.id} value={a.id}>{a.label || a.principal_id}</option>)}</select></label>
+        <label>Model ID (preview)<input className={input} maxLength={256} value={selected?.model ?? model} onChange={e => setModel(e.target.value)} /></label>
+        <label>Permission mode<select className={input} value={selected?.permission_mode ?? mode} onChange={e => setMode(e.target.value as ChatMode)}><option value="default">Ask when needed</option><option value="acceptEdits">Accept edits</option><option value="plan">Plan only</option><option value="dontAsk">Deny actions needing approval</option></select></label>
       </fieldset>
       <p className="text-xs text-p-text-secondary">The selected account must have access to the model. GitHub account validation alone does not verify Copilot entitlement.</p>
       {(agents.isError || accounts.isError) && <p role="alert" className="text-sm text-red-500">Agents or accounts could not be loaded. Refresh this page to try again.</p>}
@@ -173,8 +263,8 @@ function Preview({ userSub }: { userSub: string }) {
         </fieldset> : <div key={item.key} className="text-sm text-p-text"><strong>{item.kind === 'user' ? 'You' : item.kind === 'tool' ? 'Tool activity' : 'Copilot'}</strong><pre className="whitespace-pre-wrap break-words font-sans">{item.text}</pre></div>)}
       </div>
       <form onSubmit={send} className="space-y-2">
-        <label className="block text-sm text-p-text">Message<textarea className={input} maxLength={32768} rows={3} value={prompt} disabled={busy} onChange={e => setPrompt(e.target.value)} /></label>
-        <div className="flex gap-2"><button className={button} disabled={busy || !prompt.trim() || !selectedAgent || !selectedAccount || !model.trim() || life.current.cleanupFailed}>Send</button>
+        <label className="block text-sm text-p-text">Message<textarea className={input} maxLength={32768} rows={3} value={prompt} disabled={busy || loading || (!!selected && !session)} onChange={e => setPrompt(e.target.value)} /></label>
+        <div className="flex gap-2"><button className={button} disabled={busy || loading || (!!selected && !session) || !prompt.trim() || !selectedAgent || !selectedAccount || !(selected?.model ?? model).trim() || life.current.cleanupFailed}>Send</button>
           <button className={button} type="button" disabled={!busy && !session} onClick={() => void close()}>{busy ? 'Stop and close' : 'Close chat'}</button>
           <button className={button} type="button" disabled={busy || life.current.cleanupFailed} onClick={() => void newChat()}>New chat</button></div>
       </form>
