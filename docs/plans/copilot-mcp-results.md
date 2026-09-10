@@ -147,3 +147,39 @@ permission boundary, including real interceptor stripping with repository tokens
 preserved. HTTP MCP, MCP authentication renewal, elicitation, sandboxed
 MCP startup, remote workers, and runtime failure recovery remain unverified by
 this probe.
+
+## Configuration follow-up
+
+The session-contract branch adds
+[`wrap_stdio_servers`](../../proxy/core/layers/copilot/mcp_config.py), now used
+by the wrapped live probe. It always wraps explicitly configured stdio servers,
+including those with no broker/path marker. It merges existing strip lists,
+removes inference-token entries from the resulting config, preserves per-tool
+filters and separately selected repository credentials, and leaves the source
+config unmodified. Reapplying it does not nest the same interceptor. HTTP/SSE
+and malformed configurations fail explicitly; HTTP policy support remains open.
+
+The [recorded live result](evidence/copilot-mcp-config.json) passed one exact
+fixture call, one permission approval, all three inference-token variables
+absent in the child, and ordinary runtime cleanup. The live stream also passes
+through the new completion coordinator: fresh task, permission, input-queue,
+and processing snapshots yield one DONE, with zero replayed DONEs or mapping
+errors. Offline tests also verify
+stripping after broker injection and preservation of a brokered repository
+token. This is configuration and interceptor evidence, not a live Oto broker
+integration test or production engine registration.
+
+Review exposed an existing interceptor bug: a case-insensitive removal deleted
+only the first spelling of an environment key. POSIX permits multiple spellings
+at once. The interceptor now removes every variant while preferring the exact
+name's value when a return value is needed. The source was synchronized into
+the satellite with `scripts/sync-satellite-code.sh`, including its integrity
+hash. This shared fix applies to existing engines as well.
+
+Independent review also reproduced a broker bundle replacing `OTO_STRIP_KEYS`
+or reinjecting `OTO_MCP_FETCH_TOKEN`. The interceptor now captures the launcher's
+strip policy before merging credentials and refuses those reserved keys from
+the bundle, including case variants. Regression tests prove that broker-injected
+inference credentials are removed while an authorized repository token survives.
+The live fixture does not use a broker. The added broker regression uses
+controlled in-memory bundles.

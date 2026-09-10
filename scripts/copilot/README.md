@@ -109,7 +109,23 @@ existing wrapper. That variant additionally requires the Copilot inference and
 connection-token variables to be absent from the fixture's environment. It does
 not establish filesystem/process-information isolation or wire production MCPs.
 
+The wrapped variant now uses the adapter's `wrap_stdio_servers` configuration
+helper. It wraps every explicitly supplied stdio server, merges existing broker
+strip lists, preserves tool filters and repository credentials, and rejects
+unsupported transports. See the [configuration follow-up](../../docs/plans/copilot-mcp-results.md#configuration-follow-up).
+
 ## Offline regression tests
+
+The [native terminal probe](../../docs/plans/copilot-terminal-results.md) runs a
+real SDK → PTY → SDK history round trip with a separately verified full CLI.
+The [lifecycle probe](../../docs/plans/copilot-lifecycle-results.md) exercises
+abort, interrupt, immediate input, compaction, and the task registry in separate
+bounded scenarios. Both require explicit live-account selection; their reports
+record limitations as well as passing checks.
+
+The MCP probe also routes real events through the
+[completion coordinator](../../docs/plans/copilot-session-contract.md) and checks
+that fresh runtime snapshots produce one completion and no replayed completion.
 
 With the repository's test dependencies and `psutil` installed:
 

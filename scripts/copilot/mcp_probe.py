@@ -19,10 +19,13 @@ import psutil
 from mcp_fixture import MARKER
 from probe import SDK_VERSION, RUNTIME_VERSION, child_environment, selected_token, stop_descendants
 
-SERVER = "oto-fixture"
-INFERENCE_TOKEN_NAMES = (
-    "COPILOT_SDK_AUTH_TOKEN", "COPILOT_CONNECTION_TOKEN", "COPILOT_GITHUB_TOKEN",
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "proxy"))
+from core.layers.copilot.mcp_config import INFERENCE_TOKEN_NAMES, wrap_stdio_servers  # noqa: E402
+from core.layers.copilot.coordinator import (  # noqa: E402
+    CopilotTurnCoordinator, SettlementObservation, TaskObservation, TaskState,
 )
+
+SERVER = "oto-fixture"
 
 
 def fixture_server(audit: Path, otodock_interceptor: bool) -> dict:
@@ -34,8 +37,9 @@ def fixture_server(audit: Path, otodock_interceptor: bool) -> dict:
     }
     if otodock_interceptor:
         interceptor = Path(__file__).resolve().parents[2] / "proxy/core/stdio_path_interceptor.py"
-        config["args"] = [str(interceptor), "--", sys.executable, *fixture_args]
-        config["env"] = {"OTO_STRIP_KEYS": ",".join(INFERENCE_TOKEN_NAMES)}
+        config = wrap_stdio_servers(
+            {SERVER: config}, interpreter=sys.executable, interceptor_path=str(interceptor),
+        )[SERVER]
     return config
 
 
@@ -68,6 +72,26 @@ async def run(args, report):
     permissions = Counter()
     events = Counter()
     observed = {}
+    coordinator = CopilotTurnCoordinator()
+    common_events = Counter()
+    open_tools = set()
+    mapping_errors = Counter()
+    sequence = 0
+
+    def receive(event):
+        nonlocal sequence
+        sequence += 1
+        raw = event.to_dict()
+        kind = raw["type"]
+        events[kind] += 1
+        if kind == "tool.execution_start":
+            open_tools.add(raw["data"]["toolCallId"])
+        elif kind == "tool.execution_complete":
+            open_tools.discard(raw["data"]["toolCallId"])
+        try:
+            common_events.update(e.type for e in coordinator.receive_event(sequence, raw))
+        except (ValueError, RuntimeError, TypeError) as exc:
+            mapping_errors[type(exc).__name__] += 1
 
     def decide(request, _invocation):
         report.setdefault("permission_shapes", []).append(request_shape(request))
@@ -113,7 +137,7 @@ async def run(args, report):
                     on_permission_request=decide,
                     enable_config_discovery=False, enable_file_hooks=False,
                     enable_host_git_operations=False, enable_session_store=False,
-                    on_event=lambda event: events.update([event.raw_type or event.type.value]),
+                    on_event=receive,
                     session_limits={"max_ai_credits": 30.0},
                     mcp_servers={SERVER: fixture_server(audit, args.otodock_interceptor)},
                 )
@@ -134,6 +158,31 @@ async def run(args, report):
                 assert permissions["fixture_approved"] == 1, "MCP permission not observed once"
                 assert not permissions["other_denied"], "unexpected tool permission requested"
                 assert report["returned_marker"] == MARKER, "fixture result did not reach final response"
+                # No SDK-hosted tools or asynchronous permission callbacks are
+                # exposed by this probe. Track native tool events and fetch the
+                # runtime snapshots AFTER capturing the coordinator checkpoint.
+                checkpoint = coordinator.begin_reconciliation()
+                assert checkpoint is not None, "no current idle candidate"
+                tasks = await session.rpc.tasks.list(timeout=5)
+                pending = await session.rpc.permissions.pending_requests(timeout=5)
+                queued = await session.rpc.queue.pending_items(timeout=5)
+                processing = await session.rpc.metadata.is_processing(timeout=5)
+                assert not queued.items and not queued.steering_messages, "pending native input"
+                observation = SettlementObservation(
+                    processing=processing.processing,
+                    tasks=tuple(TaskObservation(task.id, TaskState(task.status.value)) for task in tasks.tasks),
+                    pending_permissions=frozenset(item.request_id for item in pending.items),
+                    pending_tools=frozenset(open_tools),
+                    pending_messages=frozenset(),  # One awaited send; no local queue.
+                )
+                settled = coordinator.finish_reconciliation(checkpoint, observation)
+                report["coordinator_done_count"] = sum(event.type == "done" for event in settled)
+                report["coordinator_replayed_done_count"] = len(
+                    coordinator.finish_reconciliation(checkpoint, observation),
+                )
+                report["coordinator_mapping_errors"] = dict(mapping_errors)
+                assert not mapping_errors and report["coordinator_done_count"] == 1
+                assert report["coordinator_replayed_done_count"] == 0
                 if args.otodock_interceptor:
                     assert not any(records[0]["token_presence"][name] for name in INFERENCE_TOKEN_NAMES), (
                         "interceptor did not strip inference credentials"
@@ -152,6 +201,7 @@ async def run(args, report):
                 report["tracked_descendants_reaped"] = stop_descendants(remaining)
                 report["permission_counts"] = dict(permissions)
                 report["event_counts"] = dict(sorted(events.items()))
+                report["common_event_counts"] = dict(sorted(common_events.items()))
                 assert report["tracked_descendants_reaped"]
                 if args.otodock_interceptor:
                     assert report["sdk_cleanup"] == "passed", "interceptor required force cleanup"

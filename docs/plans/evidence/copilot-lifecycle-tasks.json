@@ -1,0 +1,29 @@
+{
+  "result": "passed",
+  "scenario": "tasks",
+  "sandboxed": false,
+  "sdk_version": "1.0.13",
+  "runtime_version": "1.0.83",
+  "registered": true,
+  "running_snapshot": [
+    {
+      "type": "client",
+      "status": "running",
+      "sequence": 0
+    }
+  ],
+  "duplicate_registration_same_task": true,
+  "completion_applied": true,
+  "completed_snapshot": [
+    {
+      "type": "client",
+      "status": "completed",
+      "sequence": 1
+    }
+  ],
+  "duplicate_update_recognized": true,
+  "removed": true,
+  "final_snapshot": [],
+  "sdk_cleanup": "passed",
+  "tracked_descendants_reaped": true
+}

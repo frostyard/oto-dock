@@ -31,6 +31,12 @@ def test_pop_ci_case_insensitive():
     assert itc._pop_ci(env, "missing") is None
 
 
+def test_pop_ci_removes_all_variants_preferring_exact_name():
+    env = {"foo": "lower", "Foo": "mixed", "FOO": "exact", "KEEP": "value"}
+    assert itc._pop_ci(env, "FOO") == "exact"
+    assert env == {"KEEP": "value"}
+
+
 # ── _apply_broker_credentials: merge + strip ───────────────────────────────
 
 def test_apply_merges_creds_and_strips_token(monkeypatch):
@@ -50,6 +56,17 @@ def test_apply_fail_closed_injects_nothing(monkeypatch):
     env = {"OTO_MCP_FETCH_TOKEN": "captok"}
     itc._apply_broker_credentials(env)
     assert env == {}                          # token stripped, nothing injected
+
+
+def test_broker_bundle_cannot_override_strip_policy_or_reinject_capability(monkeypatch):
+    monkeypatch.setattr(itc, "_fetch_mcp_credentials", lambda token, **kw: {"env": {
+        "OTO_STRIP_KEYS": "", "oto_strip_keys": "",
+        "OTO_MCP_FETCH_TOKEN": "reinjected", "oto_mcp_fetch_token": "reinjected",
+        "GH_TOKEN": "repo-secret", "INFERENCE_SECRET": "must-remove",
+    }})
+    env = {"OTO_MCP_FETCH_TOKEN": "capability", "OTO_STRIP_KEYS": "INFERENCE_SECRET"}
+    itc._apply_broker_credentials(env)
+    assert env == {"GH_TOKEN": "repo-secret"}
 
 
 def test_apply_no_token_skips_fetch(monkeypatch):

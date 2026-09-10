@@ -60,3 +60,17 @@ The [release image and update-channel audit](../development/frostyard-releases.m
 records the remaining upstream boundaries and the fork's source-build policy.
 Together with the executed CI baseline, this completes C0. It does not establish
 any Copilot runtime capability or satisfy the later parity acceptance gates.
+
+## Session-contract follow-up
+
+The first [PR #4 run](https://github.com/frostyard/oto-dock/actions/runs/34417698863/attempts/1)
+passed dashboard, satellite, Copilot tests (104 plus 40 subtests), and Ruff.
+The proxy result was 7,995 passed and one failure in the existing watchdog
+stall test: no warning was captured. Audio was skipped after that failure.
+
+That test blocked the loop for 0.9 seconds while the watchdog sampled every
+0.5 seconds, then assumed a warning had occurred. Depending on relative timer
+scheduling, the heartbeat could resume before the watchdog observed enough lag.
+The follow-up changes only the test: a bounded signal from the actual warning
+handler ends the blocked call, and recovery is observed explicitly. Production
+watchdog behavior is unchanged. The PR records the final regression result.

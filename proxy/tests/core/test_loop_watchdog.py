@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-import time
+import threading
 
 import pytest
 
@@ -18,20 +18,37 @@ def _clean():
     wd.reset_stats()
 
 
-def _blocking_call_for_the_test():
-    time.sleep(0.9)
+def _blocking_call_for_the_test(warning_seen):
+    # Keep the loop blocked until the independent watchdog actually samples
+    # the stall, rather than racing its 0.5-second polling interval.
+    assert warning_seen.wait(timeout=5), "no stall warning logged"
 
 
 @pytest.mark.asyncio
 async def test_stall_is_logged_with_loop_stack_and_counted(caplog):
     caplog.set_level(logging.INFO, logger="claude-proxy.loop-watchdog")
-    assert wd.start(threshold_s=0.2)
-    await asyncio.sleep(0.6)  # let the first tick land
+    warning_seen = threading.Event()
+    recovery_seen = threading.Event()
 
-    _blocking_call_for_the_test()  # blocks the loop thread ~0.9 s
+    class WatchdogEvents(logging.Handler):
+        def emit(self, record):
+            message = record.getMessage()
+            if record.levelno == logging.WARNING and "event loop stalled" in message:
+                warning_seen.set()
+            elif record.levelno == logging.INFO and "recovered after" in message:
+                recovery_seen.set()
 
-    await asyncio.sleep(1.2)  # ticks resume → recovery is detected
-    wd.stop()
+    handler = WatchdogEvents()
+    wd.logger.addHandler(handler)
+    try:
+        assert wd.start(threshold_s=0.2)
+        await asyncio.sleep(0)  # let the newly scheduled heartbeat initialize
+        _blocking_call_for_the_test(warning_seen)
+        # Waiting in a worker leaves the event loop free to resume heartbeats.
+        assert await asyncio.to_thread(recovery_seen.wait, 5), "no recovery logged"
+    finally:
+        wd.stop()
+        wd.logger.removeHandler(handler)
 
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert warnings, "no stall warning logged"
@@ -41,7 +58,7 @@ async def test_stall_is_logged_with_loop_stack_and_counted(caplog):
     assert any("recovered after" in m for m in infos)
     s = wd.stats()
     assert s["stalls"] == 1
-    assert 0.5 < s["last_stall_s"] < 3.0
+    assert s["last_stall_s"] >= s["threshold_s"]
     assert s["max_stall_s"] == s["last_stall_s"]
 
 

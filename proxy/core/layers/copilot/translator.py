@@ -75,6 +75,11 @@ class CopilotEventTranslator:
     def _system(subtype: str, **data) -> CommonEvent:
         return CommonEvent(SYSTEM, {"subtype": subtype, **data})
 
+    @property
+    def pending_idle_id(self) -> str | None:
+        """Current runtime idle candidate, invalidated by subsequent activity."""
+        return self._idle_id
+
     def translate(self, event: dict) -> list[CommonEvent]:
         if not isinstance(event, dict):
             raise ValueError("Copilot event must be a serialized dictionary")
@@ -253,3 +258,24 @@ class CopilotEventTranslator:
         self._idle_id = None
         self._settled_generation = self._generation
         return [CommonEvent(DONE)]
+
+    def reconcile_cancelled_tools(self, tool_ids: frozenset[str]) -> list[CommonEvent]:
+        """Close known tool displays after externally confirmed cancellation.
+
+        Only the coordinator may call this after a current runtime snapshot and
+        cancellation/join of every corresponding host callback. An abort ACK or
+        an empty native task list is not evidence: SDK callbacks can survive both.
+        Validate the entire batch before mutation; never invent an unknown tool
+        or report successful execution for a cancelled operation.
+        """
+        if not isinstance(tool_ids, frozenset) or any(
+            tool_id not in self._tools or tool_id in self._completed_tools
+            for tool_id in tool_ids
+        ):
+            raise ValueError("Cancellation proof must identify known open Copilot tools")
+        events = []
+        for tool_id in sorted(tool_ids):
+            events.extend(self._tool_result(tool_id, {
+                "success": False, "error": {"message": "Tool execution cancelled."},
+            }))
+        return events

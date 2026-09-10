@@ -89,13 +89,26 @@ durable replay and bounded retention remain session-layer work.
 
 ## C1 still required
 
+The next session-contract slice adds a passing native SDK → PTY → SDK history
+round trip, recorded control/compaction/task behavior, mandatory stdio MCP
+wrapping, and a tested completion coordinator. See the
+[terminal results](copilot-terminal-results.md),
+[lifecycle results](copilot-lifecycle-results.md), and
+[coordinator contract](copilot-session-contract.md). Its live MCP check produces
+one reconciled completion with no duplicate, while preserving credential
+stripping and ordinary runtime cleanup. These are additional compatibility
+proofs and implementation foundations, not completion of C1 or engine parity.
+
 - Full SDK tool/policy and persistence flows inside the actual sandbox; the
   combined startup/DNS/no-tool inference path is now proven.
 - Stdio/HTTP MCP, credential broker integration, question/permission recovery,
   and native tool/background enforcement beyond the single write denial.
-- Native terminal/headless history handoff and single-writer ownership.
-- Mid-turn controls, compaction, goals, background settlement, and cancellation
-  tested with live runtime behavior rather than API declarations alone.
+- Native terminal policy/tool-history handoff, centralized writer ownership,
+  and crash/reconnect behavior beyond the passing sequential no-tool round trip.
+- Production control semantics, including interrupt settlement when no new idle
+  arrives, immediate input waiting on a tool, actual callback cancellation/join,
+  goals, and background subagent/shell recovery. Compaction preserved the short
+  test history but increased tokens; do not assume every compaction saves space.
 - Credential expiry/refresh, multi-account concurrency, organization entitlement,
   and all supported satellite operating systems.
 
