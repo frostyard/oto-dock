@@ -28,6 +28,12 @@ Local PostgreSQL was unavailable; database integration checks run in full CI.
 Exact test counts and the final commit's CI status are recorded in the pull
 request and [tracking issue](https://github.com/frostyard/oto-dock/issues/1).
 
+The first full run passed 9,075 proxy tests, including the ledger cases, but
+failed the schema-wide agent-deletion coverage guard. The ledger was then added
+to its documented retention list: deleting unresolved receipts would erase
+restart quarantine. A target-agent deletion and slug-reuse regression also
+checks that this retained identity cannot be rebound to new work.
+
 These checks establish deterministic recovery behavior. They do not demonstrate
 live process re-adoption, recovery of old unrecorded workers, Copilot repository
 workers or complete organization-level parity. See the

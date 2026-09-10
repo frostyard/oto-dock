@@ -371,6 +371,20 @@ def test_schema_upgrade_drops_old_cascades_without_erasing_receipt(conversation)
     assert store.finish(receipt, result(receipt)) is True
 
 
+def test_target_agent_delete_and_recreate_never_rebinds_receipt(conversation):
+    agent_store.create_agent("repo", "Original target")
+    receipt = reserve(conversation)
+    assert agent_store.delete_agent("repo")
+    assert store.list_unsettled() == [receipt]
+    assert store.list_outcomes(conversation["id"], OWNER)[0]["recovery_state"] == "unverified"
+    agent_store.create_agent("repo", "Replacement target")
+    assert store.list_unsettled() == [receipt]
+    assert store.finish(receipt, result(receipt)) is True
+    assert store.list_outcomes(conversation["id"], OWNER)[0]["output"] == "Reviewed fixture"
+    # Recreating the slug cannot convert the original invocation into new work.
+    assert reserve(conversation) is None
+
+
 def test_memory_deleted_parent_keeps_exact_receipt_authority(memory):
     h, ledger, row = memory
     receipt = ledger.reserve(row["id"], OWNER, row["generation"], "call", arguments(), allocation())
