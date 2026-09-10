@@ -16,6 +16,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'proxy'))
 from core.layers.copilot import runtime as module
+from core.layers.copilot.credentials import CopilotCredential, CredentialKind, CredentialUnavailableError
 
 
 def async_test(function):
@@ -313,3 +314,156 @@ def test_module_import_has_no_sdk_or_platform_configuration_side_effects():
               'import core.layers.copilot.runtime; '
               'assert "config" not in sys.modules; assert "copilot" not in sys.modules')
     subprocess.run([sys.executable, '-I', '-c', script], check=True, timeout=2)
+
+
+def credential(kind=CredentialKind.USER_TOKEN, expires_at=200):
+    token = 'ghu_privatefixture' if kind is CredentialKind.USER_TOKEN else 'ghs_privatefixture'
+    return CopilotCredential('account', 'principal', 'revision', kind, token, expires_at)
+
+
+def capture_sdk(monkeypatch):
+    sdk = ModuleType('copilot')
+    sdk.CopilotClient = SimpleNamespace
+    sdk.RuntimeConnection = SimpleNamespace(for_stdio=lambda **kwargs: kwargs)
+    monkeypatch.setitem(sys.modules, 'copilot', sdk)
+    monkeypatch.setattr(module.importlib.metadata, 'version', lambda _: module.SDK_VERSION)
+    return sdk
+
+
+@pytest.mark.parametrize('kind', [CredentialKind.USER_TOKEN, CredentialKind.INSTALLATION_TOKEN, None])
+def test_explicit_credential_selects_exact_sdk_channel(monkeypatch, tmp_path, kind):
+    capture_sdk(monkeypatch)
+    monkeypatch.setattr(module.time, 'time', lambda: 100)
+    selected = credential(kind) if kind else None
+    runtime = new_runtime(tmp_path, credential=selected)
+    client = runtime._make_client(['fake-sandbox'])
+    expected_user = selected.token if kind is CredentialKind.USER_TOKEN else None
+    assert client.github_token == expected_user
+    if kind is CredentialKind.INSTALLATION_TOKEN:
+        assert client.env['COPILOT_GITHUB_TOKEN'] == selected.token
+    else:
+        assert 'COPILOT_GITHUB_TOKEN' not in client.env
+    assert 'COPILOT_SDK_AUTH_TOKEN' not in client.env
+    assert client.use_logged_in_user is False and client.mode == 'empty'
+    if selected:
+        assert selected.token not in repr(runtime)
+        assert selected.token not in repr(selected)
+        assert selected.token not in repr(client.connection)
+    assert 'COPILOT_GITHUB_TOKEN' not in runtime.environment
+
+
+@async_test
+async def test_expired_credential_fails_before_sandbox_or_sdk_start(monkeypatch, tmp_path):
+    monkeypatch.setattr(module.time, 'time', lambda: 200)
+    runtime = new_runtime(tmp_path, credential=credential())
+
+    def forbidden_command():
+        pytest.fail('Expired credential reached sandbox construction')
+
+    monkeypatch.setattr(runtime, '_command', forbidden_command)
+    with pytest.raises(RuntimeError, match='Copilot runtime startup failed') as exc:
+        await runtime.start()
+    assert 'privatefixture' not in ''.join(traceback.format_exception(exc.value))
+    assert runtime._temporary is None and runtime._client is None
+    assert runtime._credential is None and runtime._token is None
+
+
+def test_credential_expiry_rechecked_before_client_construction(monkeypatch, tmp_path):
+    monkeypatch.setattr(module.time, 'time', lambda: 200)
+    runtime = new_runtime(tmp_path, credential=credential())
+    with pytest.raises(CredentialUnavailableError):
+        runtime._make_client(['fake-sandbox'])
+
+
+def test_explicit_credential_cannot_mix_with_legacy_token(tmp_path):
+    for legacy in ('ghu_otherfixture', ''):
+        with pytest.raises(ValueError, match='mutually exclusive') as exc:
+            new_runtime(tmp_path, credential=credential(), github_token=legacy)
+        assert 'privatefixture' not in str(exc.value) and 'otherfixture' not in str(exc.value)
+
+
+@pytest.mark.parametrize('variable', [
+    'GITHUB_COPILOT_API_TOKEN', 'github_copilot_api_token', 'COPILOT_API_URL', 'copilot_api_url',
+    'COPILOT_GITHUB_TOKEN',
+])
+def test_installation_channel_cannot_bypass_caller_environment_rejection(monkeypatch, tmp_path, variable):
+    monkeypatch.setattr(module.time, 'time', lambda: 100)
+    runtime = new_runtime(tmp_path, credential=credential(CredentialKind.INSTALLATION_TOKEN))
+    runtime.environment[variable] = 'private-override'
+    with pytest.raises(ValueError, match='Ambient credentials') as exc:
+        runtime._make_client(['fake-sandbox'])
+    assert 'private-override' not in str(exc.value)
+
+
+@async_test
+async def test_close_drops_live_credential_reference(monkeypatch, tmp_path):
+    monkeypatch.setattr(module.time, 'time', lambda: 100)
+    runtime, client = fake_runtime(monkeypatch, tmp_path)
+    runtime._credential = credential()
+    await runtime.start()
+    await runtime.close()
+    assert client.stopped and runtime._credential is None
+
+
+def state_mount_runtime(monkeypatch, tmp_path, *, with_state=True):
+    boundary = ModuleType('core.sandbox.sandbox')
+    boundary._NETNS_LAUNCHER = tmp_path / 'oto-sandbox-net'
+    assets = tmp_path / 'assets'
+    assets.mkdir()
+
+    class Builder:
+        def build_command_prefix(self, inner):
+            # Community mounts cannot expose the private host state root. Its
+            # absence models the actual SandboxBuilder allowlist faithfully.
+            return [str(boundary._NETNS_LAUNCHER), '--block-private', '--forward', '1', '--',
+                    'bwrap', '--unshare-pid', '--die-with-parent', '--cap-drop', 'ALL',
+                    '--ro-bind', str(assets), '/opt/copilot-runtime', '--tmpfs', '/var', '--', *inner]
+
+    boundary.SandboxBuilder = Builder
+    monkeypatch.setitem(sys.modules, 'core.sandbox.sandbox', boundary)
+    state = module.PrivateCopilotSessionState.create(tmp_path) if with_state else None
+    runtime = new_runtime(tmp_path, credential=credential(), session_state=state)
+    runtime.sandbox_state_directory = module.SANDBOX_STATE_DIRECTORY
+    runtime.runtime_path = assets / 'copilot-runtime'
+    runtime.runtime_path.write_bytes(b'fake-runtime')
+    runtime.runtime_path.chmod(0o700)
+    runtime.runtime_path.with_name('runtime.node').write_bytes(b'fake-assets')
+    runtime.builder = Builder()
+    return runtime, state
+
+
+@async_test
+async def test_trusted_state_mount_is_last_and_survives_runtime_close(monkeypatch, tmp_path):
+    runtime, state = state_mount_runtime(monkeypatch, tmp_path)
+    try:
+        path = state.path
+        command = runtime._command()
+        assert command[-5:] == ['--bind', str(path), module.SANDBOX_STATE_DIRECTORY,
+                               '--', runtime.sandbox_runtime_path]
+        assert command.index('--tmpfs') < command.index('--bind')
+        await runtime.close()
+        assert state.path == path and path.is_dir()
+    finally:
+        state.discard()
+
+
+def test_typed_launch_requires_private_state(monkeypatch, tmp_path):
+    runtime, _ = state_mount_runtime(monkeypatch, tmp_path, with_state=False)
+    with pytest.raises(ValueError, match='require private session state'):
+        runtime._command()
+
+
+@pytest.mark.parametrize('failure', ['discarded', 'wrong-destination', 'overlapping-assets'])
+def test_private_state_cannot_be_replaced_or_overlay_runtime(monkeypatch, tmp_path, failure):
+    runtime, state = state_mount_runtime(monkeypatch, tmp_path)
+    try:
+        if failure == 'discarded':
+            state.discard()
+        elif failure == 'wrong-destination':
+            runtime.sandbox_state_directory = '/workspace/.copilot'
+        else:
+            runtime.runtime_path = state.path / 'copilot-runtime'
+        with pytest.raises((ValueError, RuntimeError)):
+            runtime._command()
+    finally:
+        state.discard()

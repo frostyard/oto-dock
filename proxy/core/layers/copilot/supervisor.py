@@ -55,6 +55,7 @@ class CopilotSessionSupervisor:
         self, *, pending_requests: Callable[[], frozenset[str] | None],
         close_runtime: Callable[[], Awaitable[None]], queue_capacity: int = 512,
         rpc_timeout: float = 10, turn_timeout: float = 90,
+        authorize_submission: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         if (type(queue_capacity) is not int or queue_capacity < 1
                 or any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0
@@ -65,6 +66,7 @@ class CopilotSessionSupervisor:
         self.callbacks = CallbackRegistry(on_change=self.invalidate_observation)
         self._pending_requests = pending_requests
         self._close_runtime = close_runtime
+        self._authorize_submission = authorize_submission
         self._backend: SessionBackend | None = None
         self._events: deque[CommonEvent] = deque()
         self._capacity = queue_capacity
@@ -150,6 +152,10 @@ class CopilotSessionSupervisor:
         except Exception:
             self._fail("Copilot event stream is invalid")
 
+    def invalidate_credentials(self) -> None:
+        """Called by the account observer even while the consumer is paused."""
+        self._fail("Copilot account authorization changed; reconnect the session")
+
     async def _submit(self, prompt: str, *, immediate: bool = False,
                       stream_generation: int | None = None) -> str:
         if not isinstance(prompt, str) or not prompt.strip():
@@ -162,6 +168,27 @@ class CopilotSessionSupervisor:
             backend = self._check()
             if self._control_awaiting_settlement:
                 raise SessionSupervisorError("Copilot control awaiting settlement; new input was not submitted")
+            if self._authorize_submission is not None:
+                authorization_failed = False
+                try:
+                    async with asyncio.timeout(self._rpc_timeout):
+                        await self._authorize_submission()
+                except asyncio.CancelledError:
+                    self.invalidate_credentials()
+                    raise
+                except Exception:
+                    self.invalidate_credentials()
+                    authorization_failed = True
+                if authorization_failed:
+                    # Provider/store callbacks can carry tokens in exceptions;
+                    # leave that exception suite before raising the public error.
+                    raise self._failure
+                # Settlement can progress while account validation awaits I/O.
+                backend = self._check()
+                if stream_generation is not None and (
+                    not self._active or self._finishing or self._stream_generation != stream_generation
+                ):
+                    raise SessionSupervisorError("No active Copilot stream to submit to")
             self.coordinator.invalidate_observation(new_submission=True)
             self._interrupt_ticket = None
             dispatch_id = str(uuid.uuid4())

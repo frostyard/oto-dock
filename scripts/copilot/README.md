@@ -144,6 +144,26 @@ only waits in host Python and has no external side effects; the native runtime
 runs inside the sandbox. See the [supervisor results](../../docs/plans/copilot-supervisor-results.md)
 for exact guarantees, the runtime's minimum 30-credit ceiling, and remaining gates.
 
+## Scoped credentials and runtime replacement
+
+`account_probe.py` uses typed credentials, private state and the account observer
+with two sequential real sandbox runtimes. It requires the same Linux/proxy/SDK
+setup as the supervisor probe:
+
+```bash
+python scripts/copilot/account_probe.py \
+  --runtime-dir /tmp/otodock-copilot-runtime/prebuilds/linux-x64 \
+  --live --use-gh-token --output /tmp/copilot-account-restart.json
+```
+
+The probe uses at most two short prompts and an in-memory credential source.
+It selects the same GitHub CLI user token for both generations, checks sequential
+history resume, changes the observed generation to trigger independent cleanup,
+and checks that a no-auth runtime cannot inherit authentication from retained
+state. This does not mint or refresh a real OAuth/installation token or prove two
+real payer accounts. See the [authentication contract](../../docs/plans/copilot-auth-contract.md)
+and [account foundation](../../docs/plans/copilot-account-leases.md).
+
 ## Offline regression tests
 
 The [native terminal probe](../../docs/plans/copilot-terminal-results.md) runs a
@@ -166,6 +186,8 @@ python -m pytest scripts/copilot/tests -q
 These tests require neither inference credentials nor PostgreSQL. They cover
 credential isolation, adverse event ordering, callback ownership, control and
 consumer races, SDK snapshot adaptation, and exact runtime process cleanup.
+The account-store tests in `proxy/tests/billing/test_copilot_accounts.py` run in
+the PostgreSQL-backed proxy suite, with fake token values and no inference.
 The runtime tests use fake SDK transport and real disposable processes; the SDK
 is not installed by CI.
 See the [recorded results](../../docs/plans/copilot-spike-results.md) for what has
