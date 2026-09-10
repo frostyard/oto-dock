@@ -3,7 +3,7 @@
 Status: implementation started. C0 is complete; C1 is in progress. An opt-in
 local chat preview with saved transcripts and explicit clean resume is available
 in agent chat navigation and AI Engines settings for personal accounts, with
-explicit account-bound model discovery.
+explicit account-bound model discovery and per-conversation reasoning effort.
 The engine remains unregistered in general chat/task routing; full parity is
 incomplete.
 
@@ -28,7 +28,9 @@ Progress: [C0 baseline](copilot-ci-baseline.md),
 [agent chat navigation results](copilot-agent-chat-results.md)
 ([route and renderer contract](copilot-agent-chat-contract.md)), and
 [account model catalog results](copilot-model-catalog-results.md)
-([catalog contract](copilot-model-catalog-contract.md)).
+([catalog contract](copilot-model-catalog-contract.md)), and
+[reasoning effort results](copilot-reasoning-results.md)
+([reasoning contract](copilot-reasoning-contract.md)).
 
 Tracking issue: [Copilot: full Claude Code and Codex parity](https://github.com/frostyard/oto-dock/issues/1).
 

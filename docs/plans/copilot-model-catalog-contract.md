@@ -9,7 +9,9 @@ their original model and may be read/resumed without loading a new catalog.
 ## Request and authorization
 
 `POST /v1/copilot/chat/models` accepts only `{agent, account_id}` and returns
-`{models: [{id, name, available, policy, multiplier}]}`. It requires the same
+`{models: [{id, name, available, policy, multiplier, reasoning_efforts, default_reasoning_effort}]}`.
+The [reasoning contract](copilot-reasoning-contract.md) defines the advertised
+effort fields. The request requires the same
 human cookie, exact Origin and JSON checks as chat creation. GET does not start
 discovery. Responses carry `Cache-Control: no-store`.
 
@@ -69,6 +71,6 @@ against the selected account; loading a catalog does not freeze vendor policy.
 ## Remaining scope
 
 See the [parity matrix](copilot-parity.md). General engine registration, shared
-payers, persisted model defaults, reasoning controls, attachments, queues,
+payers, persisted model defaults, mid-conversation reasoning changes, attachments, queues,
 MCP/delegation, remote/terminal workflows and organization automation remain
 separate qualification gates. This slice changes no running deployment.

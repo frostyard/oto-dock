@@ -9,6 +9,7 @@ from pathlib import Path
 from .credentials import AccountScopeKind, CopilotAccountScope
 from .lease import CopilotLeaseGuard
 from .runtime import SDK_VERSION, SandboxedCopilotRuntime
+from .reasoning import model_reasoning
 from .session_state import PrivateCopilotSessionState
 
 
@@ -44,9 +45,25 @@ def normalize_models(response):
         if (multiplier is not None and (type(multiplier) not in (int, float)
                 or not 0 <= multiplier <= 1000 or not math.isfinite(multiplier))):
             raise CopilotCatalogError("Copilot model inventory is invalid")
+        invalid = False
+        try:
+            efforts, default_effort = model_reasoning(model)
+        except ValueError:
+            invalid = True
+        if invalid:
+            raise CopilotCatalogError("Copilot model inventory is invalid")
         rows.append({"id": model["id"], "name": model["name"], "policy": policy,
-                     "available": policy in {"enabled", "unconfigured"}, "multiplier": multiplier})
+                     "available": policy in {"enabled", "unconfigured"}, "multiplier": multiplier,
+                     "reasoning_efforts": efforts, "default_reasoning_effort": default_effort})
     return rows
+
+
+async def read_model_inventory(client, *, timeout=10):
+    """Pinned raw RPC shared by discovery and pre-create/resume validation."""
+    if SDK_VERSION != "1.0.13" or getattr(client, "_client", None) is None:
+        raise CopilotCatalogError("Copilot catalog adapter is unavailable")
+    response = await client._client.request("models.list", {}, timeout=timeout)
+    return normalize_models(response)
 
 
 class CopilotCatalogOwner:
@@ -164,11 +181,8 @@ class CopilotCatalogOwner:
         # SDK 1.0.13 public list_models() coerces IDs/names with str() and
         # multipliers with float(). Use the identical raw RPC through this
         # pinned adapter so malformed values cannot become selectable rows.
-        if SDK_VERSION != "1.0.13" or getattr(client, "_client", None) is None:
-            raise CopilotCatalogError("Copilot catalog adapter is unavailable")
-        response = await client._client.request("models.list", {}, timeout=10)
+        rows = await read_model_inventory(client)
         self._check()
-        rows = normalize_models(response)
         await self._guard.authorize()
         self._check()
         self.rows = rows

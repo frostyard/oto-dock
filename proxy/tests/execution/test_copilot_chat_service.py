@@ -1127,3 +1127,49 @@ async def test_internal_model_cancellation_is_unavailable_not_http_caller_cancel
         await service.list_models(f.user, 'agent', 'account-a')
     assert caught.value.status_code == 503
     assert not service._entries and not f.slots and not f.layer.sessions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('effort', [None, 'low', 'medium', 'high', 'xhigh', 'max'])
+async def test_reasoning_selection_is_saved_and_cold_resume_uses_the_original(fixture, effort):
+    service = fixture.service()
+    handle = await service.create(fixture.user, 'agent', 'account', 'model', reasoning_effort=effort)
+    cid = service.conversation_id(fixture.user, handle)
+    config = fixture.layer.started[-1][1]
+    assert getattr(config, 'reasoning_effort', None) == effort
+    turn = await service.prepare_turn(fixture.user, handle, 'Remember this selection')
+    assert [event async for event in turn][-1] == {'type': 'turn_complete'}
+    await service.close(fixture.user, handle)
+    row = (await service.get_conversation(fixture.user, cid))['conversation']
+    assert row['reasoning_effort'] == effort
+    assert (await service.list_conversations(fixture.user))['conversations'][0]['reasoning_effort'] == effort
+    fresh = fixture.service(store=service.store)
+    resumed = await fresh.resume(fixture.user, cid, row['revision'])
+    assert resumed != handle
+    assert getattr(fixture.layer.started[-1][1], 'reasoning_effort', None) == effort
+    assert service.store.get(cid, fixture.user.sub)['reasoning_effort'] == effort
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('effort', ['', 'auto', 'minimal', 'HIGH', ' high', True, 1, [], {}])
+async def test_invalid_reasoning_is_rejected_before_storage_capacity_or_runtime(fixture, effort):
+    service = fixture.service()
+    with pytest.raises(CopilotChatError) as caught:
+        await service.create(fixture.user, 'agent', 'account', 'model', reasoning_effort=effort)
+    assert caught.value.status_code == 422
+    assert not fixture.reads and not fixture.slots and not fixture.layer.started and not service.store.rows
+
+
+@pytest.mark.asyncio
+async def test_legacy_history_without_effort_keeps_model_default_on_resume(fixture):
+    service = fixture.service()
+    handle = await create(fixture, service)
+    cid = service.conversation_id(fixture.user, handle)
+    turn = await service.prepare_turn(fixture.user, handle, 'Legacy default')
+    assert [event async for event in turn][-1] == {'type': 'turn_complete'}
+    await service.close(fixture.user, handle)
+    service.store.rows[cid].pop('reasoning_effort')
+    row = (await service.get_conversation(fixture.user, cid))['conversation']
+    assert row['reasoning_effort'] is None
+    await service.resume(fixture.user, cid, row['revision'])
+    assert not hasattr(fixture.layer.started[-1][1], 'reasoning_effort')

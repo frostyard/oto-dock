@@ -17,10 +17,10 @@ vi.stubGlobal('ResizeObserver', ObserverStub)
 vi.stubGlobal('IntersectionObserver', ObserverStub)
 const json = (data: unknown, status = 200) => ({ ok: status < 400, status, json: vi.fn(async () => data) })
 const models: chat.CopilotModel[] = [
-  { id: 'small', name: 'Small model', available: true, policy: 'enabled', multiplier: 0.5 },
-  { id: 'unconfigured', name: 'Unconfigured model', available: true, policy: 'unconfigured', multiplier: null },
-  { id: 'disabled', name: 'Disabled model', available: false, policy: 'disabled', multiplier: 2 },
-  { id: 'unknown', name: 'Unknown model', available: false, policy: 'unknown', multiplier: null },
+  { id: 'small', name: 'Small model', available: true, policy: 'enabled', multiplier: 0.5, reasoning_efforts: [], default_reasoning_effort: null },
+  { id: 'unconfigured', name: 'Unconfigured model', available: true, policy: 'unconfigured', multiplier: null, reasoning_efforts: [], default_reasoning_effort: null },
+  { id: 'disabled', name: 'Disabled model', available: false, policy: 'disabled', multiplier: 2, reasoning_efforts: [], default_reasoning_effort: null },
+  { id: 'unknown', name: 'Unknown model', available: false, policy: 'unknown', multiplier: null, reasoning_efforts: [], default_reasoning_effort: null },
 ]
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(r => { resolve = r }); return { promise, resolve } }
 beforeEach(() => {
@@ -183,4 +183,106 @@ it('invalidates cached model selection when the chosen agent is no longer access
   expect(screen.getByRole('button', { name: 'Load available models' })).toBeDisabled()
   expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
   expect(screen.queryByRole('option', { name: /Small model/ })).not.toBeInTheDocument()
+})
+function reasoningCatalog() {
+  const rows: chat.CopilotModel[] = models.map(row => ({ ...row,
+    reasoning_efforts: row.id === 'small' ? ['low', 'high'] : row.id === 'unconfigured' ? ['medium', 'max'] : [],
+    default_reasoning_effort: row.id === 'small' ? 'high' : null,
+  }))
+  const base = apiFetch.getMockImplementation()!
+  apiFetch.mockImplementation((url, options) => url.endsWith('/models') ? Promise.resolve(json({ models: rows })) : base(url, options))
+  return rows
+}
+async function selectReasoningModel() {
+  await load(); await screen.findByRole('option', { name: /Small model/ })
+  fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'small' } })
+  await screen.findByLabelText('Reasoning effort')
+}
+it('offers only advertised effort choices and preserves an explicit effort in the created conversation', async () => {
+  reasoningCatalog(); mount(); await selectReasoningModel()
+  expect(screen.getByLabelText('Reasoning effort')).toHaveValue('')
+  expect(screen.getByRole('option', { name: 'Model default' })).toBeInTheDocument()
+  expect(screen.queryByRole('option', { name: 'max' })).not.toBeInTheDocument()
+  fireEvent.change(screen.getByLabelText('Reasoning effort'), { target: { value: 'high' } })
+  fireEvent.change(screen.getByLabelText('Message'), { target: { value: 'Use high effort' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+  await waitFor(() => expect(apiFetch.mock.calls.some(([url]) => url.endsWith('/sessions'))).toBe(true))
+  const body = JSON.parse(apiFetch.mock.calls.find(([url]) => url.endsWith('/sessions'))![1].body)
+  expect(body.reasoning_effort).toBe('high')
+  expect(screen.getByLabelText('Reasoning effort')).toHaveValue('high')
+  expect(screen.getByLabelText('Reasoning effort')).toBeDisabled()
+})
+it('Model default omits the override instead of pinning the advertised default', async () => {
+  reasoningCatalog(); mount(); await selectReasoningModel()
+  fireEvent.change(screen.getByLabelText('Message'), { target: { value: 'Use model default' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+  await waitFor(() => expect(apiFetch.mock.calls.some(([url]) => url.endsWith('/sessions'))).toBe(true))
+  expect(JSON.parse(apiFetch.mock.calls.find(([url]) => url.endsWith('/sessions'))![1].body)).not.toHaveProperty('reasoning_effort')
+  expect(screen.getByLabelText('Reasoning effort')).toHaveValue('Model default')
+})
+it('model switching and catalog reloading reset effort instead of carrying a previous choice', async () => {
+  reasoningCatalog(); mount(); await selectReasoningModel()
+  fireEvent.change(screen.getByLabelText('Reasoning effort'), { target: { value: 'high' } })
+  fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'unconfigured' } })
+  expect(screen.getByLabelText('Reasoning effort')).toHaveValue('')
+  expect(screen.getByRole('option', { name: 'max' })).toBeInTheDocument()
+  expect(screen.queryByRole('option', { name: 'high' })).not.toBeInTheDocument()
+  fireEvent.change(screen.getByLabelText('Reasoning effort'), { target: { value: 'max' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Reload available models' }))
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Reload available models' })).toBeEnabled())
+  fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'unconfigured' } })
+  expect(screen.getByLabelText('Reasoning effort')).toHaveValue('')
+})
+it.each(['account', 'agent', 'revision'])('changing %s clears a previously selected effort', async change => {
+  reasoningCatalog(); const page = mount(); await selectReasoningModel()
+  fireEvent.change(screen.getByLabelText('Reasoning effort'), { target: { value: 'high' } })
+  if (change === 'account') fireEvent.change(screen.getByLabelText('Personal Copilot account'), { target: { value: 'account-b' } })
+  else if (change === 'agent') fireEvent.change(screen.getByLabelText('Agent'), { target: { value: 'beta' } })
+  else { fixture.accounts[0] = { ...fixture.accounts[0], revision: 'r2' }; page.redraw() }
+  expect(screen.queryByLabelText('Reasoning effort')).not.toBeInTheDocument()
+  await selectReasoningModel()
+  expect(screen.getByLabelText('Reasoning effort')).toHaveValue('')
+})
+it('blocks programmatically injected effort choices that the selected model does not advertise', async () => {
+  reasoningCatalog(); mount(); await selectReasoningModel()
+  const picker = screen.getByLabelText('Reasoning effort')
+  const injected = document.createElement('option'); injected.value = 'max'; injected.textContent = 'Injected max'; picker.append(injected)
+  fireEvent.change(picker, { target: { value: 'max' } })
+  fireEvent.change(screen.getByLabelText('Message'), { target: { value: 'Invalid override' } })
+  expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+  fireEvent.submit(screen.getByLabelText('Message').closest('form')!)
+  expect(apiFetch.mock.calls.some(([url]) => url.endsWith('/sessions'))).toBe(false)
+  fireEvent.change(picker, { target: { value: '' } })
+  expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
+})
+it('does not offer effort controls for a model without advertised choices', async () => {
+  mount(); await load(); await screen.findByRole('option', { name: /Small model/ })
+  fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'small' } })
+  expect(screen.queryByLabelText('Reasoning effort')).not.toBeInTheDocument()
+})
+it.each([
+  { reasoning_efforts: ['high', 'high'], default_reasoning_effort: 'high' },
+  { reasoning_efforts: ['ultra'], default_reasoning_effort: null },
+  { reasoning_efforts: ['low'], default_reasoning_effort: 'high' },
+  { reasoning_efforts: [], default_reasoning_effort: 'high' },
+  { reasoning_efforts: 'high', default_reasoning_effort: 'high' },
+  { reasoning_efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'other'], default_reasoning_effort: null },
+  { reasoning_efforts: ['high'] },
+  { default_reasoning_effort: null },
+])('rejects invalid or partial reasoning metadata %#', async fields => {
+  const { reasoning_efforts: _efforts, default_reasoning_effort: _default, ...legacy } = models[0]
+  apiFetch.mockResolvedValue(json({ models: [{ ...legacy, ...fields }] }))
+  await expect(chat.loadCopilotModels({ agent: 'demo', account_id: 'account-a' })).rejects.toThrow(chat.CopilotChatError)
+})
+it('normalizes legacy catalogs to no choices without inventing a default', async () => {
+  const { reasoning_efforts: _efforts, default_reasoning_effort: _default, ...legacy } = models[0]
+  apiFetch.mockResolvedValue(json({ models: [legacy] }))
+  expect(await chat.loadCopilotModels({ agent: 'demo', account_id: 'account-a' })).toEqual([{ ...legacy, reasoning_efforts: [], default_reasoning_effort: null }])
+})
+it('validates explicit create effort and preserves null as a default request', async () => {
+  const body = { agent: 'demo', account_id: 'account-a', model: 'small', permission_mode: 'default' as const }
+  await expect(chat.createCopilotChat({ ...body, reasoning_effort: 'ultra' as chat.ReasoningEffort })).rejects.toThrow(chat.CopilotChatError)
+  expect(apiFetch).not.toHaveBeenCalled()
+  await chat.createCopilotChat({ ...body, reasoning_effort: null })
+  expect(JSON.parse(apiFetch.mock.calls[0][1].body).reasoning_effort).toBeNull()
 })

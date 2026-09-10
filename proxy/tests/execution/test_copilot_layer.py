@@ -202,7 +202,7 @@ async def pending_permission(sid):
 @pytest.mark.parametrize("changes", [
     {"mcp_config_path": "private-config"}, {"credential_env": {"TOKEN": "secret"}},
     {"extra_env": {"TOKEN": "secret"}}, {"mcp_secret_bundles": {"server": {"token": "secret"}}},
-    {"effort": "high"}, {"subscription_id": "generic-payer"}, {"subscription_user_sub": "alice"},
+    {"effort": "unsupported"}, {"subscription_id": "generic-payer"}, {"subscription_user_sub": "alice"},
     {"sandbox_host_claude_dir": "/untrusted"}, {"codex_thread_id": "other-engine"},
     {"use_native_permissions": True}, {"interactive": True}, {"interactive_first_prompt": "unexpected"},
     {"work_cwd": "/outside"}, {"default_execution_mode": "interactive"}, {"term": "xterm"},
@@ -1016,7 +1016,7 @@ async def test_catalog_inventory_uses_isolated_real_builder_and_leaves_no_histor
     layer, sid = harness.layer(), harness.identity()
     rows = await layer.list_models(sid, config(model="placeholder-not-requested"))
     assert rows == [{"id": "listed-model", "name": "Listed model", "available": True,
-                     "policy": "unconfigured", "multiplier": None}]
+                     "policy": "unconfigured", "multiplier": None, "reasoning_efforts": [], "default_reasoning_effort": None}]
     assert catalog_runtime.calls == ["auth", "authorize", "models.list", "authorize"]
     assert not harness.opens and not list(harness.records.root.iterdir())
     assert not list(harness.records.state_root.iterdir()) and not list(harness.homes.root.iterdir())

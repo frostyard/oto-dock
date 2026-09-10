@@ -8,6 +8,7 @@ import math
 import uuid
 
 import config
+from core.layers.copilot.reasoning import valid_reasoning_effort
 from auth.providers import UserContext
 from core.concurrency import acquire_chat_slot, release_chat_slot
 from core.config.copilot_config_builder import authorize_copilot_history, build_copilot_agent_config
@@ -71,6 +72,7 @@ class _Entry:
     account_id: str
     model: str
     mode: str
+    reasoning_effort: str | None = None
     handle: str = ""
     cid: str = ""
     resume: bool = False
@@ -308,11 +310,12 @@ class CopilotChatService:
             raise CopilotChatError(503, "Copilot session is unavailable")
 
     async def _config(self, entry, user):
+        options = {"reasoning_effort": entry.reasoning_effort} if entry.reasoning_effort is not None else {}
         async with asyncio.timeout(self.authorization_timeout):
             return await build_copilot_agent_config(
                 user=user, agent_name=entry.agent, account_id=entry.account_id,
                 account_scope=CopilotAccountScope.personal(entry.user.sub), model=entry.model,
-                permission_mode=entry.mode, client_type="dashboard", enabled_tools=SUPPORTED_NATIVE_TOOLS,
+                permission_mode=entry.mode, client_type="dashboard", enabled_tools=SUPPORTED_NATIVE_TOOLS, **options,
             )
 
     async def _authorize(self, entry, user):
@@ -406,7 +409,8 @@ class CopilotChatService:
         else:
             await self._db("create", entry.cid, entry.user.sub, agent=entry.agent,
                            account_id=entry.account_id, model=entry.model, permission_mode=entry.mode,
-                           platform_session_id=entry.sid, generation=entry.handle, entry=entry)
+                           platform_session_id=entry.sid, generation=entry.handle,
+                           reasoning_effort=entry.reasoning_effort, entry=entry)
         self._check(entry)
         async with asyncio.timeout(5):
             admission = await acquire_chat_slot(entry.sid, target="local", execution_path="copilot-cli", user_sub=entry.user.sub)
@@ -438,12 +442,14 @@ class CopilotChatService:
         await self._close_entry(entry)
         raise CopilotChatError(status, "Copilot session could not be started")
 
-    async def create(self, user, agent, account_id, model, permission_mode="default"):
+    async def create(self, user, agent, account_id, model, permission_mode="default", reasoning_effort=None):
         _human(user)
+        if not valid_reasoning_effort(reasoning_effort):
+            raise CopilotChatError(422, "Invalid Copilot reasoning effort")
         self._capacity(user)
         sid = str(uuid.uuid4())
         entry = _Entry(sid, deepcopy(user), agent, account_id, model, permission_mode,
-                       handle=sid, cid=str(uuid.uuid4()))
+                       reasoning_effort=reasoning_effort, handle=sid, cid=str(uuid.uuid4()))
         return await self._launch(entry)
 
     async def _model_credential(self, entry):
@@ -539,6 +545,7 @@ class CopilotChatService:
         fields = ("id", "agent", "account_id", "model", "permission_mode", "title",
                   "created_at", "updated_at", "state", "revision")
         metadata = {key: row[key].isoformat() if hasattr(row[key], "isoformat") else row[key] for key in fields}
+        metadata["reasoning_effort"] = row.get("reasoning_effort")
         metadata.update(can_resume=bool(resumable), reason="Ready to resume" if resumable else "Conversation is not ready to resume")
         return metadata
 
@@ -588,7 +595,8 @@ class CopilotChatService:
         if sid in self._entries:
             raise CopilotChatError(409, "Copilot conversation already has an owner")
         entry = _Entry(sid, deepcopy(user), row["agent"], row["account_id"], row["model"], row["permission_mode"],
-                       handle=str(uuid.uuid4()), cid=cid, resume=True, expected_revision=expected_revision)
+                       reasoning_effort=row.get("reasoning_effort"), handle=str(uuid.uuid4()), cid=cid,
+                       resume=True, expected_revision=expected_revision)
         return await self._launch(entry)
 
     async def prepare_turn(self, user, sid, text):

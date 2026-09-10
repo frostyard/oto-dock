@@ -184,7 +184,8 @@ async def run(args, report):
                     assert response.status_code == 200
                     rows = response.json()["models"]
                     assert 0 < len(rows) <= 200
-                    assert all(set(row) == {"id", "name", "available", "policy", "multiplier"} for row in rows)
+                    assert all(set(row) == {"id", "name", "available", "policy", "multiplier",
+                                            "reasoning_efforts", "default_reasoning_effort"} for row in rows)
                     selected = [row for row in rows if row["id"] == "gpt-5-mini"]
                     report["model_count"] = len(rows)
                     report["gpt_5_mini_present"] = bool(selected)

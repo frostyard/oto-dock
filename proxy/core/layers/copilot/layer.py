@@ -16,6 +16,7 @@ from core.execution_layer import AgentConfig, ExecutionLayer, LayerCapabilities
 from core.layers.copilot.catalog import CopilotCatalogOwner
 from core.layers.copilot.credentials import CopilotAccountScope
 from core.layers.copilot.local_session import CopilotLocalSession, CopilotLocalSessionConfig
+from core.layers.copilot.reasoning import valid_reasoning_effort
 from core.layers.copilot.sandbox_home import CopilotSandboxHomes
 from core.layers.copilot.session_records import CopilotSessionRecords
 from core.sandbox.sandbox import SandboxBuilder, SandboxMount, resolve_sandbox_config
@@ -117,16 +118,17 @@ class CopilotExecutionLayer(ExecutionLayer):
                 or not config.user_sub or config.permission_mode not in _PERMISSION_MODES
                 or type(config.resume) is not bool
                 or any(getattr(config, name) for name in (
-                    "mcp_config_path", "credential_env", "mcp_secret_bundles", "extra_env", "effort",
+                    "mcp_config_path", "credential_env", "mcp_secret_bundles", "extra_env",
                     "subscription_id", "sandbox_host_claude_dir", "codex_thread_id", "multi_value_envs",
                     "interactive", "interactive_theme", "interactive_first_prompt", "chat_id",
                     "work_cwd", "use_native_permissions",
                     "default_execution_mode", "term", "fallback_reason"))
-                or config.subscription_user_sub is not None):
+                or config.subscription_user_sub is not None
+                or type(config.effort) is not str or not valid_reasoning_effort(config.effort or None)):
             raise CopilotLayerError("Unsupported Copilot local session configuration")
         return CopilotLocalSessionConfig(
             session_id, config.account_id, config.account_scope, config.user_sub,
-            config.model, config.enabled_tools, config.system_prompt,
+            config.model, config.enabled_tools, config.system_prompt, config.effort or None,
         )
 
     async def start_session(self, session_id, config):

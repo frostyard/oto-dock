@@ -83,6 +83,52 @@ async def run(args, report):
                 super().__init__(*values, **options)
                 runtimes.append(self)
 
+            async def start(self):
+                client = await super().start()
+
+                def capture(original, kind):
+                    async def invoke(*values, **options):
+                        assert options.get("reasoning_effort") == args.reasoning_effort
+                        if args.reasoning_effort is None:
+                            assert "reasoning_effort" not in options
+                        report.setdefault("sdk_reasoning_options", []).append({
+                            "operation": kind, "reasoning_effort": options.get("reasoning_effort"),
+                            "explicit": "reasoning_effort" in options,
+                        })
+                        session = await original(*values, **options)
+                        if args.reasoning_effort is not None:
+                            current = await client._client.request("session.model.getCurrent", {
+                                "sessionId": session.session_id,
+                            }, timeout=5)
+                            assert current.get("reasoningEffort") == args.reasoning_effort
+                            report.setdefault("runtime_reasoning_snapshots", []).append({
+                                "operation": kind, "reasoning_effort": current["reasoningEffort"],
+                            })
+                        return session
+                    return invoke
+
+                client.create_session = capture(client.create_session, "create")
+                client.resume_session = capture(client.resume_session, "resume")
+                original_request = client._client.request
+
+                async def request(method, params=None, **options):
+                    if method in {"session.create", "session.resume"}:
+                        assert params.get("reasoningEffort") == args.reasoning_effort
+                        if args.reasoning_effort is None:
+                            assert "reasoningEffort" not in params
+                        report.setdefault("native_reasoning_payloads", []).append({
+                            "operation": method, "reasoning_effort": params.get("reasoningEffort"),
+                            "explicit": "reasoningEffort" in params,
+                        })
+                    result = await original_request(method, params, **options)
+                    if method == "models.list" and args.reasoning_effort is not None:
+                        selected = next(model for model in result["models"] if model["id"] == "gpt-5-mini")
+                        assert args.reasoning_effort in selected.get("supportedReasoningEfforts", [])
+                        report["selected_effort_advertised_by_real_account_catalog"] = True
+                    return result
+                client._client.request = request
+                return client
+
         replace(config, "get_jwt_expiry_hours", lambda: 8)
         replace(database, "get_user", {human["sub"]: human, other["sub"]: other}.get)
         replace(database, "get_user_agent_roles", lambda sub: dict(roles) if sub == human["sub"] else {})
@@ -128,6 +174,11 @@ async def run(args, report):
                     assert (await client.get(prefix + "/status")).json() == {"available": True}
                     create = {"agent": agent.name, "account_id": credential.account_id,
                               "model": "gpt-5-mini", "permission_mode": "default"}
+                    if args.reasoning_effort is not None:
+                        create["reasoning_effort"] = args.reasoning_effort
+                        denied = await client.post(prefix + "/sessions", json={**create, "reasoning_effort": "unsupported"})
+                        assert denied.status_code == 422 and not runtimes
+                        report["invalid_effort_rejected_before_runtime"] = True
                     denied = await client.post(prefix + "/sessions", json=create, headers={"Origin": "https://invalid.example"})
                     assert denied.status_code == 403 and not runtimes
                     report["cross_origin_start_denied"] = True
@@ -189,6 +240,10 @@ async def run(args, report):
                             assert (await client.delete(f"{prefix}/sessions/{sid}")).status_code == 204
                             archived = (await client.get(f"{prefix}/conversations/{cid}", params={"agent": agent.name})).json()
                             assert archived["conversation"]["can_resume"] is True
+                            if args.reasoning_effort is not None:
+                                assert archived["conversation"]["reasoning_effort"] == args.reasoning_effort
+                                assert history.rows[cid]["reasoning_effort"] == args.reasoning_effort
+                                report["explicit_effort_persisted_in_owned_conversation_metadata"] = True
                             assert archived["events"][-1]["type"] == "turn_complete"
                             assert any(event["type"] == "permission_prompt" for event in archived["events"])
                             assert [event["seq"] for event in archived["events"]] == list(range(1, len(archived["events"]) + 1))
@@ -220,6 +275,13 @@ async def run(args, report):
                             await replacement.__aenter__()
                             archived = (await client.get(f"{prefix}/conversations/{cid}", params={"agent": agent.name})).json()
                             revision = archived["conversation"]["revision"]
+                            if args.reasoning_effort is not None:
+                                before = history.get(cid, human["sub"])
+                                rejected = await client.post(f"{prefix}/conversations/{cid}/resume", params={"agent": agent.name},
+                                                             json={"revision": revision, "reasoning_effort": "high"})
+                                assert rejected.status_code == 422 and len(runtimes) == 1
+                                assert history.get(cid, human["sub"]) == before
+                                report["resume_effort_override_rejected_before_startup"] = True
                             rejected = await client.post(f"{prefix}/conversations/{cid}/resume", params={"agent": agent.name}, json={"revision": revision - 1})
                             assert rejected.status_code == 409 and len(runtimes) == 1
                             resumed = await client.post(f"{prefix}/conversations/{cid}/resume", params={"agent": agent.name}, json={"revision": revision})
@@ -266,6 +328,9 @@ async def run(args, report):
                         while get_owned_session(revoked) is not None:
                             await asyncio.sleep(0.05)
                     report["database_role_revocation_closed_idle_session"] = True
+                    assert {item["operation"] for item in report["sdk_reasoning_options"]} == {"create", "resume"}
+                    assert {item["operation"] for item in report["native_reasoning_payloads"]} == {"session.create", "session.resume"}
+                    report["native_create_and_cold_resume_effort_match"] = True
         finally:
             if replacement is not None:
                 await replacement.__aexit__(None, None, None)
@@ -287,6 +352,7 @@ def main():
     parser.add_argument("--live", action="store_true", required=True)
     parser.add_argument("--use-gh-token", action="store_true", required=True)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--reasoning-effort", choices=("low", "medium", "high", "xhigh", "max"), default=None)
     args = parser.parse_args()
     logging.disable(logging.CRITICAL)
     report = {"result": "failed", "sdk_version": "1.0.13", "runtime_version": "1.0.83",
@@ -295,6 +361,7 @@ def main():
               "actual_chat_service": True, "actual_platform_permission_authority": True,
               "actual_private_history_and_resume_locks": True,
               "postgresql": False, "storage": "controlled user, agent and account reads; in-memory conversation store"}
+    report["reasoning_effort"] = args.reasoning_effort
     started = time.monotonic()
     try:
         asyncio.run(run(args, report))

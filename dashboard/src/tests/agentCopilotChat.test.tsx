@@ -24,7 +24,7 @@ vi.stubGlobal('IntersectionObserver', ObserverStub)
 vi.stubGlobal('matchMedia', () => ({ matches: false, addEventListener() {}, removeEventListener() {} }))
 const json = (data: unknown, status = 200) => ({ ok: status < 400, status, json: async () => data })
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(r => { resolve = r }); return { promise, resolve } }
-const metadata = (id = 'saved-a', agent = 'demo'): chat.CopilotConversation => ({ id, agent, account_id: 'account-1', model: 'saved-model', permission_mode: 'plan', title: `${id} title`, state: 'closed', revision: 9, created_at: 1, updated_at: 2, can_resume: true, reason: '' })
+const metadata = (id = 'saved-a', agent = 'demo'): chat.CopilotConversation => ({ id, agent, account_id: 'account-1', model: 'saved-model', permission_mode: 'plan', reasoning_effort: null, title: `${id} title`, state: 'closed', revision: 9, created_at: 1, updated_at: 2, can_resume: true, reason: '' })
 beforeEach(() => {
   vi.restoreAllMocks(); apiFetch.mockReset(); historyProps.mockClear()
   auth.user = { sub: 'alice', role: 'member', agents: ['demo', 'beta'], must_change_password: false, must_enroll_2fa: false }
