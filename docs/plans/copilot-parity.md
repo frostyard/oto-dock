@@ -10,7 +10,8 @@ Progress: [C0 baseline](copilot-ci-baseline.md),
 [owned session supervisor results](copilot-supervisor-results.md), and
 [account and credential lease foundation](copilot-account-leases.md), and
 [account connection preview](copilot-connect-results.md), and
-[owned permission and question bridge](copilot-permission-results.md).
+[owned permission and question bridge](copilot-permission-results.md), and
+[native-tool policy results](copilot-native-tool-results.md).
 
 Tracking issue: [Copilot: full Claude Code and Codex parity](https://github.com/frostyard/oto-dock/issues/1).
 

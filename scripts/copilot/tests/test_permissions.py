@@ -51,6 +51,170 @@ def bridge(*, decide=None, ask=None, context_valid=lambda: True, **kwargs):
                                    context_valid=context_valid, working_directory="/workspace", **kwargs)
 
 
+def operation():
+    return "Read", {"file_path": "/workspace/file"}
+
+
+def test_public_working_directory_is_read_only_and_session_match_requires_binding():
+    handler = bridge()
+    assert handler.working_directory == "/workspace"
+    with pytest.raises(AttributeError):
+        handler.working_directory = "/different"
+    assert not handler.matches_sdk_session(None)
+    assert not handler.matches_sdk_session("native")
+    handler.bind_sdk_session("native")
+    assert handler.matches_sdk_session("native")
+    assert not handler.matches_sdk_session("other")
+    assert not handler.matches_sdk_session(None)
+
+
+@async_test
+async def test_native_operation_requires_bound_matching_session_before_project_or_policy():
+    calls = []
+
+    def project():
+        calls.append("project")
+        return operation()
+
+    async def decide(name, args):
+        calls.append((name, args))
+        return {"decision": "allow"}
+
+    handler = bridge(decide=decide)
+    assert not await handler.authorize_operation(project, {"session_id": "native"}, require_bound_session=True)
+    assert calls == []
+    handler.bind_sdk_session("native")
+    for invocation in ({}, None, {"session_id": "other"}):
+        assert not await handler.authorize_operation(project, invocation, require_bound_session=True)
+    assert calls == []
+    assert await handler.authorize_operation(project, {"session_id": "native"}, require_bound_session=True)
+    assert ("Read", {"file_path": "/workspace/file"}) in calls
+
+
+@async_test
+async def test_unbound_legacy_permission_and_operation_behavior_remains_available():
+    handler = bridge()
+    assert await handler.authorize_operation(operation, {})
+    response = await handler.on_permission_request({"kind": "read", "path": "/workspace/file"}, {})
+    assert response.kind == "approve-once"
+
+
+@async_test
+@pytest.mark.parametrize("projected", [None, {}, [], ("Read",), ("", {}), ("Read", "file")])
+async def test_invalid_native_projection_never_reaches_policy(projected):
+    async def forbidden(*_):
+        pytest.fail("invalid projection reached authority")
+
+    handler = bridge(decide=forbidden, expected_sdk_session_id="native")
+    assert not await handler.authorize_operation(lambda: projected, {"session_id": "native"},
+                                                require_bound_session=True)
+    assert not handler.requests.pending_ids
+
+
+@async_test
+@pytest.mark.parametrize("change", ["context", "input", "source", "invocation", "rewrite"])
+async def test_shared_authorization_rejects_mutation_or_context_change_during_policy(change):
+    live = [True]
+    source = [operation()]
+    invocation = {"session_id": "native"}
+
+    async def decide(_name, args):
+        if change == "context":
+            live[0] = False
+        elif change == "input":
+            args["file_path"] = "/different"
+        elif change == "source":
+            source[0][1]["file_path"] = "/different"
+        elif change == "invocation":
+            invocation["session_id"] = "other"
+        else:
+            return {"decision": "allow", "updated_input": {"file_path": "/different"}}
+        return {"decision": "allow"}
+
+    handler = bridge(decide=decide, context_valid=lambda: live[0], expected_sdk_session_id="native")
+    assert not await handler.authorize_operation(lambda: source[0], invocation, require_bound_session=True)
+    assert not handler.requests.pending_ids
+    if change == "input":
+        assert source[0] == operation()  # Authority receives an isolated input copy.
+
+
+@async_test
+async def test_scheduled_source_mutation_is_rejected_before_policy_execution():
+    source = operation()
+    calls = 0
+
+    def project():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            asyncio.get_running_loop().call_soon(source[1].update, {"file_path": "/different"})
+        return source
+
+    async def forbidden(*_):
+        pytest.fail("mutated projection reached authority")
+
+    handler = bridge(decide=forbidden)
+    assert not await handler.authorize_operation(project, {})
+
+
+@async_test
+async def test_source_change_between_policy_completion_and_answer_delivery_rejects():
+    source = operation()
+
+    async def decide(_name, _args):
+        asyncio.current_task().add_done_callback(lambda _task: source[1].update({"file_path": "/different"}))
+        return {"decision": "allow"}
+
+    handler = bridge(decide=decide)
+    assert not await handler.authorize_operation(lambda: source, {})
+
+
+@async_test
+async def test_cancelled_shared_authorization_denies_but_keeps_host_policy_owned():
+    started = asyncio.Event()
+
+    async def decide(_name, _args):
+        started.set()
+        await asyncio.Event().wait()
+
+    handler = bridge(decide=decide)
+    waiter = asyncio.create_task(handler.authorize_operation(operation, {}))
+    await started.wait()
+    waiter.cancel()
+    assert await waiter is False
+    assert handler.requests.pending_ids
+    await handler.requests.cancel_all(0.5)
+    assert not handler.requests.pending_ids
+
+
+@async_test
+async def test_shared_authorization_rejects_stale_allow_after_pause_resume():
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def decide(_name, _args):
+        started.set()
+        await release.wait()
+        return {"decision": "allow"}
+
+    handler = bridge(decide=decide)
+    waiter = asyncio.create_task(handler.authorize_operation(operation, {}))
+    await started.wait()
+    handler.requests.pause_admissions()
+    handler.requests.resume_admissions()
+    release.set()
+    assert await waiter is False
+
+
+@async_test
+async def test_project_errors_are_sanitized_and_do_not_escape_as_permission_approval():
+    def project():
+        raise RuntimeError("secret-request-data")
+
+    handler = bridge()
+    assert await handler.authorize_operation(project, {}) is False
+    assert not handler.requests.pending_ids
+
+
 @pytest.mark.parametrize("payload,expected", [
     ({"kind": "shell", "full_command_text": "rm /workspace/file", "read_only": True},
      ("Bash", {"command": "rm /workspace/file", "cwd": "/workspace"})),

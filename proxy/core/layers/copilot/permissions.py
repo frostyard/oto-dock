@@ -120,38 +120,66 @@ class CopilotPermissionBridge:
             raise ValueError("Copilot callback session binding cannot change")
         self._sdk_session_id = session_id
 
+    @property
+    def working_directory(self) -> str:
+        return self._working_directory
+
+    def matches_sdk_session(self, session_id) -> bool:
+        return (self._sdk_session_id is not None and isinstance(session_id, str)
+                and session_id == self._sdk_session_id)
+
     def _valid(self, invocation):
         return (self._context_valid() is True
                 and (self._sdk_session_id is None or (
                     isinstance(invocation, Mapping) and invocation.get("session_id") == self._sdk_session_id)))
 
+    async def authorize_operation(self, project, invocation, *, require_bound_session=False) -> bool:
+        """Authorize one immutable operation through the owned shared authority.
+
+        ``project`` is a trusted synchronous mapper returning (canonical tool
+        name, input dict), or None for an unsupported operation. Reprojection
+        checks that neither scheduling nor a held decision changed its source.
+        Native tool gates require an explicit SDK session binding; the older
+        permission callback retains its optional-binding behavior.
+        """
+        def valid():
+            return (self._valid(invocation) and (not require_bound_session or (
+                isinstance(invocation, Mapping) and self.matches_sdk_session(invocation.get("session_id")))))
+
+        async def decide():
+            if not valid() or project() != original:
+                return False
+            name, args = deepcopy(original)
+            result = await self._decide(name, args)
+            return (valid() and isinstance(result, dict)
+                    and result.get("decision") == "allow" and args == original[1]
+                    and project() == original
+                    and ("updated_input" not in result or result["updated_input"] == original[1]))
+
+        try:
+            if type(require_bound_session) is not bool or not callable(project) or not valid():
+                return False
+            original = deepcopy(project())
+            if (not isinstance(original, tuple) or len(original) != 2
+                    or not _text(original[0], 512) or not isinstance(original[1], dict)):
+                return False
+            allowed = await self.requests.run(decide)
+            return allowed is True and valid() and project() == original
+        except (asyncio.CancelledError, Exception):
+            pass
+        return False
+
     async def on_permission_request(self, request, invocation):
         from copilot.rpc import PermissionDecisionApproveOnce, PermissionDecisionReject
 
-        async def decide():
-            if not self._valid(invocation):
-                return False
-            mapped = map_permission(request, working_directory=self._working_directory,
-                                    custom_tools=self._custom_tools)
-            if mapped is None:
-                return False
-            name, args = mapped
-            original = deepcopy(args)
-            result = await self._decide(name, args)
-            return (self._valid(invocation) and isinstance(result, dict)
-                    and result.get("decision") == "allow" and args == original
-                    and map_permission(request, working_directory=self._working_directory,
-                                       custom_tools=self._custom_tools) == (name, original)
-                    and ("updated_input" not in result or result["updated_input"] == original))
+        def project():
+            return map_permission(request, working_directory=self._working_directory,
+                                  custom_tools=self._custom_tools)
 
-        try:
-            allowed = await self.requests.run(decide)
-            if allowed is True and self._valid(invocation):
-                # Do not persist a runtime-wide allow rule or claim a human
-                # approved an action that the platform may have auto-allowed.
-                return PermissionDecisionApproveOnce()
-        except (asyncio.CancelledError, Exception):
-            pass
+        if await self.authorize_operation(project, invocation):
+            # Do not persist a runtime-wide allow rule or claim a human
+            # approved an action that the platform may have auto-allowed.
+            return PermissionDecisionApproveOnce()
         return PermissionDecisionReject(feedback="OtoDock did not authorize this action")
 
     async def on_user_input_request(self, request, invocation):

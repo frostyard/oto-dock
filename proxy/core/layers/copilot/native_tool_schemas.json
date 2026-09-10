@@ -1,0 +1,168 @@
+{
+  "bash": {
+    "properties": {
+      "command": {
+        "type": "string"
+      },
+      "description": {
+        "type": "string"
+      },
+      "detach": {
+        "type": "boolean"
+      },
+      "initial_wait": {
+        "type": "number"
+      },
+      "mode": {
+        "enum": [
+          "sync",
+          "async"
+        ],
+        "type": "string"
+      },
+      "shellId": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "command",
+      "description"
+    ],
+    "type": "object"
+  },
+  "create": {
+    "properties": {
+      "file_text": {
+        "type": "string"
+      },
+      "path": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "path",
+      "file_text"
+    ],
+    "type": "object"
+  },
+  "edit": {
+    "properties": {
+      "new_str": {
+        "type": "string"
+      },
+      "old_str": {
+        "type": "string"
+      },
+      "path": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "path"
+    ],
+    "type": "object"
+  },
+  "glob": {
+    "properties": {
+      "paths": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        ]
+      },
+      "pattern": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "pattern"
+    ],
+    "type": "object"
+  },
+  "grep": {
+    "properties": {
+      "-A": {
+        "type": "number"
+      },
+      "-B": {
+        "type": "number"
+      },
+      "-C": {
+        "type": "number"
+      },
+      "-i": {
+        "type": "boolean"
+      },
+      "-n": {
+        "type": "boolean"
+      },
+      "glob": {
+        "type": "string"
+      },
+      "head_limit": {
+        "type": "number"
+      },
+      "multiline": {
+        "type": "boolean"
+      },
+      "output_mode": {
+        "enum": [
+          "content",
+          "files_with_matches",
+          "count"
+        ],
+        "type": "string"
+      },
+      "paths": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        ]
+      },
+      "pattern": {
+        "type": "string"
+      },
+      "type": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "pattern"
+    ],
+    "type": "object"
+  },
+  "view": {
+    "properties": {
+      "forceReadLargeFiles": {
+        "type": "boolean"
+      },
+      "path": {
+        "type": "string"
+      },
+      "view_range": {
+        "items": {
+          "type": "integer"
+        },
+        "type": "array"
+      }
+    },
+    "required": [
+      "path"
+    ],
+    "type": "object"
+  }
+}
