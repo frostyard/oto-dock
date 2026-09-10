@@ -12,6 +12,11 @@ export interface CopilotConversation {
   state: 'open' | 'closed' | 'incomplete'; revision: number; can_resume: boolean; reason: string
 }
 export interface CopilotChatOwner { session_id: string; conversation_id: string }
+export interface CopilotModel {
+  id: string; name: string; available: boolean
+  policy: 'enabled' | 'unconfigured' | 'disabled' | 'unknown'
+  multiplier: number | null
+}
 const identifier = (value: unknown): value is string => typeof value === 'string' && /^[a-zA-Z0-9-]{1,128}$/.test(value)
 const bounded = (value: unknown, limit = 256): value is string => typeof value === 'string' && value.length > 0 && value.length <= limit
 function conversation(value: unknown): CopilotConversation {
@@ -51,6 +56,22 @@ async function request(path: string, options: RequestInit = {}) {
 export async function copilotChatAvailable(): Promise<boolean> {
   const response = await request('/status')
   try { return (await response.json()).available === true } catch { throw new CopilotChatError(failure) }
+}
+export async function loadCopilotModels(body: { agent: string; account_id: string }, signal?: AbortSignal): Promise<CopilotModel[]> {
+  const response = await request('/models', { method: 'POST', body: JSON.stringify(body), signal })
+  try {
+    const data = await response.json()
+    if (!Array.isArray(data.models) || data.models.length > 200) throw new Error()
+    const ids = new Set<string>()
+    const label = (value: unknown) => bounded(value) && value.trim() === value && !/[\p{C}\p{Zl}\p{Zp}]/u.test(value)
+    return data.models.map((row: CopilotModel) => {
+      if (!row || !label(row.id) || !label(row.name) || ids.has(row.id)
+          || typeof row.available !== 'boolean' || !['enabled', 'unconfigured', 'disabled', 'unknown'].includes(row.policy)
+          || (row.multiplier !== null && (typeof row.multiplier !== 'number' || !Number.isFinite(row.multiplier) || row.multiplier < 0 || row.multiplier > 1000))) throw new Error()
+      ids.add(row.id)
+      return { id: row.id, name: row.name, available: row.available && (row.policy === 'enabled' || row.policy === 'unconfigured'), policy: row.policy, multiplier: row.multiplier }
+    })
+  } catch { throw new CopilotChatError('Available models could not be loaded. Try loading them again.') }
 }
 export async function createCopilotChat(body: { agent: string; account_id: string; model: string; permission_mode: ChatMode }) {
   const response = await request('/sessions', { method: 'POST', body: JSON.stringify(body) })

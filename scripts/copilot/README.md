@@ -4,6 +4,24 @@ These are development probes for C1 of the
 [parity plan](../../docs/plans/copilot-parity.md). They do not register an engine,
 change an OtoDock installation, or establish full parity.
 
+## Account model catalog
+
+The [catalog contract](../../docs/plans/copilot-model-catalog-contract.md) describes
+explicit model discovery in chat. This zero-turn probe exercises real cookie
+HTTP, account-bound configuration and sandbox metadata RPCs:
+
+```bash
+python scripts/copilot/model_catalog_probe.py \
+  --provisioned-root /srv/otodock-copilot-private/local \
+  --live --use-gh-token --output /tmp/copilot-model-catalog.json
+```
+
+It allows at most two runtimes and no native session/inference calls. It checks
+real model inventory, unauthorized account/origin rejection, normal cleanup,
+no persistent allocations, and revocation while a second real response is held.
+User/agent/account reads and conversation storage are explicit fixtures. No
+existing deployment is modified. See the [results](../../docs/plans/copilot-model-catalog-results.md).
+
 ## Authenticated chat preview
 
 The [preview contract](../../docs/plans/copilot-chat-preview-contract.md) describes

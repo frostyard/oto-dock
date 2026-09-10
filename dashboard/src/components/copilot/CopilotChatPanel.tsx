@@ -8,6 +8,7 @@ import {
   CopilotChatError, CopilotChatCleanupError, copilotChatAvailable, createCopilotChat, closeCopilotChat,
   streamCopilotTurn, respondCopilotPermission, respondCopilotQuestion, type ChatEvent, type ChatMode,
   listCopilotConversations, getCopilotConversation, resumeCopilotConversation, type CopilotConversation,
+  loadCopilotModels, type CopilotModel,
 } from '../../api/copilotChat'
 import CopilotMessages, { type CopilotMessageItem as Item } from './CopilotMessages'
 
@@ -33,7 +34,11 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
   const agents = useAgents()
   const accounts = useCopilotAccounts(userSub)
   const [agent, setAgent] = useState(''), [account, setAccount] = useState('')
-  const [model, setModel] = useState('gpt-5-mini'), [mode, setMode] = useState<ChatMode>('default')
+  const [model, setModel] = useState(''), [mode, setMode] = useState<ChatMode>('default')
+  const [catalog, setCatalog] = useState<{ scope: string; models: CopilotModel[] } | null>(null)
+  const [modelsLoading, setModelsLoading] = useState(false), [modelsError, setModelsError] = useState('')
+  const catalogRequest = useRef<{ scope: string; controller: AbortController } | null>(null)
+  const catalogScope = useRef('')
   const [prompt, setPrompt] = useState(''), [items, setItems] = useState<Item[]>([])
   const [session, setSession] = useState<string | null>(null), [busy, setBusy] = useState(false)
   const [error, setError] = useState(''), [answering, setAnswering] = useState<string | null>(null)
@@ -50,6 +55,14 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
   const eligible = (accounts.data ?? []).filter(a => a.status === 'active' && a.use_personal && (a.expires_at === null || a.expires_at > Date.now() / 1000))
   const selectedAgent = agentName ?? selected?.agent ?? (agent || agents.data?.[0]?.name || '')
   const selectedAccount = selected?.account_id ?? (account || eligible[0]?.id || '')
+  const accountRecord = accounts.data?.find(row => row.id === selectedAccount)
+  const accountUsable = () => !!accountRecord && accountRecord.status === 'active' && accountRecord.use_personal
+    && (accountRecord.expires_at === null || accountRecord.expires_at > Date.now() / 1000)
+  const agentAccessible = !!agents.data?.some(row => row.name === selectedAgent)
+  const scope = JSON.stringify([userSub, selectedAgent, selectedAccount, accountRecord?.revision, accountRecord?.status, accountRecord?.use_personal, accountRecord?.expires_at, accountUsable(), agentAccessible])
+  catalogScope.current = scope
+  const currentModels = catalog?.scope === scope ? catalog.models : null
+  const chosenModel = accountUsable() && agentAccessible ? currentModels?.find(value => value.id === model && value.available)?.id ?? '' : ''
   const savedAccountAvailable = !!selected && eligible.some(a => a.id === selected.account_id)
   const savedAgentAvailable = !!selected && !!agents.data?.some(a => a.name === selected.agent)
   const agentChatPath = `/chat/${encodeURIComponent(selectedAgent)}/copilot${selected ? `/${encodeURIComponent(selected.id)}` : ''}`
@@ -58,9 +71,13 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
     current.mounted = true
     return () => {
       current.mounted = false; current.epoch++; current.controller?.abort()
+      catalogRequest.current?.controller.abort()
       if (current.sid) void closeCopilotChat(current.sid).catch(() => {})
     }
   }, [])
+  useEffect(() => {
+    setCatalog(null); setModel(''); setModelsError('')
+  }, [scope])
   useEffect(() => {
     if (status.data !== true) return
     const target = conversationId ?? null
@@ -85,6 +102,25 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [conversationId, status.data])
   const message = (e: unknown) => e instanceof CopilotChatError ? e.message : 'Copilot chat failed. Close this chat and try again.'
+  async function loadModels() {
+    const current = life.current
+    if (catalogRequest.current || current.busy || current.creating || current.closing || current.sid || current.cid || current.cleanupFailed
+        || !agentAccessible || !accountUsable()) return
+    const request = { scope, controller: new AbortController() }, epoch = current.epoch
+    catalogRequest.current = request
+    setModelsLoading(true); setModelsError(''); setCatalog(null); setModel('')
+    try {
+      const models = await loadCopilotModels({ agent: selectedAgent, account_id: selectedAccount }, request.controller.signal)
+      if (current.mounted && current.epoch === epoch && catalogScope.current === request.scope && !current.cid) setCatalog({ scope: request.scope, models })
+    } catch {
+      if (current.mounted && current.epoch === epoch && catalogScope.current === request.scope && !current.cid) setModelsError('Available models could not be loaded. Try loading them again.')
+    } finally {
+      if (catalogRequest.current === request) {
+        catalogRequest.current = null
+        if (current.mounted) setModelsLoading(false)
+      }
+    }
+  }
   function refresh() {
     void queryClient.invalidateQueries({ queryKey: ['copilot-conversations', userSub] })
     const current = life.current, cid = current.cid, epoch = current.epoch
@@ -120,7 +156,7 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
   }
   async function newChat() {
     const current = life.current
-    if (current.busy || current.closing || current.cleanupFailed) return
+    if (catalogRequest.current || current.busy || current.closing || current.cleanupFailed) return
     await close()
     if (current.mounted && !current.cleanupFailed) {
       current.epoch++; current.cid = null; current.loading = false
@@ -131,7 +167,7 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
   }
   async function openAgentPage() {
     const current = life.current, target = agentChatPath
-    if (current.busy || current.creating || current.closing || current.cleanupFailed) return
+    if (catalogRequest.current || current.busy || current.creating || current.closing || current.cleanupFailed) return
     await close()
     // The destination's initial GET must observe the finished close, rather
     // than racing it and retaining an obsolete non-resumable "open" snapshot.
@@ -164,7 +200,7 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
   }
   async function resume() {
     const current = life.current, row = selected
-    if (!row || (agentName && row.agent !== agentName) || !row.can_resume || !savedAccountAvailable || !savedAgentAvailable || current.loading || current.busy || current.closing || current.sid || current.cleanupFailed) return
+    if (catalogRequest.current || !row || (agentName && row.agent !== agentName) || !row.can_resume || !savedAccountAvailable || !savedAgentAvailable || current.loading || current.busy || current.closing || current.sid || current.cleanupFailed) return
     const epoch = current.epoch, valid = () => current.mounted && current.epoch === epoch
     current.busy = true; current.creating = true; setBusy(true); setError('')
     try {
@@ -229,7 +265,7 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
   async function send(event: React.FormEvent) {
     event.preventDefault()
     const current = life.current
-    if (current.loading || (current.cid && !current.sid) || current.busy || current.closing || current.cleanupFailed || !prompt.trim() || !selectedAgent || !selectedAccount) return
+    if (catalogRequest.current || (!current.sid && (!chosenModel || !accountUsable() || !agentAccessible)) || current.loading || (current.cid && !current.sid) || current.busy || current.closing || current.cleanupFailed || !prompt.trim() || !selectedAgent || !selectedAccount) return
     const text = prompt.trim(), epoch = current.epoch
     current.busy = true; setBusy(true); setError(''); setPrompt('')
     const valid = () => current.mounted && current.epoch === epoch
@@ -241,14 +277,14 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
         // Do not cancel creation and lose its owner ID. Dispose late results.
         current.creating = true
         let owner
-        try { owner = await createCopilotChat({ agent: selectedAgent, account_id: selectedAccount, model: model.trim(), permission_mode: mode }); sid = owner.session_id }
+        try { owner = await createCopilotChat({ agent: selectedAgent, account_id: selectedAccount, model: chosenModel, permission_mode: mode }); sid = owner.session_id }
         finally { current.creating = false }
         if (!valid()) {
           try { await closeCopilotChat(sid) } catch (e) { current.cleanupFailed = true; if (current.mounted) setError(message(e)) }
           return
         }
         current.cid = owner.conversation_id
-        setSelected({ id: owner.conversation_id, agent: selectedAgent, account_id: selectedAccount, model: model.trim(), permission_mode: mode, title: text.slice(0, 100), created_at: '', updated_at: '', state: 'open', revision: 1, can_resume: false, reason: '' })
+        setSelected({ id: owner.conversation_id, agent: selectedAgent, account_id: selectedAccount, model: chosenModel, permission_mode: mode, title: text.slice(0, 100), created_at: '', updated_at: '', state: 'open', revision: 1, can_resume: false, reason: '' })
         current.sid = sid; setSession(sid)
         onConversationChange?.(owner.conversation_id, { replace: true })
       }
@@ -291,26 +327,35 @@ function Panel({ userSub, agentName, conversationId, onConversationChange, fullH
         {!savedAccountAvailable && <p>The saved personal account is unavailable. A different account will not be substituted.</p>}
         {!savedAgentAvailable && <p>The saved agent is unavailable.</p>}
         {!selected.can_resume && selected.reason && <p>{selected.reason}</p>}
-        <button type="button" className={button} disabled={busy || loading || !selected.can_resume || !savedAccountAvailable || !savedAgentAvailable || life.current.cleanupFailed} onClick={() => void resume()}>Resume conversation</button>
+        <button type="button" className={button} disabled={modelsLoading || busy || loading || !selected.can_resume || !savedAccountAvailable || !savedAgentAvailable || life.current.cleanupFailed} onClick={() => void resume()}>Resume conversation</button>
       </div>}
       <fieldset disabled={busy || loading || !!session || !!selected} className="grid gap-2 sm:grid-cols-2 text-sm text-p-text">
         <label>Agent<select disabled={!!agentName} className={input} value={selectedAgent} onChange={e => setAgent(e.target.value)}><option value="">Select an agent</option>{selected && !savedAgentAvailable && <option value={selected.agent}>Saved agent unavailable</option>}{(agents.data ?? []).map(a => <option key={a.name} value={a.name}>{a.display_name || a.name}</option>)}</select></label>
         <label>Personal Copilot account<select className={input} value={selectedAccount} onChange={e => setAccount(e.target.value)}><option value="">Select an account</option>{selected && !savedAccountAvailable && <option value={selected.account_id}>Saved account unavailable</option>}{eligible.map(a => <option key={a.id} value={a.id}>{a.label || a.principal_id}</option>)}</select></label>
-        <label>Model ID (preview)<input className={input} maxLength={256} value={selected?.model ?? model} onChange={e => setModel(e.target.value)} /></label>
+        {selected ? <label>Model<input className={input} readOnly value={selected.model} /></label> : <label>Model<select className={input} value={chosenModel} disabled={modelsLoading || !currentModels} onChange={e => setModel(e.target.value)}>
+          <option value="">Select a model</option>
+          {(currentModels ?? []).map(row => <option key={row.id} value={row.id} disabled={!row.available}>{row.name} ({row.id}){row.available ? '' : ` — ${row.policy === 'disabled' ? 'Disabled by policy' : row.policy === 'unknown' ? 'Unknown policy' : 'Unavailable'}`}{row.multiplier === null ? '' : ` · ${row.multiplier}× reported multiplier`}</option>)}
+        </select></label>}
         <label>Permission mode<select className={input} value={selected?.permission_mode ?? mode} onChange={e => setMode(e.target.value as ChatMode)}><option value="default">Ask when needed</option><option value="acceptEdits">Accept edits</option><option value="plan">Plan only</option><option value="dontAsk">Deny actions needing approval</option></select></label>
       </fieldset>
-      <p className="text-xs text-p-text-secondary">The selected account must have access to the model. GitHub account validation alone does not verify Copilot entitlement.</p>
-      {!fullHeight && selectedAgent && <p className="text-sm">{session || busy || life.current.cleanupFailed
-        ? <button type="button" className="underline disabled:opacity-40" disabled={busy || life.current.cleanupFailed} onClick={() => void openAgentPage()}>Open Copilot chat for this agent</button>
+      {!selected && <div className="space-y-1 text-sm">
+        <button type="button" className={button} disabled={modelsLoading || busy || loading || !!life.current.cid || !agentAccessible || !accountUsable() || life.current.cleanupFailed} onClick={() => void loadModels()}>{modelsLoading ? 'Loading available models…' : currentModels ? 'Reload available models' : 'Load available models'}</button>
+        {modelsLoading && <p role="status">Checking models for this agent and account…</p>}
+        {modelsError && <p role="alert" className="text-red-500">{modelsError}</p>}
+        {currentModels && !currentModels.some(row => row.available) && <p>No selectable models were returned for this account.</p>}
+      </div>}
+      {!selected && <p className="text-xs text-p-text-secondary">Load models for the selected account. Model policy and reported multipliers may change; access is checked again when chat starts.</p>}
+      {!fullHeight && selectedAgent && <p className="text-sm">{session || modelsLoading || busy || life.current.cleanupFailed
+        ? <button type="button" className="underline disabled:opacity-40" disabled={modelsLoading || busy || life.current.cleanupFailed} onClick={() => void openAgentPage()}>Open Copilot chat for this agent</button>
         : <Link className="underline" to={agentChatPath}>Open Copilot chat for this agent</Link>}</p>}
       {(agents.isError || accounts.isError) && <p role="alert" className="text-sm text-red-500">Agents or accounts could not be loaded. Refresh this page to try again.</p>}
       {!eligible.length && <p className="text-sm">Connect an active personal account in <Link className="underline" to="/user-settings?tab=ai-engines">AI Engines settings</Link>.</p>}
       <CopilotMessages items={items} activeSession={session} answering={answering} onAnswer={(item, approved, answers) => void answer(item, approved, answers)} streaming={busy && !!session} agentDisplayName={agents.data?.find(a => a.name === selectedAgent)?.display_name || selectedAgent} />
       <form onSubmit={send} className="space-y-2">
         <label className="block text-sm text-p-text">Message<textarea className={input} maxLength={32768} rows={3} value={prompt} disabled={busy || loading || (!!life.current.cid && !session)} onChange={e => setPrompt(e.target.value)} /></label>
-        <div className="flex gap-2"><button className={button} disabled={busy || loading || (!!life.current.cid && !session) || !prompt.trim() || !selectedAgent || !selectedAccount || !(selected?.model ?? model).trim() || life.current.cleanupFailed}>Send</button>
+        <div className="flex gap-2"><button className={button} disabled={modelsLoading || busy || loading || (!!life.current.cid && !session) || !prompt.trim() || !selectedAgent || !selectedAccount || (!session && !chosenModel) || life.current.cleanupFailed}>Send</button>
           <button className={button} type="button" disabled={!busy && !session} onClick={() => void close()}>{busy ? 'Stop and close' : 'Close chat'}</button>
-          <button className={button} type="button" disabled={busy || life.current.cleanupFailed} onClick={() => void newChat()}>New chat</button></div>
+          <button className={button} type="button" disabled={modelsLoading || busy || life.current.cleanupFailed} onClick={() => void newChat()}>New chat</button></div>
       </form>
       {busy && <p role="status" className="text-sm">Working…</p>}
     </>}

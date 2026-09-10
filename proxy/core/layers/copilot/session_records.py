@@ -236,6 +236,18 @@ class CopilotSessionRecords:
             handle.close()
         raise error("Copilot session resume provenance could not be established")
 
+    def validate_roots(self) -> None:
+        """Revalidate the original host roots without reading or creating records."""
+        failed = False
+        try:
+            if (self._directory_identity(self.root) != self._root_identity
+                    or self._directory_identity(self.state_root) != self._state_root_identity):
+                failed = True
+        except Exception:
+            failed = True
+        if failed:
+            raise SessionRecordError("Copilot private storage ownership changed")
+
     def is_ready(self, platform_session_id: str, owner_sub: str) -> bool:
         """Read-only personal-history candidate check; never authorizes resume.
 

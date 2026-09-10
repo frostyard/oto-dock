@@ -960,3 +960,170 @@ async def test_agent_page_mismatch_cannot_read_or_resume_or_mutate_saved_generat
     assert service.store.get(cid, fixture.user.sub) == before
     assert len(fixture.layer.started) == starts
     assert (await service.get_conversation(fixture.user, cid, agent='agent'))['conversation']['id'] == cid
+
+
+@pytest_asyncio.fixture
+async def catalog_fixture(fixture, monkeypatch):
+    fixture.current['credential'] = 'generation-one'
+    fixture.catalogs = []
+    fixture.catalog_hook = None
+    fixture.models = [{'id': 'model-a', 'name': 'Model A', 'available': True,
+                       'policy': 'enabled', 'multiplier': 1.0}]
+
+    async def credential(self, entry):
+        assert entry.user.sub in {fixture.user.sub, fixture.other.sub}
+        return fixture.current['credential']
+
+    async def models(sid, config):
+        fixture.catalogs.append((sid, config))
+        fixture.layer.sessions[sid] = asyncio.Lock()
+        try:
+            if fixture.catalog_hook:
+                await fixture.catalog_hook()
+            return fixture.models
+        finally:
+            await fixture.layer.close_session(sid)
+
+    monkeypatch.setattr(CopilotChatService, '_model_credential', credential)
+    monkeypatch.setattr(fixture.layer, 'list_models', models, raising=False)
+    return fixture
+
+
+@pytest.mark.asyncio
+async def test_model_catalog_is_personal_bounded_and_leaves_no_conversation_or_owner(catalog_fixture):
+    f = catalog_fixture
+    service = f.service()
+    assert await service.list_models(f.user, 'agent', 'account-a') == {'models': f.models}
+    assert not service._entries and not service.store.rows and not f.slots
+    assert not f.layer.started and not f.layer.messages and not f.layer.sessions
+    assert f.reads[0]['account_id'] == 'account-a'
+    assert f.reads[0]['account_scope'].user_sub == f.user.sub
+    assert len(f.reads) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('field', ['revision', 'credential', 'denied'])
+async def test_model_catalog_rechecks_agent_and_exact_account_after_discovery(catalog_fixture, field):
+    f = catalog_fixture
+    service = f.service()
+
+    async def change():
+        f.current[field] = {'revision': 2, 'credential': 'generation-two', 'denied': True}[field]
+    f.catalog_hook = change
+    with pytest.raises(CopilotChatError):
+        await service.list_models(f.user, 'agent', 'account-a')
+    assert not service._entries and not service.store.rows and not f.slots and not f.layer.sessions
+
+
+@pytest.mark.asyncio
+async def test_model_discovery_reserves_capacity_before_await_and_shares_chat_limits(catalog_fixture):
+    f = catalog_fixture
+    service = f.service(max_sessions=1, max_per_user=1)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def hold():
+        entered.set()
+        await release.wait()
+    f.catalog_hook = hold
+    pending = asyncio.create_task(service.list_models(f.user, 'agent', 'account-a'))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        for operation in (service.list_models(f.other, 'agent', 'account-b'), create(f, service)):
+            with pytest.raises(CopilotChatError) as caught:
+                await operation
+            assert caught.value.status_code == 429
+        assert len(f.catalogs) == 1 and len(f.slots) == 1
+    finally:
+        release.set()
+        await pending
+    assert not f.slots
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('action', ['cancel', 'timeout', 'shutdown'])
+async def test_model_discovery_cancellation_and_shutdown_join_runtime_cleanup(catalog_fixture, action):
+    f = catalog_fixture
+    service = f.service(model_timeout=0.05 if action == 'timeout' else 45)
+    entered, cleanup, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def hold():
+        entered.set()
+        await asyncio.Event().wait()
+
+    async def close(sid):
+        cleanup.set()
+        await release.wait()
+    f.catalog_hook = hold
+    f.layer.close_hook = close
+    pending = asyncio.create_task(service.list_models(f.user, 'agent', 'account-a'))
+    shutdown = None
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        if action == 'cancel':
+            pending.cancel()
+        elif action == 'shutdown':
+            shutdown = asyncio.create_task(service.aclose())
+        await asyncio.wait_for(cleanup.wait(), 1)
+        assert not pending.done() and f.slots and service._entries
+        release.set()
+        results = await asyncio.gather(pending, return_exceptions=True)
+        assert isinstance(results[0], (asyncio.CancelledError, CopilotChatError))
+        if shutdown:
+            await shutdown
+        assert not f.slots and not service._entries and not f.layer.sessions and not service.store.rows
+    finally:
+        release.set()
+        await asyncio.gather(pending, *([shutdown] if shutdown else []), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_failed_model_cleanup_retains_capacity_and_never_returns_inventory(catalog_fixture):
+    f = catalog_fixture
+    service = f.service(max_sessions=1, max_per_user=1)
+
+    async def failed(sid):
+        raise RuntimeError('private cleanup details')
+    f.layer.close_hook = failed
+    with pytest.raises(CopilotChatError) as caught:
+        await service.list_models(f.user, 'agent', 'account-a')
+    assert 'private' not in str(caught.value)
+    assert service._entries and f.slots and not service.store.rows
+    with pytest.raises(CopilotChatError) as caught:
+        await service.list_models(f.other, 'agent', 'account-b')
+    assert caught.value.status_code == 429
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fields', [{'is_api_key': True}, {'session_id': 'session'}, {'agent': 'agent'}, {'external_claim': 'phone'}])
+async def test_model_discovery_rejects_nonhuman_before_authority_or_runtime(catalog_fixture, fields):
+    f = catalog_fixture
+    service = f.service()
+    with pytest.raises(CopilotChatError) as caught:
+        await service.list_models(replace(f.user, **fields), 'agent', 'account-a')
+    assert caught.value.status_code == 403
+    assert not f.reads and not f.catalogs and not f.slots
+
+
+@pytest.mark.asyncio
+async def test_model_discovery_denied_admission_never_starts_runtime(catalog_fixture):
+    f = catalog_fixture
+    f.current['admission'] = False
+    service = f.service()
+    with pytest.raises(CopilotChatError) as caught:
+        await service.list_models(f.user, 'agent', 'account-a')
+    assert caught.value.status_code == 429
+    assert not f.catalogs and not service._entries and not service.store.rows
+
+
+@pytest.mark.asyncio
+async def test_internal_model_cancellation_is_unavailable_not_http_caller_cancellation(catalog_fixture):
+    f = catalog_fixture
+    service = f.service()
+
+    async def revoked():
+        raise asyncio.CancelledError
+    f.catalog_hook = revoked
+    with pytest.raises(CopilotChatError) as caught:
+        await service.list_models(f.user, 'agent', 'account-a')
+    assert caught.value.status_code == 503
+    assert not service._entries and not f.slots and not f.layer.sessions

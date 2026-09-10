@@ -273,17 +273,20 @@ class CopilotChatTurn:
 
 class CopilotChatService:
     def __init__(self, layer, *, max_sessions=4, max_per_user=2, idle_timeout=300,
-                 turn_timeout=300, watch_interval=5, authorization_timeout=5, store=None, database_timeout=40):
+                 turn_timeout=300, watch_interval=5, authorization_timeout=5, store=None, database_timeout=40,
+                 model_timeout=45):
         if (type(max_sessions) is not int or not 1 <= max_sessions <= 8
                 or type(max_per_user) is not int or not 1 <= max_per_user <= max_sessions
                 or any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0
-                       for value in (idle_timeout, turn_timeout, watch_interval, authorization_timeout, database_timeout))
-                or turn_timeout > 300 or watch_interval > 10 or authorization_timeout > 10 or database_timeout > 60):
+                       for value in (idle_timeout, turn_timeout, watch_interval, authorization_timeout, database_timeout, model_timeout))
+                or turn_timeout > 300 or watch_interval > 10 or authorization_timeout > 10 or database_timeout > 60
+                or model_timeout > 60):
             raise ValueError("Invalid Copilot preview limits")
         from storage import copilot_conversation_store
 
         self.store = copilot_conversation_store if store is None else store
         self.database_timeout = database_timeout
+        self.model_timeout = model_timeout
         self.layer = layer
         self.max_sessions, self.max_per_user = max_sessions, max_per_user
         self.idle_timeout, self.turn_timeout = idle_timeout, turn_timeout
@@ -442,6 +445,75 @@ class CopilotChatService:
         entry = _Entry(sid, deepcopy(user), agent, account_id, model, permission_mode,
                        handle=sid, cid=str(uuid.uuid4()))
         return await self._launch(entry)
+
+    async def _model_credential(self, entry):
+        from storage.copilot_account_store import read_credential
+        from storage.pg import run_db
+
+        async with asyncio.timeout(self.authorization_timeout):
+            return await run_db(read_credential, entry.account_id, CopilotAccountScope.personal(entry.user.sub))
+
+    async def _discover_models(self, entry):
+        entry.config = await self._config(entry, entry.user)
+        self._check(entry)
+        credential = await self._model_credential(entry)
+        self._check(entry)
+        async with asyncio.timeout(5):
+            entry.admitted = bool(await acquire_chat_slot(
+                entry.sid, target="local", execution_path="copilot-cli", user_sub=entry.user.sub,
+            ))
+        self._check(entry)
+        if not entry.admitted:
+            raise CopilotChatError(429, "Local session capacity is unavailable")
+        entry.layer_start_attempted = True
+        models = await self.layer.list_models(entry.sid, deepcopy(entry.config))
+        self._check(entry)
+        # Discovery may have taken time. Never return an inventory after its
+        # agent, human or selected payer authorization changed in that interval.
+        current = await self._config(entry, entry.user)
+        self._check(entry)
+        if current != entry.config:
+            raise CopilotChatError(403, "Copilot model access is unavailable")
+        if await self._model_credential(entry) != credential:
+            raise CopilotChatError(403, "Copilot model account changed")
+        self._check(entry)
+        return {"models": models}
+
+    async def list_models(self, user, agent, account_id):
+        _human(user)
+        _agent_filter(agent)
+        if agent is None or not isinstance(account_id, str) or not 0 < len(account_id) <= 256:
+            raise CopilotChatError(422, "An agent and personal account are required")
+        self._capacity(user)
+        sid = str(uuid.uuid4())
+        # This is a capacity/cleanup owner only. No conversation row, handle or
+        # native session is created; the placeholder model is never dispatched.
+        entry = _Entry(sid, deepcopy(user), agent, account_id, "catalog-discovery", "default")
+        self._entries[sid] = entry
+        entry.startup = asyncio.create_task(self._discover_models(entry))
+        status = 503
+        result = None
+        try:
+            async with asyncio.timeout(self.model_timeout):
+                result = await entry.startup
+        except asyncio.CancelledError:
+            # A revoked catalog or shutdown can cancel its child operation
+            # without the HTTP request being cancelled. Report unavailability
+            # instead of leaking an internal cancellation through ASGI.
+            if asyncio.current_task().cancelling():
+                raise
+        except CopilotChatError as error:
+            status = error.status_code
+        except Exception:
+            pass
+        finally:
+            # Also joins cancellation during startup/RPC, and retains capacity
+            # if runtime shutdown cannot be confirmed. A result is never exposed
+            # while the temporary discovery owner remains alive.
+            await self._close_entry(entry)
+        if result is None:
+            raise CopilotChatError(status, "Copilot models are unavailable")
+        return result
 
     def conversation_id(self, user, handle):
         return self._entry(user, handle).cid

@@ -943,3 +943,154 @@ async def test_history_readiness_rechecks_new_claim_after_thread_read(harness, m
     finally:
         release.set()
         owned_sessions.release_owned_session(claim)
+
+
+@pytest.fixture
+def catalog_runtime(harness, monkeypatch):
+    from core.layers.copilot import catalog
+
+    scenario = SimpleNamespace(entered=asyncio.Event(), release=None, runtimes=[], guards=[],
+                               close_error=False, calls=[], commands=[])
+
+    class Runtime:
+        alive = False
+        forced_cleanup = False
+
+        def __init__(self, builder, **options):
+            scenario.runtimes.append(self)
+            self.options = options
+            # Actual builder command proves the catalog replaces workspace and
+            # home roots before any native launch, including its final cwd.
+            command = builder.build_command_prefix(["/opt/copilot-runtime/copilot-runtime"])
+            scenario.commands.append(command)
+            assert builder.get_cwd() == "/workspace"
+            workspace = next(mount for mount in builder.workspace_mount_table() if mount.sandbox == "/workspace")
+            assert Path(workspace.host).is_dir() and Path(workspace.host).is_relative_to(harness.records.state_root)
+            for index, option in enumerate(command):
+                if option in {"--bind", "--ro-bind"}:
+                    source = Path(command[index + 1])
+                    assert not source.is_relative_to(harness.homes.root)
+                    assert not source.is_relative_to(harness.records.root)
+            assert not options["environment"].keys() - {"PATH", "HOME", "LANG"}
+
+        async def start(self):
+            self.alive = True
+            return SimpleNamespace(get_auth_status=self.auth, _client=SimpleNamespace(request=self.request))
+
+        async def auth(self):
+            scenario.calls.append("auth")
+            return SimpleNamespace(isAuthenticated=True)
+
+        async def request(self, method, params, timeout):
+            assert (method, params) == ("models.list", {})
+            scenario.calls.append(method)
+            scenario.entered.set()
+            if scenario.release is not None:
+                await scenario.release.wait()
+            return {"models": [{"id": "listed-model", "name": "Listed model", "capabilities": {}}]}
+
+        async def close(self):
+            if scenario.close_error:
+                raise RuntimeError("secret cleanup detail")
+            self.alive = False
+
+    async def acquire(account, scope, on_invalid):
+        async def authorize():
+            scenario.calls.append("authorize")
+        async def close():
+            guard.valid = False
+        guard = SimpleNamespace(valid=True, credential=object(), authorize=authorize, close=close)
+        scenario.guards.append(guard)
+        scenario.invalidate = on_invalid
+        return guard
+
+    monkeypatch.setattr(catalog, "SandboxedCopilotRuntime", Runtime)
+    monkeypatch.setattr(catalog.CopilotLeaseGuard, "acquire", acquire)
+    return scenario
+
+
+@pytest.mark.asyncio
+async def test_catalog_inventory_uses_isolated_real_builder_and_leaves_no_history(harness, catalog_runtime):
+    from core.session.owned_sessions import get_owned_session
+
+    layer, sid = harness.layer(), harness.identity()
+    rows = await layer.list_models(sid, config(model="placeholder-not-requested"))
+    assert rows == [{"id": "listed-model", "name": "Listed model", "available": True,
+                     "policy": "unconfigured", "multiplier": None}]
+    assert catalog_runtime.calls == ["auth", "authorize", "models.list", "authorize"]
+    assert not harness.opens and not list(harness.records.root.iterdir())
+    assert not list(harness.records.state_root.iterdir()) and not list(harness.homes.root.iterdir())
+    assert not catalog_runtime.runtimes[0].alive and not catalog_runtime.guards[0].valid
+    assert get_owned_session(sid) is None and state.get_session_security(sid) is None
+
+
+@pytest.mark.asyncio
+async def test_catalog_cannot_be_driven_as_chat_and_layer_shutdown_joins_it(harness, catalog_runtime):
+    from core.session.owned_sessions import get_owned_session
+
+    layer, sid = harness.layer(), harness.identity()
+    catalog_runtime.release = asyncio.Event()
+    task = asyncio.create_task(layer.list_models(sid, config()))
+    await asyncio.wait_for(catalog_runtime.entered.wait(), timeout=2)
+    assert get_owned_session(sid) is not None
+    with pytest.raises(module.CopilotLayerError):
+        await anext(layer.send_message(sid, "must never reach SDK"))
+    with pytest.raises(module.CopilotLayerError):
+        await layer.start_session(sid, config())
+    await layer.aclose()
+    with pytest.raises(module.CopilotLayerError):
+        await task
+    assert not catalog_runtime.runtimes[0].alive
+    assert not list(harness.records.state_root.iterdir()) and get_owned_session(sid) is None
+
+
+@pytest.mark.asyncio
+async def test_failed_catalog_cleanup_retains_exact_claim_and_private_allocation(harness, catalog_runtime):
+    from core.session.owned_sessions import get_owned_session
+
+    layer, sid = harness.layer(), harness.identity()
+    catalog_runtime.close_error = True
+    with pytest.raises(module.CopilotLayerError, match="cleanup is incomplete"):
+        await layer.list_models(sid, config())
+    assert get_owned_session(sid) is not None and sid in layer._sessions
+    assert list(harness.records.state_root.iterdir()) and not list(harness.records.root.iterdir())
+    assert catalog_runtime.runtimes[0].alive and not catalog_runtime.guards[0].valid
+
+
+@pytest.mark.asyncio
+async def test_catalog_refuses_resume_before_creating_any_owner(harness, catalog_runtime):
+    layer, sid = harness.layer(), harness.identity()
+    with pytest.raises(module.CopilotLayerError):
+        await layer.list_models(sid, config(resume=True))
+    assert not layer._sessions and not catalog_runtime.runtimes
+    assert not list(harness.records.state_root.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_catalog_refuses_replacement_private_root_without_launch(harness, catalog_runtime):
+    layer, sid = harness.layer(), harness.identity()
+    root = harness.records.state_root
+    original = root.with_name("original-state")
+    root.rename(original)
+    root.mkdir(mode=0o700)
+    try:
+        with pytest.raises(module.CopilotLayerError):
+            await layer.list_models(sid, config())
+        assert not catalog_runtime.runtimes and not list(root.iterdir())
+        assert not layer._sessions
+    finally:
+        root.rmdir()
+        original.rename(root)
+
+
+@pytest.mark.asyncio
+async def test_catalog_actual_caller_cancellation_propagates_only_after_cleanup(harness, catalog_runtime):
+    layer, sid = harness.layer(), harness.identity()
+    catalog_runtime.release = asyncio.Event()
+    task = asyncio.create_task(layer.list_models(sid, config()))
+    await asyncio.wait_for(catalog_runtime.entered.wait(), timeout=2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not catalog_runtime.runtimes[0].alive and not layer._sessions
+    assert not list(harness.records.state_root.iterdir())

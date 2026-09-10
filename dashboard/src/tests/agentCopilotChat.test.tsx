@@ -30,6 +30,7 @@ beforeEach(() => {
   auth.user = { sub: 'alice', role: 'member', agents: ['demo', 'beta'], must_change_password: false, must_enroll_2fa: false }
   apiFetch.mockImplementation(async (raw: string, options: RequestInit = {}) => {
     const url = new URL(raw, 'http://localhost'), path = url.pathname
+    if (path.endsWith('/models')) return json({ models: [{ id: 'gpt-5-mini', name: 'GPT-5 mini', available: true, policy: 'enabled', multiplier: 0.33 }] })
     if (path.endsWith('/status')) return json({ available: true })
     if (path === '/v1/agents') return json({ agents: [{ name: 'demo', display_name: 'Demo agent' }, { name: 'beta', display_name: 'Beta agent' }] })
     if (path === '/v1/chats') return json({ chats: [] })
@@ -62,6 +63,14 @@ function mount(path = '/chat/demo/copilot') {
 }
 async function send(text = 'Hello') {
   await waitFor(() => expect(screen.getByLabelText('Message')).toBeEnabled())
+  const picker = screen.getByLabelText('Model')
+  if (picker.tagName === 'SELECT' && !(picker as HTMLSelectElement).value) {
+    const load = screen.getByRole('button', { name: 'Load available models' })
+    await waitFor(() => expect(load).toBeEnabled())
+    fireEvent.click(load)
+    await screen.findByRole('option', { name: /GPT-5 mini/ })
+    fireEvent.change(picker, { target: { value: 'gpt-5-mini' } })
+  }
   fireEvent.change(screen.getByLabelText('Message'), { target: { value: text } })
   fireEvent.click(screen.getByRole('button', { name: 'Send' }))
 }
