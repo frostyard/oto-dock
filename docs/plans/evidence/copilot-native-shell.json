@@ -1,0 +1,837 @@
+{
+  "result": "passed",
+  "sdk_version": "1.0.13",
+  "runtime_version": "1.0.83",
+  "credentials_supplied": false,
+  "model_prompts": 0,
+  "sandboxed": true,
+  "dispatch": "session.tools.execute",
+  "phase": "native shell lifecycle (RPC only)",
+  "cases": [
+    {
+      "mode": "sync",
+      "control": "natural",
+      "caller_supplied_shell_id": false,
+      "fixture_processes": 1,
+      "launch_returned_before_control": false,
+      "active_task_count": 1,
+      "tasks_before": [
+        {
+          "type": "shell",
+          "status": "running",
+          "attachment_mode": "attached",
+          "execution_mode": "sync",
+          "id_matches_shell_id": false
+        }
+      ],
+      "pid_relation": {
+        "pid_present": true,
+        "matches_host_fixture_pid": false,
+        "matches_host_ancestor_pid": false,
+        "matches_fixture_namespace_pid": true,
+        "matches_ancestor_namespace_pid": false
+      },
+      "progress_shape": {
+        "progress": {
+          "type": "str",
+          "pid": "int",
+          "recentOutput": "str"
+        }
+      },
+      "task_id_matches_shell_id": true,
+      "list_contains_shell_id": true,
+      "live_immediately_after_control": 0,
+      "tasks_immediately_after_control": [],
+      "live_after_quarter_second": 0,
+      "tasks_after_quarter_second": [],
+      "live_after_stop": 0,
+      "tasks_after_stop": [],
+      "launch_seconds": 2.277,
+      "launch_contains_shell_id": true,
+      "launch_contains_fixture_output": true
+    },
+    {
+      "mode": "sync",
+      "control": "tasks_cancel",
+      "caller_supplied_shell_id": false,
+      "fixture_processes": 1,
+      "launch_returned_before_control": false,
+      "active_task_count": 1,
+      "tasks_before": [
+        {
+          "type": "shell",
+          "status": "running",
+          "attachment_mode": "attached",
+          "execution_mode": "sync",
+          "id_matches_shell_id": false
+        }
+      ],
+      "pid_relation": {
+        "pid_present": true,
+        "matches_host_fixture_pid": false,
+        "matches_host_ancestor_pid": false,
+        "matches_fixture_namespace_pid": true,
+        "matches_ancestor_namespace_pid": false
+      },
+      "progress_shape": {
+        "progress": {
+          "type": "str",
+          "pid": "int",
+          "recentOutput": "str"
+        }
+      },
+      "task_id_matches_shell_id": true,
+      "list_contains_shell_id": true,
+      "tasks_cancel_result": {
+        "cancelled": true
+      },
+      "live_immediately_after_control": 1,
+      "tasks_immediately_after_control": [
+        {
+          "type": "shell",
+          "status": "completed",
+          "attachment_mode": "attached",
+          "execution_mode": "sync",
+          "id_matches_shell_id": true
+        }
+      ],
+      "live_after_quarter_second": 0,
+      "tasks_after_quarter_second": [
+        {
+          "type": "shell",
+          "status": "completed",
+          "attachment_mode": "attached",
+          "execution_mode": "sync",
+          "id_matches_shell_id": true
+        }
+      ],
+      "live_after_stop": 0,
+      "tasks_after_stop": [
+        {
+          "type": "shell",
+          "status": "completed",
+          "attachment_mode": "attached",
+          "execution_mode": "sync",
+          "id_matches_shell_id": true
+        }
+      ],
+      "launch_seconds": 12.287,
+      "launch_contains_shell_id": false,
+      "launch_contains_fixture_output": true
+    },
+    {
+      "mode": "sync",
+      "control": "promote_then_cancel",
+      "caller_supplied_shell_id": false,
+      "fixture_processes": 1,
+      "launch_returned_before_control": false,
+      "active_task_count": 1,
+      "tasks_before": [
+        {
+          "type": "shell",
+          "status": "running",
+          "attachment_mode": "attached",
+          "execution_mode": "sync",
+          "id_matches_shell_id": false
+        },
+        {
+          "type": "shell",
+          "status": "completed",
+          "attachment_mode": "attached",
+          "execution_mode": "sync",
+          "id_matches_shell_id": false
+        }
+      ],
+      "pid_relation": {
+        "pid_present": true,
+        "matches_host_fixture_pid": false,
+        "matches_host_ancestor_pid": false,
+        "matches_fixture_namespace_pid": true,
+        "matches_ancestor_namespace_pid": false
+      },
+      "progress_shape": {
+        "progress": {
+          "type": "str",
+          "pid": "int",
+          "recentOutput": "str"
+        }
+      },
+      "task_id_matches_shell_id": true,
+      "list_contains_shell_id": true,
+      "promote_result": {
+        "promoted": true
+      },
+      "tasks_after_promotion": [
+        {
+          "type": "shell",
+          "status": "running",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": true
+        },
+        {
+          "type": "shell",
+          "status": "completed",
+          "attachment_mode": "attached",
+          "execution_mode": "sync",
+          "id_matches_shell_id": false
+        }
+      ],
+      "launch_returned_after_promotion": true,
+      "tasks_cancel_result": {
+        "cancelled": true
+      },
+      "live_immediately_after_control": 0,
+      "tasks_immediately_after_control": [
+        {
+          "type": "shell",
+          "status": "cancelled",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": true
+        },
+        {
+          "type": "shell",
+          "status": "completed",
+          "attachment_mode": "attached",
+          "execution_mode": "sync",
+          "id_matches_shell_id": false
+        }
+      ],
+      "live_after_quarter_second": 0,
+      "tasks_after_quarter_second": [
+        {
+          "type": "shell",
+          "status": "cancelled",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": true
+        },
+        {
+          "type": "shell",
+          "status": "completed",
+          "attachment_mode": "attached",
+          "execution_mode": "sync",
+          "id_matches_shell_id": false
+        }
+      ],
+      "live_after_stop": 0,
+      "tasks_after_stop": [
+        {
+          "type": "shell",
+          "status": "cancelled",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": true
+        },
+        {
+          "type": "shell",
+          "status": "completed",
+          "attachment_mode": "attached",
+          "execution_mode": "sync",
+          "id_matches_shell_id": false
+        }
+      ],
+      "launch_seconds": 12.393,
+      "launch_contains_shell_id": true,
+      "launch_contains_fixture_output": false
+    },
+    {
+      "mode": "sync",
+      "control": "stop_bash",
+      "caller_supplied_shell_id": false,
+      "fixture_processes": 1,
+      "launch_returned_before_control": false,
+      "active_task_count": 1,
+      "tasks_before": [
+        {
+          "type": "shell",
+          "status": "running",
+          "attachment_mode": "attached",
+          "execution_mode": "sync",
+          "id_matches_shell_id": false
+        },
+        {
+          "type": "shell",
+          "status": "cancelled",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": false
+        },
+        {
+          "type": "shell",
+          "status": "completed",
+          "attachment_mode": "attached",
+          "execution_mode": "sync",
+          "id_matches_shell_id": false
+        }
+      ],
+      "pid_relation": {
+        "pid_present": true,
+        "matches_host_fixture_pid": false,
+        "matches_host_ancestor_pid": false,
+        "matches_fixture_namespace_pid": true,
+        "matches_ancestor_namespace_pid": false
+      },
+      "progress_shape": {
+        "progress": {
+          "type": "str",
+          "pid": "int",
+          "recentOutput": "str"
+        }
+      },
+      "task_id_matches_shell_id": true,
+      "list_contains_shell_id": true,
+      "stop_result_shape": {
+        "textResultForLlm": "str",
+        "resultType": "str",
+        "sessionLog": "str",
+        "toolTelemetry": {
+          "properties": {
+            "shell_status": "str"
+          },
+          "metrics": {
+            "tracked_shutdown_count": "float"
+          }
+        }
+      },
+      "live_immediately_after_control": 0,
+      "tasks_immediately_after_control": [
+        {
+          "type": "shell",
+          "status": "cancelled",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": false
+        },
+        {
+          "type": "shell",
+          "status": "completed",
+          "attachment_mode": "attached",
+          "execution_mode": "sync",
+          "id_matches_shell_id": false
+        }
+      ],
+      "live_after_quarter_second": 0,
+      "tasks_after_quarter_second": [
+        {
+          "type": "shell",
+          "status": "cancelled",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": false
+        },
+        {
+          "type": "shell",
+          "status": "completed",
+          "attachment_mode": "attached",
+          "execution_mode": "sync",
+          "id_matches_shell_id": false
+        }
+      ],
+      "live_after_stop": 0,
+      "tasks_after_stop": [
+        {
+          "type": "shell",
+          "status": "cancelled",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": false
+        },
+        {
+          "type": "shell",
+          "status": "completed",
+          "attachment_mode": "attached",
+          "execution_mode": "sync",
+          "id_matches_shell_id": false
+        }
+      ],
+      "launch_seconds": 12.29,
+      "launch_contains_shell_id": true,
+      "launch_contains_fixture_output": true
+    },
+    {
+      "mode": "async",
+      "control": "interrupt",
+      "caller_supplied_shell_id": true,
+      "fixture_processes": 1,
+      "launch_returned_before_control": true,
+      "active_task_count": 1,
+      "tasks_before": [
+        {
+          "type": "shell",
+          "status": "running",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": true
+        },
+        {
+          "type": "shell",
+          "status": "cancelled",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": false
+        },
+        {
+          "type": "shell",
+          "status": "completed",
+          "attachment_mode": "attached",
+          "execution_mode": "sync",
+          "id_matches_shell_id": false
+        }
+      ],
+      "pid_relation": {
+        "pid_present": true,
+        "matches_host_fixture_pid": false,
+        "matches_host_ancestor_pid": false,
+        "matches_fixture_namespace_pid": true,
+        "matches_ancestor_namespace_pid": false
+      },
+      "progress_shape": {
+        "progress": {
+          "type": "str",
+          "pid": "int",
+          "recentOutput": "str"
+        }
+      },
+      "task_id_matches_shell_id": true,
+      "list_contains_shell_id": true,
+      "read_contains_fixture_output": true,
+      "interrupt_result": {
+        "interrupted": false
+      },
+      "live_immediately_after_control": 1,
+      "tasks_immediately_after_control": [
+        {
+          "type": "shell",
+          "status": "running",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": true
+        },
+        {
+          "type": "shell",
+          "status": "cancelled",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": false
+        },
+        {
+          "type": "shell",
+          "status": "completed",
+          "attachment_mode": "attached",
+          "execution_mode": "sync",
+          "id_matches_shell_id": false
+        }
+      ],
+      "live_after_quarter_second": 1,
+      "tasks_after_quarter_second": [
+        {
+          "type": "shell",
+          "status": "running",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": true
+        },
+        {
+          "type": "shell",
+          "status": "cancelled",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": false
+        },
+        {
+          "type": "shell",
+          "status": "completed",
+          "attachment_mode": "attached",
+          "execution_mode": "sync",
+          "id_matches_shell_id": false
+        }
+      ],
+      "fallback_tasks_cancel_result": {
+        "cancelled": true
+      },
+      "live_after_stop": 0,
+      "tasks_after_stop": [
+        {
+          "type": "shell",
+          "status": "cancelled",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": true
+        },
+        {
+          "type": "shell",
+          "status": "cancelled",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": false
+        },
+        {
+          "type": "shell",
+          "status": "completed",
+          "attachment_mode": "attached",
+          "execution_mode": "sync",
+          "id_matches_shell_id": false
+        }
+      ],
+      "launch_seconds": 1.394,
+      "launch_contains_shell_id": true,
+      "launch_contains_fixture_output": false
+    },
+    {
+      "mode": "async",
+      "control": "abort",
+      "caller_supplied_shell_id": true,
+      "fixture_processes": 1,
+      "launch_returned_before_control": true,
+      "active_task_count": 1,
+      "tasks_before": [
+        {
+          "type": "shell",
+          "status": "running",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": true
+        },
+        {
+          "type": "shell",
+          "status": "cancelled",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": false
+        },
+        {
+          "type": "shell",
+          "status": "cancelled",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": false
+        },
+        {
+          "type": "shell",
+          "status": "completed",
+          "attachment_mode": "attached",
+          "execution_mode": "sync",
+          "id_matches_shell_id": false
+        }
+      ],
+      "pid_relation": {
+        "pid_present": true,
+        "matches_host_fixture_pid": false,
+        "matches_host_ancestor_pid": false,
+        "matches_fixture_namespace_pid": true,
+        "matches_ancestor_namespace_pid": false
+      },
+      "progress_shape": {
+        "progress": {
+          "type": "str",
+          "pid": "int",
+          "recentOutput": "str"
+        }
+      },
+      "task_id_matches_shell_id": true,
+      "list_contains_shell_id": true,
+      "read_contains_fixture_output": true,
+      "abort_result_shape": {
+        "success": "bool"
+      },
+      "abort_success": true,
+      "live_immediately_after_control": 1,
+      "tasks_immediately_after_control": [
+        {
+          "type": "shell",
+          "status": "running",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": true
+        },
+        {
+          "type": "shell",
+          "status": "cancelled",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": false
+        },
+        {
+          "type": "shell",
+          "status": "cancelled",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": false
+        },
+        {
+          "type": "shell",
+          "status": "completed",
+          "attachment_mode": "attached",
+          "execution_mode": "sync",
+          "id_matches_shell_id": false
+        }
+      ],
+      "live_after_quarter_second": 1,
+      "tasks_after_quarter_second": [
+        {
+          "type": "shell",
+          "status": "running",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": true
+        },
+        {
+          "type": "shell",
+          "status": "cancelled",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": false
+        },
+        {
+          "type": "shell",
+          "status": "cancelled",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": false
+        },
+        {
+          "type": "shell",
+          "status": "completed",
+          "attachment_mode": "attached",
+          "execution_mode": "sync",
+          "id_matches_shell_id": false
+        }
+      ],
+      "fallback_tasks_cancel_result": {
+        "cancelled": true
+      },
+      "live_after_stop": 0,
+      "tasks_after_stop": [
+        {
+          "type": "shell",
+          "status": "cancelled",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": true
+        },
+        {
+          "type": "shell",
+          "status": "cancelled",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": false
+        },
+        {
+          "type": "shell",
+          "status": "cancelled",
+          "attachment_mode": "attached",
+          "execution_mode": "background",
+          "id_matches_shell_id": false
+        },
+        {
+          "type": "shell",
+          "status": "completed",
+          "attachment_mode": "attached",
+          "execution_mode": "sync",
+          "id_matches_shell_id": false
+        }
+      ],
+      "launch_seconds": 1.392,
+      "launch_contains_shell_id": true,
+      "launch_contains_fixture_output": false
+    }
+  ],
+  "unauthenticated": true,
+  "tasks_shape": {
+    "tasks": [
+      {
+        "attachmentMode": "str",
+        "command": "str",
+        "description": "str",
+        "id": "str",
+        "startedAt": "str",
+        "status": "str",
+        "type": "str",
+        "canPromoteToBackground": "bool",
+        "completedAt": "str",
+        "executionMode": "str",
+        "pid": "int"
+      }
+    ]
+  },
+  "tool_result_shapes": {
+    "list_bash": {
+      "textResultForLlm": "str",
+      "resultType": "str",
+      "sessionLog": "str",
+      "toolTelemetry": {}
+    },
+    "bash": {
+      "textResultForLlm": "str",
+      "resultType": "str",
+      "sessionLog": "str",
+      "toolTelemetry": {
+        "properties": {
+          "customTimeout": "str",
+          "executionMode": "str",
+          "detached": "str",
+          "sandboxApplied": "str",
+          "sandboxOptOutRequested": "str"
+        },
+        "metrics": {}
+      }
+    },
+    "stop_bash": {
+      "textResultForLlm": "str",
+      "resultType": "str",
+      "sessionLog": "str",
+      "toolTelemetry": {
+        "properties": {
+          "shell_status": "str"
+        },
+        "metrics": {
+          "tracked_shutdown_count": "float"
+        }
+      }
+    },
+    "read_bash": {
+      "textResultForLlm": "str",
+      "resultType": "str",
+      "sessionLog": "str",
+      "toolTelemetry": {
+        "properties": {
+          "read_target_state": "str",
+          "read_target_original_mode": "str",
+          "shell_error_category": "str",
+          "is_timeout": "str"
+        }
+      }
+    }
+  },
+  "live_fixtures_before_runtime_close": 0,
+  "runtime_closed": true,
+  "normal_cleanup": true,
+  "fixture_survivors_after_cleanup": 0,
+  "events": {
+    "session.start": 1,
+    "session.skills_loaded": 1,
+    "session.info": 1,
+    "session.tools_updated": 1,
+    "hook.start": 30,
+    "hook.end": 30,
+    "session.background_tasks_changed": 72,
+    "sandbox.decision": 6,
+    "tool.execution_partial_result": 7,
+    "session.shutdown": 1
+  },
+  "event_shapes": {
+    "session.start": {
+      "copilotVersion": "str",
+      "producer": "str",
+      "sessionId": "str",
+      "startTime": "str",
+      "version": "int",
+      "alreadyInUse": "bool",
+      "context": {
+        "cwd": "str"
+      },
+      "remoteSteerable": "bool",
+      "selectedModel": "str"
+    },
+    "session.skills_loaded": {
+      "skills": []
+    },
+    "session.info": {
+      "infoType": "str",
+      "message": "str"
+    },
+    "session.tools_updated": {
+      "model": "str"
+    },
+    "hook.start": {
+      "hookInvocationId": "str",
+      "hookType": "str",
+      "input": {
+        "sessionId": "str",
+        "timestamp": "int",
+        "cwd": "str",
+        "toolName": "str",
+        "toolArgs": {
+          "shellId": "str",
+          "delay": "int"
+        },
+        "toolResult": {
+          "textResultForLlm": "str",
+          "resultType": "str",
+          "sessionLog": "str",
+          "toolTelemetry": {
+            "properties": {
+              "read_target_state": "str",
+              "read_target_original_mode": "str",
+              "shell_error_category": "str",
+              "is_timeout": "str"
+            }
+          }
+        }
+      }
+    },
+    "hook.end": {
+      "hookInvocationId": "str",
+      "hookType": "str",
+      "success": "bool"
+    },
+    "session.background_tasks_changed": {},
+    "sandbox.decision": {},
+    "tool.execution_partial_result": {
+      "partialOutput": "str",
+      "toolCallId": "str"
+    },
+    "session.shutdown": {
+      "codeChanges": {
+        "filesModified": [],
+        "linesAdded": "int",
+        "linesRemoved": "int"
+      },
+      "modelMetrics": {},
+      "sessionStartTime": "int",
+      "shutdownType": "str",
+      "totalApiDurationMs": "int",
+      "conversationTokens": "int",
+      "currentTokens": "int",
+      "systemTokens": "int",
+      "toolDefinitionsTokens": "int",
+      "totalNanoAiu": "float",
+      "totalPremiumRequests": "float"
+    }
+  },
+  "hook_counts": {
+    "bash": 6,
+    "list_bash": 6,
+    "stop_bash": 1,
+    "read_bash": 2
+  },
+  "guarded_cases": [
+    {
+      "control": "natural",
+      "fence_blocks_while_running": true,
+      "snapshot_has_unsettled_work": true,
+      "fence_settled_after_control": true,
+      "fixture_live_after_control": 0,
+      "snapshot_settled_after_control": true
+    },
+    {
+      "control": "abort",
+      "fence_blocks_while_running": true,
+      "snapshot_has_unsettled_work": true,
+      "promoted_to_background": true,
+      "native_execution_mode_background": true,
+      "tool_rpc_returned_while_process_alive": true,
+      "fence_blocks_after_tool_rpc_returned": true,
+      "adapter_abort_returned": true,
+      "fence_settled_after_control": true,
+      "fixture_live_after_control": 0,
+      "snapshot_settled_after_control": true
+    }
+  ],
+  "guarded_runtime_closed": true,
+  "guarded_normal_cleanup": true,
+  "fixture_survivors_after_all_cleanup": 0,
+  "elapsed_seconds": 50.419
+}

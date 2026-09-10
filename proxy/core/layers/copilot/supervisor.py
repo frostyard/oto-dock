@@ -30,6 +30,9 @@ class RuntimeSnapshot:
     tasks: tuple[TaskObservation, ...] | None
     pending_permissions: frozenset[str] | None
     pending_messages: frozenset[str] | None
+    # Only the guarded shell adapter supplies this after an accepted control,
+    # terminal native inventory AND independent owned-process settlement.
+    native_shells_stopped: bool = False
 
 
 class SessionBackend(Protocol):
@@ -82,6 +85,7 @@ class CopilotSessionSupervisor:
         self._completed_user_inputs: set[str] = set()
         self._permission_events = CopilotPermissionEvents()
         self._open_tools: set[str] = set()
+        self._native_shell_tools: set[str] = set()
         self._cancelled_tools: frozenset[str] = frozenset()
         self._interrupt_ticket = None
         self._control_pending = False
@@ -133,6 +137,7 @@ class CopilotSessionSupervisor:
                 self.requests.pause_admissions()
             if event.type == TOOL_RESULT:
                 self._open_tools.discard(event.data.get("tool_id"))
+                self._native_shell_tools.discard(event.data.get("tool_id"))
             self._events.append(event)
         self._changed.set()
 
@@ -164,6 +169,8 @@ class CopilotSessionSupervisor:
                 for output in translated:
                     if output.type == "tool_use":
                         self._open_tools.add(output.data["tool_id"])
+                        if output.data.get("name") == "bash":
+                            self._native_shell_tools.add(output.data["tool_id"])
             self._emit(translated)
             self._changed.set()
         except Exception:
@@ -242,7 +249,7 @@ class CopilotSessionSupervisor:
         requests = self._pending_requests()
         if not isinstance(native, RuntimeSnapshot) or (
             native.processing is not None and type(native.processing) is not bool
-        ):
+        ) or type(native.native_shells_stopped) is not bool:
             raise ValueError("Invalid Copilot runtime snapshot")
         for identities in (native.pending_permissions, native.pending_messages, requests):
             if identities is not None and (
@@ -264,6 +271,11 @@ class CopilotSessionSupervisor:
             cancelled_tool_ids=self._cancelled_tools & self._open_tools,
             cancelled_permission_tool_ids=(self._permission_events.cancelled_tool_ids
                                           & self._open_tools - self._cancelled_tools),
+            cancelled_native_shell_tool_ids=frozenset(
+                self._native_shell_tools & self._open_tools
+                - self._cancelled_tools - self._permission_events.cancelled_tool_ids
+                if native.native_shells_stopped else frozenset()
+            ),
         )
 
     async def _reconcile(self) -> None:

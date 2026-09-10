@@ -190,7 +190,23 @@ class SandboxedCopilotRuntime:
         self._nonce = secrets.token_hex(32)
         self._tree = _OwnedTree()
         self._started = False
+        self._process_fence = None
         self.forced_cleanup = False
+
+    def capture_process_fence(self):
+        """Capture once, before creating any SDK session or admitting tool work.
+
+        The returned check blocks while any new owned process identity is live.
+        It is deliberately runtime-wide: a persistent helper also blocks until
+        retired. Native task PIDs are namespace-local and are never signalled or
+        interpreted as host PIDs. One guarded SDK session may own this runtime.
+        """
+        if (not self.alive or self._process_fence is not None
+                or getattr(self._client, '_sessions', None) != {}):
+            raise RuntimeError('Copilot process baseline must precede session creation')
+        self._observe()
+        self._process_fence = _RuntimeProcessFence(self)
+        return self._process_fence
 
     @property
     def alive(self) -> bool:
@@ -458,3 +474,52 @@ class SandboxedCopilotRuntime:
             self._client = None
             self._start_task = None
             self._popen = None
+
+
+class _RuntimeProcessFence:
+    """Conservative read-only census over the existing exact process owner."""
+
+    def __init__(self, runtime):
+        self._runtime = runtime
+        self._client = runtime._client
+        self._baseline = frozenset((p.pid, p.start_ticks) for p in runtime._tree.live())
+        self._session = None
+        self._session_id = None
+        self._failed = False
+
+    def _check(self):
+        runtime = self._runtime
+        if (self._failed or not runtime.alive or not runtime._tree.handshake_verified
+                or runtime._client is not self._client):
+            raise RuntimeError()
+        sessions = getattr(self._client, '_sessions', None)
+        if not isinstance(sessions, dict) or len(sessions) != 1:
+            raise RuntimeError()
+        identity, session = next(iter(sessions.items()))
+        if (not isinstance(identity, str) or not identity or len(identity) > 256
+                or identity.strip() != identity or not identity.isprintable()
+                or getattr(session, 'session_id', None) != identity):
+            raise RuntimeError()
+        if self._session is None:
+            self._session, self._session_id = session, identity
+        elif session is not self._session or identity != self._session_id:
+            raise RuntimeError()
+
+    def is_settled(self) -> bool:
+        runtime = self._runtime
+        try:
+            self._check()
+            # Two complete censuses retain newly discovered descendants even
+            # when their original parent has already exited. Only exact root
+            # ancestry/session ownership can adopt a process; unrelated proxy
+            # children neither block nor receive signals through this check.
+            for _ in range(2):
+                runtime._observe()
+                self._check()
+                if any((p.pid, p.start_ticks) not in self._baseline for p in runtime._tree.live()):
+                    return False
+            self._check()
+            return True
+        except Exception:
+            self._failed = True
+        raise RuntimeError('Copilot owned process settlement is unavailable')

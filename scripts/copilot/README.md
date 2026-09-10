@@ -214,6 +214,32 @@ state. This does not mint or refresh a real OAuth/installation token or prove tw
 real payer accounts. See the [authentication contract](../../docs/plans/copilot-auth-contract.md)
 and [account foundation](../../docs/plans/copilot-account-leases.md).
 
+## Attached native shell ownership
+
+The no-auth probe records native shell task/control behavior and the independent
+owned-process fence. It uses fixed disposable sleeps in two sequential runtimes:
+
+```bash
+python scripts/copilot/native_shell_probe.py \
+  --runtime-dir /tmp/otodock-copilot-runtime/prebuilds/linux-x64 \
+  --run --output /tmp/copilot-native-shell.json
+```
+
+The separate model-driven probe uses three bounded turns (normal, abort,
+interrupt), with a 240-second overall deadline, 65-second turn deadlines and
+30-credit session ceilings. It selects the GitHub CLI user token in memory:
+
+```bash
+python scripts/copilot/native_shell_model_probe.py \
+  --runtime-dir /tmp/otodock-copilot-runtime/prebuilds/linux-x64 \
+  --live --use-gh-token --output /tmp/copilot-native-shell-model.json
+```
+
+Both require the existing Linux sandbox/SDK setup and `psutil`. They verify exact
+fixture process identities without exporting command text or PIDs. See the
+[shell results](../../docs/plans/copilot-native-shell-results.md) and
+[pinned contract](../../docs/plans/copilot-native-shell-contract.md) for limits.
+
 ## Offline regression tests
 
 The [native terminal probe](../../docs/plans/copilot-terminal-results.md) runs a
