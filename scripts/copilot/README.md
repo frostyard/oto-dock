@@ -4,6 +4,25 @@ These are development probes for C1 of the
 [parity plan](../../docs/plans/copilot-parity.md). They do not register an engine,
 change an OtoDock installation, or establish full parity.
 
+## Authenticated chat preview
+
+The [preview contract](../../docs/plans/copilot-chat-preview-contract.md) describes
+enabling local chat in User Settings after provisioning. `chat_api_probe.py`
+qualifies the actual signed-cookie HTTP/SSE path in an isolated temporary app:
+
+```bash
+python scripts/copilot/chat_api_probe.py \
+  --provisioned-root /srv/otodock-copilot-private/local \
+  --live --use-gh-token --output /tmp/copilot-chat-preview.json
+```
+
+This spends up to three model turns, approves only an exact temporary native file
+write, checks warm recall, disconnect cleanup, cross-user/origin rejection and
+idle role revocation. It uses real runtime assets and retained private history,
+but controlled user, agent, account and network-discovery reads; it does not
+modify an existing deployment or use PostgreSQL. See the
+[results and limits](../../docs/plans/copilot-chat-preview-results.md).
+
 ## Explicit local setup
 
 `provision_local.py` initializes a private installation from the exact official

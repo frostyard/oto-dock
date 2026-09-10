@@ -55,7 +55,7 @@ function AccountSetup({ userSub, isAdmin }: { userSub: string; isAdmin: boolean 
 
   return <section aria-label="GitHub Copilot account setup preview" className="border border-p-border-light rounded-xl p-4 bg-white dark:bg-p-surface space-y-3">
     <h3 className="font-medium text-p-text">GitHub Copilot <span className="text-xs text-p-text-secondary">Account setup preview</span></h3>
-    <p className="text-sm text-p-text-secondary">Save your GitHub account for future Copilot support. Copilot chat is not available yet. GitHub identity validation does not verify Copilot entitlement.</p>
+    <p className="text-sm text-p-text-secondary">Save your GitHub account for Copilot. Chat preview is available below when enabled on this server. GitHub identity validation does not verify Copilot entitlement.</p>
     {query.isLoading && <p className="text-sm text-p-text-secondary">Loading accounts…</p>}
     {query.isError && <p role="alert" className="text-sm text-red-500">Accounts could not be loaded. Refresh to try again.</p>}
     <ul className="space-y-3">

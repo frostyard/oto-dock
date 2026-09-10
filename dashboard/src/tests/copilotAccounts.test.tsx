@@ -47,10 +47,10 @@ async function connectForm() {
 }
 
 describe('Copilot account preview', () => {
-  it('discloses unavailable chat and unverified entitlement, without a model picker', async () => {
+  it('discloses opt-in chat and unverified entitlement, without a model picker', async () => {
     mount()
     await connectForm()
-    expect(screen.getByText(/Copilot chat is not available yet/)).toBeInTheDocument()
+    expect(screen.getByText(/Chat preview is available below when enabled/)).toBeInTheDocument()
     expect(screen.getByText(/does not verify Copilot entitlement/)).toBeInTheDocument()
     expect(screen.getByLabelText('GitHub token')).toHaveAttribute('type', 'password')
     expect(screen.getByLabelText('GitHub token')).toHaveAttribute('autocomplete', 'off')

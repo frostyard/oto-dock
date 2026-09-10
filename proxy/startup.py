@@ -575,51 +575,55 @@ async def lifespan(app: FastAPI):
             config.LOOP_WATCHDOG_THRESHOLD_S,
         )
 
-    yield
-    # ── Graceful Shutdown ──
-    logger.info("Proxy shutdown starting...")
-
-    # Cancel the refresh worker BEFORE _shutdown_sessions so it doesn't
-    # fight credential_writeback for per-account locks during drain.
+    from core.layers.copilot.chat_lifetime import copilot_chat_lifetime
     try:
-        await oauth_refresh_worker.stop_worker()
-    except Exception:
-        logger.exception("OAuth refresh worker shutdown failed (continuing)")
+        async with copilot_chat_lifetime(app, config.COPILOT_LOCAL_ROOT):
+            yield
+    finally:
+        # ── Graceful Shutdown ──
+        logger.info("Proxy shutdown starting...")
 
-    try:
-        await subscription_renewer.stop_worker()
-    except Exception:
-        logger.exception("Subscription renewer shutdown failed (continuing)")
+        # Cancel the refresh worker BEFORE _shutdown_sessions so it doesn't
+        # fight credential_writeback for per-account locks during drain.
+        try:
+            await oauth_refresh_worker.stop_worker()
+        except Exception:
+            logger.exception("OAuth refresh worker shutdown failed (continuing)")
 
-    try:
-        await license_check_worker.stop_worker()
-    except Exception:
-        logger.exception("License check worker shutdown failed (continuing)")
+        try:
+            await subscription_renewer.stop_worker()
+        except Exception:
+            logger.exception("Subscription renewer shutdown failed (continuing)")
 
-    try:
-        await phone_health_worker.stop_worker()
-    except Exception:
-        logger.exception("Phone health worker shutdown failed (continuing)")
+        try:
+            await license_check_worker.stop_worker()
+        except Exception:
+            logger.exception("License check worker shutdown failed (continuing)")
 
-    try:
-        await token_fanout.stop_worker()
-    except Exception:
-        logger.exception("Token-freshness worker shutdown failed (continuing)")
+        try:
+            await phone_health_worker.stop_worker()
+        except Exception:
+            logger.exception("Phone health worker shutdown failed (continuing)")
 
-    try:
-        await asyncio.wait_for(_shutdown_sessions(logger), timeout=30)
-    except (asyncio.TimeoutError, TimeoutError):
-        logger.warning("Shutdown timed out after 30s — force-closing remaining resources")
+        try:
+            await token_fanout.stop_worker()
+        except Exception:
+            logger.exception("Token-freshness worker shutdown failed (continuing)")
 
-    # Close the HTTP tunnel dispatcher (httpx client + sweeper task).
-    try:
-        from core.remote.satellite_http_tunnel import get_dispatcher
-        await get_dispatcher().shutdown()
-    except Exception:
-        logger.exception("HTTP tunnel dispatcher shutdown failed (continuing)")
+        try:
+            await asyncio.wait_for(_shutdown_sessions(logger), timeout=30)
+        except (asyncio.TimeoutError, TimeoutError):
+            logger.warning("Shutdown timed out after 30s — force-closing remaining resources")
 
-    await _shutdown_cleanup(logger)
-    logger.info("Proxy shutdown complete")
+        # Close the HTTP tunnel dispatcher (httpx client + sweeper task).
+        try:
+            from core.remote.satellite_http_tunnel import get_dispatcher
+            await get_dispatcher().shutdown()
+        except Exception:
+            logger.exception("HTTP tunnel dispatcher shutdown failed (continuing)")
+
+        await _shutdown_cleanup(logger)
+        logger.info("Proxy shutdown complete")
 
 
 async def _flush_active_pumps(logger) -> None:

@@ -73,6 +73,7 @@ from api.tasks import continuations as continuations_router
 from api.events import triggers as triggers_router
 from api.agents import agents as agents_router
 from api.agents import chats as chats_router
+from api.agents import copilot_chat as copilot_chat_router
 from api.departments import departments as departments_router
 from api.notifications import notifications as notifications_router
 from api.mcp import credentials as credentials_router
@@ -139,6 +140,7 @@ app.include_router(credentials_router.router)
 app.include_router(claude_oauth_router.router)
 app.include_router(openai_oauth_router.router)
 app.include_router(copilot_accounts_router.router)
+app.include_router(copilot_chat_router.router)
 app.include_router(oauth_router.router)
 app.include_router(mcps_router.router)
 app.include_router(community_router.router)

@@ -241,7 +241,9 @@ See all features at [otodock.io/features](https://otodock.io/features).
 
 ## Quick start
 
-**Frostyard fork:** Copilot support is under development. Use the
+**Frostyard fork:** Copilot support is under development, with an opt-in
+[local chat preview](docs/plans/copilot-chat-preview-contract.md) in AI Engines
+settings for personal GitHub accounts. Full engine parity remains incomplete. Use the
 [Frostyard source-build instructions](docs/development/frostyard-releases.md).
 The installer in this fork is disabled pending release qualification. The quick
 start below installs **upstream OtoDock**, without Frostyard changes.
