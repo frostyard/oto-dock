@@ -363,6 +363,15 @@ class CopilotExecutionLayer(ExecutionLayer):
             raise CopilotLayerError("Cannot prepare a live Copilot session for resume")
         await self.close_session(session_id)
 
+    async def history_ready(self, session_id: str, owner_sub: str) -> bool:
+        """Read-only private-record candidate proof, never resume admission."""
+        from core.session.owned_sessions import get_owned_session
+
+        if get_owned_session(session_id) is not None:
+            return False
+        ready = await asyncio.to_thread(self._records.is_ready, session_id, owner_sub)
+        return ready and get_owned_session(session_id) is None
+
     async def can_resume_session(self, session_id, *, agent_name="", username="", external_home=""):
         # This legacy query carries no account/driver/profile authorization.
         # Explicit CopilotAgentConfig(resume=True) verifies those in the factory.

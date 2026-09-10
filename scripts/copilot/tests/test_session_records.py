@@ -478,3 +478,43 @@ def test_restrictive_umask_does_not_make_record_or_lock_unusable(store, roots):
     assert stat.S_IMODE(next(roots[0].glob("*.lock")).stat().st_mode) == 0o600
     with store.open(profile()):
         pass
+
+
+def test_history_ready_is_exact_owner_read_only_and_requires_free_ready_record(store, roots):
+    before = list(roots[0].iterdir())
+    assert not store.is_ready(profile().platform_session_id, "owner")
+    assert list(roots[0].iterdir()) == before
+    path = ready(store)
+    files = {file: (file.stat().st_ino, file.stat().st_mtime_ns) for root in roots for file in root.rglob("*")}
+    assert store.is_ready(profile().platform_session_id, "owner")
+    assert not store.is_ready(profile().platform_session_id, "another-owner")
+    assert not store.is_ready("other-session", "owner")
+    assert files == {file: (file.stat().st_ino, file.stat().st_mtime_ns) for root in roots for file in root.rglob("*")}
+    record = store.open(profile())
+    try:
+        assert not store.is_ready(profile().platform_session_id, "owner")
+    finally:
+        record.close()
+    assert path.exists() and not store.is_ready(profile().platform_session_id, "owner")
+
+
+@pytest.mark.parametrize("attack", ["fifo", "symlink", "hardlink", "wrong-profile", "missing-allocation"])
+def test_history_ready_rejects_untrusted_records_without_mutating(store, roots, attack):
+    path = ready(store)
+    file = record_path(roots)
+    if attack == "fifo":
+        file.unlink()
+        os.mkfifo(file, mode=0o600)
+    elif attack == "symlink":
+        backup = file.with_suffix(".backup")
+        file.rename(backup)
+        file.symlink_to(backup)
+    elif attack == "hardlink":
+        os.link(file, file.with_suffix(".backup"))
+    elif attack == "wrong-profile":
+        document = json.loads(file.read_text())
+        document["profile"]["platform_session_id"] = "another-session"
+        file.write_text(json.dumps(document))
+    else:
+        path.rename(path.with_name("moved"))
+    assert not store.is_ready(profile().platform_session_id, "owner")

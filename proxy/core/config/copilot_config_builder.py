@@ -199,6 +199,27 @@ def _build(sub, agent_name, account_id, account_scope, model, permission_mode,
     return result
 
 
+async def authorize_copilot_history(user: UserContext, agent_name: str) -> None:
+    """Recheck human/agent access without requiring a still-connected payer.
+
+    A conversation's immutable owner must be checked separately by its store.
+    Reading saved output never reads credentials, instructions or native files.
+    """
+    failed = False
+    try:
+        if (type(user) is not UserContext or user.is_api_key is not False
+                or user.session_id or user.agent or user.external_claim
+                or user.external_channel or user.external_id
+                or not _text(user.sub) or user.sub == "api-key" or user.sub.startswith("session:")
+                or not _text(agent_name) or not config.is_safe_agent_name(agent_name)):
+            raise ValueError()
+        await asyncio.to_thread(_authority, user.sub, agent_name)
+    except Exception:
+        failed = True
+    if failed:
+        raise CopilotConfigError("Copilot conversation access is unavailable")
+
+
 async def build_copilot_agent_config(*, user: UserContext, agent_name: str,
                                      account_id: str, account_scope: CopilotAccountScope,
                                      model: str, permission_mode="default", client_type="dashboard",

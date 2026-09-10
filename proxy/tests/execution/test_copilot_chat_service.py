@@ -5,6 +5,11 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 import uuid
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts" / "copilot"))
+from conversation_fixture import MemoryConversations
 
 import pytest
 import pytest_asyncio
@@ -56,6 +61,9 @@ class Layer:
     async def is_session_process_dead(self, sid):
         return sid not in self.sessions
 
+    async def history_ready(self, sid, owner):
+        return sid not in self.sessions
+
     async def respond_permission(self, sid, request_id, approved):
         assert state.get_permission_request_session(request_id) == sid
         assert state.resolve_permission(request_id, approved)
@@ -81,12 +89,18 @@ async def fixture(monkeypatch):
             slots.add(sid)
         return current["admission"]
 
+    async def history(user, agent):
+        if current["denied"]:
+            raise RuntimeError("denied")
+
+    monkeypatch.setattr(module, "authorize_copilot_history", history)
     monkeypatch.setattr(module, "build_copilot_agent_config", build)
     monkeypatch.setattr(module, "acquire_chat_slot", acquire)
     monkeypatch.setattr(module, "release_chat_slot", slots.discard)
 
     def service(**options):
         options.setdefault("watch_interval", 0.01)
+        options.setdefault("store", MemoryConversations())
         instance = CopilotChatService(layer, **options)
         services.append(instance)
         return instance
@@ -613,3 +627,300 @@ async def test_cancellation_swallowed_by_admission_records_then_releases_safe_sl
     with pytest.raises((asyncio.CancelledError, CopilotChatError)):
         await asyncio.wait_for(pending, 1)
     assert not fixture.slots and not fixture.layer.started and not service._entries
+
+
+@pytest.mark.asyncio
+async def test_durable_order_precedes_native_dispatch_and_every_delivered_frame(fixture):
+    service = fixture.service()
+    handle = await create(fixture, service)
+    cid = service.conversation_id(fixture.user, handle)
+
+    async def program(sid):
+        assert service.store.events(cid, fixture.user.sub)[0]["type"] == "user"
+        yield CommonEvent("thinking", {"content": "private reasoning"})
+        yield CommonEvent("text", {"content": "durable"})
+        yield CommonEvent("done", {})
+
+    fixture.layer.program = program
+    turn = await service.prepare_turn(fixture.user, handle, "persist first")
+    async for frame in turn:
+        assert any({key: value for key, value in event.items() if key != "seq"} == frame
+                   for event in service.store.events(cid, fixture.user.sub))
+    await service.close(fixture.user, handle)
+    history = await service.get_conversation(fixture.user, cid)
+    assert [event["type"] for event in history["events"]] == ["user", "text", "turn_complete"]
+    assert history["conversation"]["can_resume"]
+    assert not {"platform_session_id", "generation", "user_sub"} & history["conversation"].keys()
+
+
+@pytest.mark.asyncio
+async def test_cold_resume_preserves_config_rotates_handle_and_rejects_stale_driver(fixture):
+    store = MemoryConversations()
+    first = fixture.service(store=store)
+    old = await create(fixture, first)
+    cid = first.conversation_id(fixture.user, old)
+    assert [frame async for frame in await first.prepare_turn(fixture.user, old, "remember")][-1]["type"] == "turn_complete"
+    await first.close(fixture.user, old)
+    second = fixture.service(store=store)
+    saved = await second.get_conversation(fixture.user, cid)
+    handle = await second.resume(fixture.user, cid, saved["conversation"]["revision"])
+    assert handle != old and second.conversation_id(fixture.user, handle) == cid
+    sid, config = fixture.layer.started[-1]
+    assert sid == old and config.resume is True
+    assert (config.agent_name, config.account_id, config.model, config.permission_mode) == ("agent", "account", "model", "default")
+    with pytest.raises(CopilotChatError) as caught:
+        await second.close(fixture.user, old)
+    assert caught.value.status_code == 404 and sid in fixture.layer.sessions
+    assert [frame async for frame in await second.prepare_turn(fixture.user, handle, "recall")][-1]["type"] == "turn_complete"
+
+
+@pytest.mark.asyncio
+async def test_wrong_owner_and_revoked_agent_cannot_read_or_resume(fixture):
+    service = fixture.service()
+    handle = await create(fixture, service)
+    cid = service.conversation_id(fixture.user, handle)
+    for operation in (service.get_conversation(fixture.other, cid), service.resume(fixture.other, cid, 1)):
+        with pytest.raises(CopilotChatError) as caught:
+            await operation
+        assert caught.value.status_code == 404
+    assert (await service.list_conversations(fixture.other))["conversations"] == []
+    fixture.current["denied"] = True
+    with pytest.raises(CopilotChatError) as caught:
+        await service.get_conversation(fixture.user, cid)
+    assert caught.value.status_code == 403
+    assert (await service.list_conversations(fixture.user))["conversations"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["begin_turn", "append_event", "finish_turn"])
+async def test_failed_durable_write_never_fabricates_completion(fixture, operation):
+    service = fixture.service()
+    handle = await create(fixture, service)
+    cid = service.conversation_id(fixture.user, handle)
+
+    def failure(*args, **kwargs):
+        raise RuntimeError("private SQL credential text")
+
+    setattr(service.store, operation, failure)
+    if operation == "begin_turn":
+        with pytest.raises(CopilotChatError) as caught:
+            await service.prepare_turn(fixture.user, handle, "failure")
+        assert "private" not in str(caught.value) and not fixture.layer.messages
+    else:
+        frames = [frame async for frame in await service.prepare_turn(fixture.user, handle, "failure")]
+        assert not any(frame["type"] == "turn_complete" for frame in frames)
+    await gone(fixture, service, handle)
+    assert service.store.get(cid, fixture.user.sub)["state"] == "incomplete"
+
+
+@pytest.mark.asyncio
+async def test_partial_turn_is_quarantined_and_resume_never_starts_runtime(fixture):
+    service = fixture.service()
+    handle = await create(fixture, service)
+    cid = service.conversation_id(fixture.user, handle)
+
+    async def program(sid):
+        yield CommonEvent("text", {"content": "partial"})
+        await asyncio.Event().wait()
+
+    fixture.layer.program = program
+    turn = await service.prepare_turn(fixture.user, handle, "partial")
+    assert (await anext(turn))["type"] == "text"
+    await turn.aclose()
+    row = service.store.get(cid, fixture.user.sub)
+    assert row["state"] == "incomplete"
+    with pytest.raises(CopilotChatError) as caught:
+        await service.resume(fixture.user, cid, row["revision"])
+    assert caught.value.status_code == 409 and len(fixture.layer.started) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_resume_claim_has_one_owner_and_loser_cannot_quarantine(fixture):
+    service = fixture.service()
+    old = await create(fixture, service)
+    cid = service.conversation_id(fixture.user, old)
+    _ = [frame async for frame in await service.prepare_turn(fixture.user, old, "ready")]
+    await service.close(fixture.user, old)
+    revision = service.store.get(cid, fixture.user.sub)["revision"]
+    results = await asyncio.gather(service.resume(fixture.user, cid, revision),
+                                   service.resume(fixture.user, cid, revision), return_exceptions=True)
+    assert sum(isinstance(value, str) for value in results) == 1
+    row = service.store.get(cid, fixture.user.sub)
+    assert row["state"] == "open" and row["generation"] in results
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["create", "begin_turn", "finish_turn"])
+async def test_cancelled_database_mutation_joins_before_cleanup(fixture, operation):
+    import threading
+
+    service = fixture.service()
+    entered, release = threading.Event(), threading.Event()
+    original = getattr(service.store, operation)
+
+    def held(*args, **kwargs):
+        entered.set()
+        assert release.wait(2)
+        return original(*args, **kwargs)
+
+    setattr(service.store, operation, held)
+    if operation == "create":
+        task = asyncio.create_task(create(fixture, service))
+    else:
+        handle = await create(fixture, service)
+        if operation == "begin_turn":
+            task = asyncio.create_task(service.prepare_turn(fixture.user, handle, "cancel"))
+        else:
+            turn = await service.prepare_turn(fixture.user, handle, "cancel")
+            task = asyncio.create_task(anext(turn))
+    try:
+        async with asyncio.timeout(1):
+            while not entered.is_set():
+                await asyncio.sleep(0.001)
+        entry = next(iter(service._entries.values()))
+        if operation == "finish_turn":
+            task = asyncio.create_task(service.close(fixture.user, entry.handle))
+        else:
+            task.cancel()
+        await asyncio.sleep(0.01)
+        assert entry.sid in service._entries and not task.done()
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await gone(fixture, service, entry.sid)
+        assert not entry.mutations
+        row = service.store.get(entry.cid, fixture.user.sub)
+        assert row["state"] == "incomplete"
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_failed_store_close_keeps_capacity_claim_after_runtime_join(fixture):
+    service = fixture.service(max_sessions=1, max_per_user=1)
+    handle = await create(fixture, service)
+    service.store.finish_close = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("private"))
+    with pytest.raises(CopilotChatError) as caught:
+        await service.close(fixture.user, handle)
+    assert caught.value.status_code == 503
+    assert handle in service._entries and handle not in fixture.layer.sessions
+    with pytest.raises(CopilotChatError) as caught:
+        await create(fixture, service)
+    assert caught.value.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_losing_resume_in_another_service_never_closes_shared_layer_winner(fixture):
+    store = MemoryConversations()
+    first = fixture.service(store=store)
+    sid = await create(fixture, first)
+    cid = first.conversation_id(fixture.user, sid)
+    _ = [frame async for frame in await first.prepare_turn(fixture.user, sid, "ready")]
+    await first.close(fixture.user, sid)
+    revision = store.get(cid, fixture.user.sub)["revision"]
+    winner = await first.resume(fixture.user, cid, revision)
+    closes = len(fixture.layer.closed)
+    loser = fixture.service(store=store)
+    with pytest.raises(CopilotChatError) as caught:
+        await loser.resume(fixture.user, cid, revision)
+    assert caught.value.status_code == 409
+    assert len(fixture.layer.closed) == closes and sid in fixture.layer.sessions
+    assert store.get(cid, fixture.user.sub)["generation"] == winner
+    assert not loser._entries
+
+
+@pytest.mark.asyncio
+async def test_stalled_read_times_out_without_waiting_or_creating_owner(fixture):
+    import threading
+
+    service = fixture.service(authorization_timeout=0.02)
+    entered, release = threading.Event(), threading.Event()
+
+    def held(*args, **kwargs):
+        entered.set()
+        assert release.wait(2)
+        return []
+
+    service.store.list_conversations = held
+    try:
+        async with asyncio.timeout(0.2):
+            with pytest.raises(CopilotChatError) as caught:
+                await service.list_conversations(fixture.user)
+        assert caught.value.status_code == 503 and entered.is_set()
+        assert not service._entries and not fixture.layer.started
+    finally:
+        release.set()
+
+
+@pytest.mark.asyncio
+async def test_stalled_mutation_retains_generation_and_capacity_after_bounded_cleanup(fixture):
+    import threading
+
+    service = fixture.service(database_timeout=0.02, max_sessions=1, max_per_user=1)
+    entered, release = threading.Event(), threading.Event()
+    original = service.store.create
+
+    def held(*args, **kwargs):
+        entered.set()
+        assert release.wait(2)
+        return original(*args, **kwargs)
+
+    service.store.create = held
+    try:
+        async with asyncio.timeout(0.3):
+            with pytest.raises(CopilotChatError) as caught:
+                await create(fixture, service)
+        assert caught.value.status_code == 503 and entered.is_set()
+        entry = next(iter(service._entries.values()))
+        assert entry.mutations and entry.closing.done() and not fixture.layer.started
+        with pytest.raises(CopilotChatError) as caught:
+            await create(fixture, service)
+        assert caught.value.status_code == 429
+        release.set()
+        async with asyncio.timeout(1):
+            while entry.mutations:
+                await asyncio.sleep(0.001)
+        row = service.store.get(entry.cid, fixture.user.sub)
+        assert row["generation"] == entry.handle and row["state"] == "open"
+        assert service._entries[entry.sid] is entry  # Late commit is never reclaimed or resumed.
+    finally:
+        release.set()
+
+
+@pytest.mark.asyncio
+async def test_read_history_survives_removed_account_but_fresh_resume_is_denied(fixture, monkeypatch):
+    service = fixture.service()
+    handle = await create(fixture, service)
+    cid = service.conversation_id(fixture.user, handle)
+    _ = [frame async for frame in await service.prepare_turn(fixture.user, handle, "saved")]
+    await service.close(fixture.user, handle)
+    async def removed(**kwargs):
+        raise RuntimeError("account removed")
+    monkeypatch.setattr(module, "build_copilot_agent_config", removed)
+    saved = await service.get_conversation(fixture.user, cid)
+    assert saved["events"] and saved["conversation"]["can_resume"]
+    with pytest.raises(CopilotChatError):
+        await service.resume(fixture.user, cid, saved["conversation"]["revision"])
+    assert len(fixture.layer.started) == 1
+    assert service.store.get(cid, fixture.user.sub)["state"] == "closed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('detached', [False, True])
+async def test_failed_terminal_delivery_quarantines_even_after_iterator_detaches(fixture, detached):
+    service = fixture.service()
+    handle = await create(fixture, service)
+    cid = service.conversation_id(fixture.user, handle)
+    turn = await service.prepare_turn(fixture.user, handle, 'complete native work')
+    while (await anext(turn))['type'] != 'turn_complete':
+        pass
+    if detached:
+        with pytest.raises(StopAsyncIteration):
+            await anext(turn)
+        assert service._entries[handle].turn is None
+    turn.delivery_failed()
+    await service.close(fixture.user, handle)
+    saved = await service.get_conversation(fixture.user, cid)
+    assert saved['events'][-1]['type'] == 'turn_complete'
+    assert saved['conversation']['state'] == 'incomplete'
+    assert saved['conversation']['can_resume'] is False

@@ -268,6 +268,8 @@ def harness(monkeypatch, tmp_path):
     sandbox.SandboxBuilder = SandboxBuilder
     state = ModuleType("core.session.session_state")
     state.get_session_security = scenario.contexts.get
+    scenario.mode = "default"
+    state.get_session_mode = lambda sid: scenario.mode
     monkeypatch.setitem(sys.modules, "auth.path_policy", policy)
     monkeypatch.setitem(sys.modules, "core.sandbox.sandbox", sandbox)
     monkeypatch.setitem(sys.modules, "core.session.session_state", state)
@@ -744,5 +746,20 @@ async def test_late_sdk_startup_result_cannot_escape_independent_deadline(harnes
         assert len(harness.runtimes[0].client.opened) == 1  # The late SDK resource existed.
         assert harness.runtimes[0].closed and not harness.guards[0].valid
         assert documents(harness)[0]["status"] == "active"
+    finally:
+        await clean(harness)
+
+
+@pytest.mark.asyncio
+async def test_resume_permission_mode_change_rejects_before_new_runtime(harness):
+    owner = await open_session(harness)
+    _ = [event async for event in owner.stream("complete")]
+    await owner.close()
+    count = len(harness.runtimes)
+    harness.mode = "acceptEdits"
+    try:
+        with pytest.raises(harness.module.CopilotLocalSessionError):
+            await open_session(harness, resume=True)
+        assert len(harness.runtimes) == count
     finally:
         await clean(harness)

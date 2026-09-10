@@ -381,3 +381,39 @@ async def test_legacy_nullable_library_root_normalizes_without_widening(facts):
     facts.libraries = [{"source_agent": "library", "subdir": None, "writable": False}]
     result = await build(facts)
     assert result.security_context.knowledge_libraries == (("library", "", False),)
+
+
+@pytest.mark.asyncio
+async def test_saved_history_access_does_not_require_credentials_or_read_instructions(facts, monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError('History must not read credentials or instructions')
+    monkeypatch.setattr(builder.copilot_account_store, 'read_credential', forbidden)
+    monkeypatch.setattr(builder, '_documents', forbidden)
+    await builder.authorize_copilot_history(facts.human, 'demo')
+    assert facts.authority_reads == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('change', ['role', 'agent', 'user', 'admin_only'])
+async def test_saved_history_access_rechecks_current_storage_authority(facts, change):
+    if change == 'role':
+        facts.roles.clear()
+    elif change == 'agent':
+        facts.agent = None
+    elif change == 'user':
+        facts.user = None
+    else:
+        facts.agent['admin_only'] = True
+    with pytest.raises(builder.CopilotConfigError, match='conversation access is unavailable'):
+        await builder.authorize_copilot_history(facts.human, 'demo')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('changes', [
+    {'is_api_key': True}, {'session_id': 'session'}, {'agent': 'demo'},
+    {'external_claim': 'phone:caller'}, {'sub': 'api-key'}, {'sub': 'session:synthetic'},
+])
+async def test_saved_history_rejects_nonhuman_authority_before_storage(facts, changes):
+    with pytest.raises(builder.CopilotConfigError):
+        await builder.authorize_copilot_history(replace(facts.human, **changes), 'demo')
+    assert facts.authority_reads == 0

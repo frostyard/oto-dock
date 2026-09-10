@@ -1981,6 +1981,46 @@ def init_knowledge_libraries(conn) -> None:
 # Schema entry points
 # ---------------------------------------------------------------------------
 
+def init_copilot_conversations(conn) -> None:
+    """Personal preview history, intentionally absent from generic chat tables."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS copilot_conversations (
+            id TEXT PRIMARY KEY,
+            user_sub TEXT NOT NULL REFERENCES users(sub) ON DELETE CASCADE,
+            agent TEXT NOT NULL REFERENCES agents(slug) ON DELETE CASCADE,
+            -- Deliberately no account FK: history remains readable after
+            -- disconnecting a credential; resume rechecks account eligibility.
+            account_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            permission_mode TEXT NOT NULL CHECK (permission_mode IN ('default','acceptEdits','plan','dontAsk')),
+            platform_session_id TEXT NOT NULL UNIQUE,
+            generation TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open','closed','incomplete')),
+            revision BIGINT NOT NULL DEFAULT 1 CHECK (revision > 0),
+            title TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            turn_active BOOLEAN NOT NULL DEFAULT FALSE,
+            last_turn_complete BOOLEAN NOT NULL DEFAULT FALSE,
+            event_count INTEGER NOT NULL DEFAULT 0 CHECK (event_count BETWEEN 0 AND 1000),
+            event_bytes INTEGER NOT NULL DEFAULT 0 CHECK (event_bytes BETWEEN 0 AND 1048576),
+            CHECK (NOT turn_active OR state = 'open'),
+            CHECK (state != 'closed' OR (last_turn_complete AND NOT turn_active))
+        )
+    """)
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_copilot_conversations_owner_updated
+                    ON copilot_conversations(user_sub, updated_at DESC, id DESC)""")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS copilot_conversation_events (
+            conversation_id TEXT NOT NULL REFERENCES copilot_conversations(id) ON DELETE CASCADE,
+            seq INTEGER NOT NULL CHECK (seq BETWEEN 1 AND 1000),
+            payload TEXT NOT NULL CHECK (octet_length(payload) <= 262144),
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (conversation_id, seq)
+        )
+    """)
+
+
 def init_schema(conn) -> None:
     """Create every table and index if absent (idempotent; safe each boot)."""
     init_tasks(conn)
@@ -1997,6 +2037,7 @@ def init_schema(conn) -> None:
     init_remote_machines(conn)
     init_meetings(conn)
     init_execution_layers(conn)
+    init_copilot_conversations(conn)
     init_notifications(conn)
     init_mcp_autoupdate(conn)
     init_push(conn)

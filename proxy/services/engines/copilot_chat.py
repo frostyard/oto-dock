@@ -9,7 +9,7 @@ import uuid
 
 from auth.providers import UserContext
 from core.concurrency import acquire_chat_slot, release_chat_slot
-from core.config.copilot_config_builder import build_copilot_agent_config
+from core.config.copilot_config_builder import authorize_copilot_history, build_copilot_agent_config
 from core.layers.copilot.credentials import CopilotAccountScope
 from core.layers.copilot.native_tool_policy import SUPPORTED_NATIVE_TOOLS
 from core.session import session_state as state
@@ -64,6 +64,14 @@ class _Entry:
     account_id: str
     model: str
     mode: str
+    handle: str = ""
+    cid: str = ""
+    resume: bool = False
+    expected_revision: int | None = None
+    store_attempted: bool = False
+    uncertain_delivery: bool = False
+    layer_start_attempted: bool = False
+    mutations: set = field(default_factory=set)
     config: object = None
     admitted: bool = False
     startup: asyncio.Task | None = None
@@ -75,6 +83,8 @@ class _Entry:
 
 
 _END = object()
+_PERSISTED = frozenset({"text", "tool_use", "tool_input", "tool_result",
+                        "permission_prompt", "question_prompt", "error"})
 
 
 class CopilotChatTurn:
@@ -84,6 +94,8 @@ class CopilotChatTurn:
         self._service, self._entry, self._text = service, entry, text
         self._queue = asyncio.Queue(maxsize=128)
         self._bytes = 0
+        self._emit_lock = asyncio.Lock()
+        self._durable_started = self._durable_finished = False
         self._complete = self._failed = self._exhausted = self._reading = False
         self._closing = None
         self._producer = self._prompts = None
@@ -98,10 +110,12 @@ class CopilotChatTurn:
         self._service._begin_close(self._entry)
 
     async def _emit(self, frame):
-        self._bytes += len(json.dumps(frame, ensure_ascii=False, allow_nan=False).encode("utf-8"))
-        if self._bytes > 1024 * 1024:
-            raise ValueError()
-        await self._queue.put(frame)
+        async with self._emit_lock:
+            self._bytes += len(json.dumps(frame, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+            if self._bytes > 1024 * 1024:
+                raise ValueError()
+            await self._service._mutation(self._entry, "append_event", frame)
+            await self._queue.put(frame)
 
     async def _forward_prompts(self):
         queue = state.get_permission_queue(self._entry.sid)
@@ -149,13 +163,15 @@ class CopilotChatTurn:
                         done += 1
                     elif event.type == "error":
                         raise ValueError()
-                    else:
+                    elif event.type in _PERSISTED:
                         await self._emit({**event.data, "type": event.type})
             if done != 1 or self._failed or self._entry.closing is not None:
                 raise ValueError()
             self._prompts.cancel()
             await asyncio.gather(self._prompts, return_exceptions=True)
-            await self._emit({"type": "turn_complete"})
+            await self._service._mutation(self._entry, "finish_turn",
+                                          success=lambda: setattr(self, "_durable_finished", True))
+            await self._queue.put({"type": "turn_complete"})
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -169,6 +185,13 @@ class CopilotChatTurn:
 
     def __aiter__(self):
         return self
+
+    def delivery_failed(self):
+        """Transport did not deliver its final body; do not advertise resume."""
+        self._failed = True
+        # The iterator may already have detached this turn before ASGI sends
+        # its final empty body. Retain the fence on the captured owner too.
+        self._entry.uncertain_delivery = True
 
     async def __anext__(self):
         if self._exhausted:
@@ -206,7 +229,16 @@ class CopilotChatTurn:
         while not self._queue.empty():
             self._queue.get_nowait()
         if self._failed:
-            self._queue.put_nowait({"type": "error", "message": "Copilot turn did not complete"})
+            frame = {"type": "error", "message": "Copilot turn did not complete"} if self._durable_started and not self._durable_finished else None
+            if self._durable_started and not self._durable_finished:
+                try:
+                    await self._service._mutation(self._entry, "append_event", frame)
+                except CopilotChatError:
+                    # No undurable frame is delivered. Cleanup still quarantines
+                    # the unfinished generation, or retains its failed claim.
+                    frame = None
+            if frame is not None:
+                self._queue.put_nowait(frame)
         self._queue.put_nowait(_END)
         self._entry.pending.clear()
         self._entry.questions.clear()
@@ -234,13 +266,17 @@ class CopilotChatTurn:
 
 class CopilotChatService:
     def __init__(self, layer, *, max_sessions=4, max_per_user=2, idle_timeout=300,
-                 turn_timeout=300, watch_interval=5, authorization_timeout=5):
+                 turn_timeout=300, watch_interval=5, authorization_timeout=5, store=None, database_timeout=40):
         if (type(max_sessions) is not int or not 1 <= max_sessions <= 8
                 or type(max_per_user) is not int or not 1 <= max_per_user <= max_sessions
                 or any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0
-                       for value in (idle_timeout, turn_timeout, watch_interval, authorization_timeout))
-                or turn_timeout > 300 or watch_interval > 10 or authorization_timeout > 10):
+                       for value in (idle_timeout, turn_timeout, watch_interval, authorization_timeout, database_timeout))
+                or turn_timeout > 300 or watch_interval > 10 or authorization_timeout > 10 or database_timeout > 60):
             raise ValueError("Invalid Copilot preview limits")
+        from storage import copilot_conversation_store
+
+        self.store = copilot_conversation_store if store is None else store
+        self.database_timeout = database_timeout
         self.layer = layer
         self.max_sessions, self.max_per_user = max_sessions, max_per_user
         self.idle_timeout, self.turn_timeout = idle_timeout, turn_timeout
@@ -251,7 +287,7 @@ class CopilotChatService:
 
     def _entry(self, user, sid):
         _human(user)
-        entry = self._entries.get(sid) if isinstance(sid, str) else None
+        entry = next((item for item in self._entries.values() if item.handle == sid), None) if isinstance(sid, str) else None
         if entry is None or entry.user.sub != user.sub:
             raise CopilotChatError(404, "Copilot session was not found")
         return entry
@@ -286,35 +322,102 @@ class CopilotChatService:
             await self._close_entry(entry)
             raise CopilotChatError(403, "Copilot session access is unavailable")
 
-    async def _start(self, entry):
-        entry.config = await self._config(entry, entry.user)
-        self._check(entry)
-        async with asyncio.timeout(5):
-            admission = await acquire_chat_slot(entry.sid, target="local", execution_path="copilot-cli", user_sub=entry.user.sub)
-            # Record the successful reservation before the cancellation/current
-            # ownership check: a late admission still needs safe cleanup.
-            entry.admitted = bool(admission)
-        self._check(entry)
-        if not admission:
-            raise CopilotChatError(429, "Local session capacity is unavailable")
-        await self.layer.start_session(entry.sid, entry.config)
-        self._check(entry)
-        entry.last_activity = asyncio.get_running_loop().time()
+    async def _db(self, operation, *args, entry=None, success=None, **kwargs):
+        """Bound waiting without cancelling a mutation that may still commit.
 
-    async def create(self, user, agent, account_id, model, permission_mode="default"):
-        _human(user)
+        Timed-out writes remain attached to the exact generation. Cleanup must
+        drain them before its CAS; failed drainage retains the capacity claim.
+        """
+        from storage import copilot_conversation_store as contract
+        from storage.pg import run_db
+
+        mutation = operation not in {"get", "list_conversations", "events"}
+        if mutation and entry is None:
+            raise ValueError("Copilot mutation ownership is required")
+        task = asyncio.create_task(run_db(getattr(self.store, operation), *args, **kwargs))
+        if mutation:
+            entry.mutations.add(task)
+
+        def finished(done):
+            if not done.cancelled() and done.exception() is None and success is not None:
+                success()
+            if mutation:
+                entry.mutations.discard(done)
+
+        task.add_done_callback(finished)
+        deadline = asyncio.get_running_loop().time() + (self.database_timeout if mutation else self.authorization_timeout)
+        cancelled, failure = False, None
+        while True:
+            try:
+                remaining = max(0, deadline - asyncio.get_running_loop().time())
+                complete, _ = await asyncio.wait({task}, timeout=remaining)
+                if not complete:
+                    failure = CopilotChatError(503, "Copilot history is unavailable")
+                    break
+                result = task.result()
+                break
+            except asyncio.CancelledError:
+                if not mutation:
+                    raise
+                if task.cancelled():
+                    failure = CopilotChatError(503, "Copilot history is unavailable")
+                    break
+                cancelled = True
+            except Exception as error:
+                status = (404 if isinstance(error, contract.CopilotConversationNotFound) else
+                          409 if isinstance(error, contract.CopilotConversationConflict) else
+                          429 if isinstance(error, contract.CopilotConversationLimit) else 503)
+                failure = CopilotChatError(status, "Copilot history is unavailable")
+                break
+        if cancelled:
+            raise asyncio.CancelledError
+        if failure is not None:
+            raise failure
+        return result
+
+    async def _mutation(self, entry, operation, *args, success=None):
+        return await self._db(operation, entry.cid, entry.user.sub, entry.handle, *args,
+                              entry=entry, success=success)
+
+    def _capacity(self, user):
         if self._closing is not None:
             raise CopilotChatError(503, "Copilot preview is shutting down")
         if (len(self._entries) >= self.max_sessions
                 or sum(entry.user.sub == user.sub for entry in self._entries.values()) >= self.max_per_user):
             raise CopilotChatError(429, "Copilot preview session limit reached")
-        entry = _Entry(str(uuid.uuid4()), deepcopy(user), agent, account_id, model, permission_mode)
+
+    async def _start(self, entry):
+        entry.config = await self._config(entry, entry.user)
+        self._check(entry)
+        entry.store_attempted = True
+        if entry.resume:
+            await self._db("claim_resume", entry.cid, entry.user.sub, entry.expected_revision,
+                           entry.handle, entry=entry)
+        else:
+            await self._db("create", entry.cid, entry.user.sub, agent=entry.agent,
+                           account_id=entry.account_id, model=entry.model, permission_mode=entry.mode,
+                           platform_session_id=entry.sid, generation=entry.handle, entry=entry)
+        self._check(entry)
+        async with asyncio.timeout(5):
+            admission = await acquire_chat_slot(entry.sid, target="local", execution_path="copilot-cli", user_sub=entry.user.sub)
+            entry.admitted = bool(admission)
+        self._check(entry)
+        if not admission:
+            raise CopilotChatError(429, "Local session capacity is unavailable")
+        config = deepcopy(entry.config)
+        config.resume = entry.resume
+        entry.layer_start_attempted = True
+        await self.layer.start_session(entry.sid, config)
+        self._check(entry)
+        entry.last_activity = asyncio.get_running_loop().time()
+
+    async def _launch(self, entry):
         self._entries[entry.sid] = entry
         entry.startup = asyncio.create_task(self._start(entry))
         status = 503
         try:
             await entry.startup
-            return entry.sid
+            return entry.handle
         except asyncio.CancelledError:
             await self._close_entry(entry)
             raise
@@ -324,6 +427,84 @@ class CopilotChatService:
             pass
         await self._close_entry(entry)
         raise CopilotChatError(status, "Copilot session could not be started")
+
+    async def create(self, user, agent, account_id, model, permission_mode="default"):
+        _human(user)
+        self._capacity(user)
+        sid = str(uuid.uuid4())
+        entry = _Entry(sid, deepcopy(user), agent, account_id, model, permission_mode,
+                       handle=sid, cid=str(uuid.uuid4()))
+        return await self._launch(entry)
+
+    def conversation_id(self, user, handle):
+        return self._entry(user, handle).cid
+
+    async def _history_authorize(self, user, agent):
+        failed = False
+        try:
+            async with asyncio.timeout(self.authorization_timeout):
+                await authorize_copilot_history(user, agent)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            failed = True
+        if failed:
+            raise CopilotChatError(403, "Copilot conversation access is unavailable")
+
+    async def _metadata(self, user, row):
+        await self._history_authorize(user, row["agent"])
+        resumable = (row["state"] == "closed" and row["last_turn_complete"] is True
+                     and row["turn_active"] is False)
+        if resumable:
+            resumable = await self.layer.history_ready(row["platform_session_id"], user.sub)
+        fields = ("id", "agent", "account_id", "model", "permission_mode", "title",
+                  "created_at", "updated_at", "state", "revision")
+        metadata = {key: row[key].isoformat() if hasattr(row[key], "isoformat") else row[key] for key in fields}
+        metadata.update(can_resume=bool(resumable), reason="Ready to resume" if resumable else "Conversation is not ready to resume")
+        return metadata
+
+    async def list_conversations(self, user, limit=20, offset=0):
+        _human(user)
+        if type(limit) is not int or not 1 <= limit <= 100 or type(offset) is not int or not 0 <= offset <= 10000:
+            raise CopilotChatError(422, "Invalid conversation pagination")
+        rows = await self._db("list_conversations", user.sub, limit=limit, offset=offset)
+        metadata = []
+        for row in rows:
+            try:
+                metadata.append(await self._metadata(user, row))
+            except CopilotChatError as error:
+                if error.status_code != 403:
+                    raise
+        more = False
+        if len(rows) == limit and offset + limit <= 10000:
+            more = bool(await self._db("list_conversations", user.sub, limit=1, offset=offset + limit))
+        return {"conversations": metadata, "has_more": more}
+
+    async def get_conversation(self, user, cid):
+        _human(user)
+        row = await self._db("get", cid, user.sub)
+        if row is None:
+            raise CopilotChatError(404, "Copilot conversation was not found")
+        metadata = await self._metadata(user, row)
+        events = await self._db("events", cid, user.sub)
+        await self._history_authorize(user, row["agent"])
+        return {"conversation": metadata, "events": events}
+
+    async def resume(self, user, cid, expected_revision):
+        _human(user)
+        if type(expected_revision) is not int or expected_revision < 1:
+            raise CopilotChatError(422, "A conversation revision is required")
+        row = await self._db("get", cid, user.sub)
+        if row is None:
+            raise CopilotChatError(404, "Copilot conversation was not found")
+        await self._history_authorize(user, row["agent"])
+        self._capacity(user)
+        sid = row["platform_session_id"]
+        if sid in self._entries:
+            raise CopilotChatError(409, "Copilot conversation already has an owner")
+        entry = _Entry(sid, deepcopy(user), row["agent"], row["account_id"], row["model"], row["permission_mode"],
+                       handle=str(uuid.uuid4()), cid=cid, resume=True, expected_revision=expected_revision)
+        return await self._launch(entry)
 
     async def prepare_turn(self, user, sid, text):
         entry = self._entry(user, sid)
@@ -337,6 +518,9 @@ class CopilotChatService:
         entry.turn = turn
         try:
             await self._authorize(entry, user)
+            self._check(entry)
+            await self._mutation(entry, "begin_turn", text,
+                                 success=lambda: setattr(turn, "_durable_started", True))
             self._check(entry)
             turn._start()
             return turn
@@ -359,12 +543,12 @@ class CopilotChatService:
             raise CopilotChatError(422, "A permission decision is required")
         await self._authorize(entry, user)
         if (entry.pending.get(request_id) != "permission_prompt"
-                or state.get_permission_request_session(request_id) != sid
+                or state.get_permission_request_session(request_id) != entry.sid
                 or request_id not in state._permission_events or request_id in state._question_events):
             raise CopilotChatError(409, "Copilot permission request is no longer pending")
         failed = False
         try:
-            await self.layer.respond_permission(sid, request_id, approved)
+            await self.layer.respond_permission(entry.sid, request_id, approved)
         except asyncio.CancelledError:
             await self._close_entry(entry)
             raise
@@ -396,7 +580,7 @@ class CopilotChatService:
                     or (len(values) == 2 and values[0] not in labels)):
                 raise CopilotChatError(422, "Select an offered answer or permitted free text")
         if (question is None or entry.pending.get(request_id) != "question_prompt"
-                or state.get_permission_request_session(request_id) != sid
+                or state.get_permission_request_session(request_id) != entry.sid
                 or request_id not in state._question_events or request_id in state._permission_events
                 or not state.resolve_question(request_id, deepcopy(answers))):
             raise CopilotChatError(409, "Copilot question is no longer pending")
@@ -424,7 +608,7 @@ class CopilotChatService:
             if entry.startup is not None and not entry.startup.done():
                 entry.startup.cancel()
                 await asyncio.gather(entry.startup, return_exceptions=True)
-            cleanup = [self.layer.close_session(entry.sid)]
+            cleanup = [self.layer.close_session(entry.sid)] if entry.layer_start_attempted else []
             if entry.turn is not None:
                 if not entry.turn._complete:
                     entry.turn._failed = True
@@ -432,8 +616,22 @@ class CopilotChatService:
             results = await asyncio.gather(*cleanup, return_exceptions=True)
             if any(isinstance(result, BaseException) for result in results):
                 raise ValueError()
-            if not await self.layer.is_session_process_dead(entry.sid):
+            if entry.layer_start_attempted and not await self.layer.is_session_process_dead(entry.sid):
                 raise ValueError()
+            if entry.mutations:
+                _, pending = await asyncio.wait(tuple(entry.mutations), timeout=min(5, self.database_timeout))
+                if pending:
+                    raise ValueError()
+            if entry.store_attempted:
+                row = await self._db("get", entry.cid, entry.user.sub)
+                # A losing CAS must never quarantine the winning generation.
+                if row is not None and row["generation"] == entry.handle:
+                    delivered = (not entry.uncertain_delivery
+                                 and (entry.turn is None or (entry.turn._complete and not entry.turn._failed)))
+                    ready = (entry.layer_start_attempted and delivered
+                             and await self.layer.history_ready(entry.sid, entry.user.sub))
+                    await self._db("finish_close", entry.cid, entry.user.sub, entry.handle,
+                                   resumable=ready, entry=entry)
             from core.session.owned_sessions import get_owned_session
             from core.session.session_manager import has_legacy_session
 

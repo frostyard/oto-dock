@@ -7,7 +7,7 @@ from typing import Annotated, Literal
 from uuid import UUID
 
 import anyio
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRoute
@@ -31,6 +31,7 @@ class _PrivateRoute(APIRoute):
 
 
 router = APIRouter(prefix="/v1/copilot/chat", route_class=_PrivateRoute)
+_HISTORY_READ_SECONDS = 15
 Identifier = Annotated[str, Field(strict=True, min_length=1, max_length=256)]
 Answer = Annotated[str, Field(strict=True, max_length=4096)]
 
@@ -48,6 +49,10 @@ class CreateRequest(_Body):
 
 class TurnRequest(_Body):
     text: Annotated[str, Field(strict=True, min_length=1, max_length=65536)]
+
+
+class ResumeRequest(_Body):
+    revision: Annotated[int, Field(strict=True, ge=1, le=9223372036854775807)]
 
 
 class PermissionRequest(_Body):
@@ -142,8 +147,10 @@ async def _disconnected(request, stopped):
 
 
 class _CreatedResponse(JSONResponse):
-    def __init__(self, service, user, session_id):
-        super().__init__({"session_id": session_id}, status_code=201)
+    def __init__(self, service, user, session_id, conversation_id):
+        super().__init__({"session_id": session_id,
+                          "conversation_id": conversation_id}, status_code=201,
+                         headers={"Cache-Control": "no-store"})
         self.service, self.user, self.session_id = service, user, session_id
 
     async def __call__(self, scope, receive, send):
@@ -187,6 +194,7 @@ class _TurnResponse(StreamingResponse):
             # first event. This must not depend on an async generator's finally.
             try:
                 if not delivered:
+                    self.turn.delivery_failed()
                     with suppress(CopilotChatError):
                         await _join(self.close_session())
             finally:
@@ -205,8 +213,14 @@ async def create(req: CreateRequest, request: Request, user: UserContext | None 
     user = _human(request, user)
     _mutation(request)
     service = _service(request)
-    task = asyncio.create_task(service.create(user, req.agent, req.account_id, req.model,
-                                               permission_mode=req.permission_mode))
+    return await _open_session(request, user, service, service.create(
+        user, req.agent, req.account_id, req.model, permission_mode=req.permission_mode,
+    ))
+
+
+async def _open_session(request, user, service, operation):
+    # Creation and cold resume share exact-owner disposal on a lost response.
+    task = asyncio.create_task(operation)
     stopped = asyncio.Event()
     disconnected = asyncio.create_task(_disconnected(request, stopped))
     handed_off = False
@@ -215,7 +229,10 @@ async def create(req: CreateRequest, request: Request, user: UserContext | None 
         if disconnected.done() or await request.is_disconnected():
             raise HTTPException(499, "Copilot chat connection closed")
         session_id = await _call(task)
-        response = _CreatedResponse(service, user, session_id)
+        async def response_metadata():
+            return service.conversation_id(user, session_id)
+        conversation_id = await _call(response_metadata())
+        response = _CreatedResponse(service, user, session_id, conversation_id)
         handed_off = True
         return response
     finally:
@@ -229,6 +246,39 @@ async def create(req: CreateRequest, request: Request, user: UserContext | None 
                     await service.close(user, result)
             await _join(abandon())
         await asyncio.gather(disconnected, return_exceptions=True)
+
+
+@router.get("/conversations")
+async def list_conversations(request: Request,
+                             limit: Annotated[int, Query(ge=1, le=100)] = 20,
+                             offset: Annotated[int, Query(ge=0, le=10000)] = 0,
+                             user: UserContext | None = Depends(get_current_user)):
+    user = _human(request, user)
+    result = await _call(_history_read(_service(request).list_conversations(user, limit=limit, offset=offset)))
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+
+@router.get("/conversations/{conversation_id}")
+async def get_conversation(conversation_id: UUID, request: Request,
+                           user: UserContext | None = Depends(get_current_user)):
+    user = _human(request, user)
+    result = await _call(_history_read(_service(request).get_conversation(user, str(conversation_id))))
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+
+async def _history_read(operation):
+    # One page must not accumulate a separate authorization deadline per row.
+    async with asyncio.timeout(_HISTORY_READ_SECONDS):
+        return await operation
+
+
+@router.post("/conversations/{conversation_id}/resume", status_code=201)
+async def resume(conversation_id: UUID, req: ResumeRequest, request: Request,
+                 user: UserContext | None = Depends(get_current_user)):
+    user = _human(request, user)
+    _mutation(request)
+    service = _service(request)
+    return await _open_session(request, user, service, service.resume(user, str(conversation_id), req.revision))
 
 
 @router.post("/sessions/{session_id}/turn")

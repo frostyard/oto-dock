@@ -48,18 +48,24 @@ stale, wrong-kind and wrong-owner responses are rejected. A request that closes
 without an answer is not displayed as approved or answered.
 
 Only one turn may run per session. There is no automatic message queue, stream
-reconnection, replay or retry. Stop/Close terminates the entire session and joins
+reconnection, replay or retry. Saved conversations support explicit cold resume
+only after verified clean completion and shutdown. Stop/Close terminates the entire session and joins
 its owned runtime; it does not promise graceful continuation of an interrupted
 turn. Losing an active stream also closes the session. The page aborts its
 stream and attempts deletion on unmount or identity change. If creation returns
 after the page has stopped waiting, it deletes the returned session instead of
 forgetting that owner. New chat cannot bypass pending or failed cleanup.
 
-Closing preserves the currently rendered transcript until New chat or page
-reload. The preview does not persist transcripts in browser storage or create
-regular chat-list entries. **Private Copilot history remains on the server**;
-closing a runtime does not erase its history, and there is no automatic history
-garbage collection in this preview. There is no history browser or resume API.
+Conversations and ordered transcript events are now saved in isolated PostgreSQL
+tables and can be read from the preview after reload. Selecting a saved item does
+not start a runtime; Resume is an explicit action using its stored configuration.
+Archived permissions/questions are inert. See the
+[saved-conversation contract](copilot-conversation-history-contract.md).
+
+The preview does not persist transcripts in browser storage or create regular
+chat-list entries. **Private Copilot history remains on the server**; closing a
+runtime does not erase its history. There is no automatic history garbage
+collection or conversation deletion in this preview.
 
 ## Authentication, ownership and transport
 
@@ -107,8 +113,9 @@ role revocation, using controlled storage reads rather than PostgreSQL. It is
 not a browser or reverse-proxy deployment qualification.
 
 General engine registration and main chat persistence/routing remain open, as
-do attachments, queued input, authorized history discovery and cold resume,
-model catalog/default integration, shared payers and general onboarding.
+do attachments, queued input, main-chat history integration, model catalog/default
+integration, shared payers and general onboarding. Saved preview conversations
+have a separate owner-only read and explicit clean-resume path.
 Graceful steering/interrupt semantics, MCP/delegation, remote machines, terminal
 sessions, meetings, phone workflows, scheduled work and organization automation
 still require their own parity evidence. Enabling this preview does not make

@@ -16,6 +16,8 @@ from auth.providers import UserContext, get_current_user
 
 BASE = "/v1/copilot/chat"
 SID = str(uuid.uuid4())
+# Parameterized route IDs must be identical across xdist workers.
+CID = "7f24f676-c1da-4e16-8bfb-4295f6fa3cbc"
 SECRET = "private-provider-input-must-not-leak"
 
 
@@ -27,9 +29,13 @@ class Turn:
         self.closed = asyncio.Event()
         self.error = None
         self.hold = None
+        self.failed_delivery = False
 
     def __aiter__(self):
         return self
+
+    def delivery_failed(self):
+        self.failed_delivery = True
 
     async def __anext__(self):
         self.started = True
@@ -58,6 +64,29 @@ class Service:
     async def create(self, user, agent, account_id, model, permission_mode="default"):
         options = {"agent": agent, "account_id": account_id, "model": model, "permission_mode": permission_mode}
         self.calls.append(("create", user, options))
+        if self.error:
+            raise self.error
+        if self.create_hook:
+            await self.create_hook()
+        return SID
+
+    def conversation_id(self, user, sid):
+        return CID
+
+    async def list_conversations(self, user, *, limit, offset):
+        self.calls.append(("list", user, limit, offset))
+        if self.error:
+            raise self.error
+        return {"conversations": [{"id": CID}], "has_more": False}
+
+    async def get_conversation(self, user, cid):
+        self.calls.append(("get", user, cid))
+        if self.error:
+            raise self.error
+        return {"conversation": {"id": CID}, "events": [{"type": "user", "content": "hello", "seq": 1}]}
+
+    async def resume(self, user, cid, revision):
+        self.calls.append(("resume", user, cid, revision))
         if self.error:
             raise self.error
         if self.create_hook:
@@ -128,7 +157,7 @@ async def test_status_and_missing_service_do_not_provision_or_dispatch(api):
 @pytest.mark.asyncio
 async def test_create_and_controls_forward_authenticated_identity_with_strict_data(api):
     response = await post(api)
-    assert response.status_code == 201 and response.json() == {"session_id": SID}
+    assert response.status_code == 201 and response.json() == {"session_id": SID, "conversation_id": CID}
     assert api.service.calls == [("create", api.user[0], create_body(permission_mode="default"))]
     response = await post(api, f"/sessions/{SID}/permission", {"request_id": "request-one", "approved": False})
     assert response.status_code == 204
@@ -322,13 +351,15 @@ async def asgi_request(api, path, *, body, send_hook=None, disconnected=None, sp
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fail_at", ["http.response.start", "http.response.body"])
-async def test_undelivered_created_session_is_closed(api, fail_at):
+@pytest.mark.parametrize("resuming", [False, True])
+async def test_undelivered_created_session_is_closed(api, fail_at, resuming):
     async def failure(message):
         if message["type"] == fail_at:
             raise OSError("client disconnected")
 
     with pytest.raises(OSError):
-        await asgi_request(api, "/sessions", body=create_body(), send_hook=failure, spec="2.4")
+        await asgi_request(api, f"/conversations/{CID}/resume" if resuming else "/sessions",
+                           body={"revision": 1} if resuming else create_body(), send_hook=failure, spec="2.4")
     assert api.service.closed.is_set()
     assert api.service.calls[-1] == ("close", api.user[0], SID)
 
@@ -369,7 +400,8 @@ async def test_midstream_disconnect_closes_prepared_turn(api):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("disconnect", [False, True])
-async def test_cancelled_create_joins_and_closes_late_created_session(api, disconnect):
+@pytest.mark.parametrize("resuming", [False, True])
+async def test_cancelled_create_joins_and_closes_late_created_session(api, disconnect, resuming):
     entered, cancelled, release, disconnected = (asyncio.Event() for _ in range(4))
 
     async def late():
@@ -381,7 +413,8 @@ async def test_cancelled_create_joins_and_closes_late_created_session(api, disco
             await release.wait()
 
     api.service.create_hook = late
-    pending = asyncio.create_task(asgi_request(api, "/sessions", body=create_body(), disconnected=disconnected))
+    pending = asyncio.create_task(asgi_request(api, f"/conversations/{CID}/resume" if resuming else "/sessions",
+                                               body={"revision": 1} if resuming else create_body(), disconnected=disconnected))
     try:
         await asyncio.wait_for(entered.wait(), 1)
         if disconnect:
@@ -485,6 +518,7 @@ async def test_terminal_transport_failure_closes_session_even_after_turn_complet
     with pytest.raises(Exception):
         await asgi_request(api, f"/sessions/{SID}/turn", body={"text": "hello"}, send_hook=failure, spec="2.4")
     assert api.service.turn.index == len(api.service.turn.frames)
+    assert api.service.turn.failed_delivery
     assert api.service.closed.is_set() and api.service.turn.closed.is_set()
     assert api.service.calls[-1] == ("close", api.user[0], SID)
 
@@ -502,4 +536,107 @@ async def test_starlette_handled_disconnect_during_terminal_send_closes_session(
     await asyncio.wait_for(asgi_request(api, f"/sessions/{SID}/turn", body={"text": "hello"},
                                        send_hook=interrupt_terminal, disconnected=disconnected), 1)
     assert reached.is_set() and api.service.turn.index == len(api.service.turn.frames)
+    assert api.service.turn.failed_delivery
     assert api.service.closed.is_set() and api.service.turn.closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_history_read_and_explicit_resume_forward_identity_and_disable_caching(api):
+    listing = await api.client.get(BASE + '/conversations?limit=3&offset=2')
+    detail = await api.client.get(BASE + f'/conversations/{CID}')
+    assert listing.json() == {'conversations': [{'id': CID}], 'has_more': False}
+    assert detail.json()['events'] == [{'type': 'user', 'content': 'hello', 'seq': 1}]
+    assert listing.headers['cache-control'] == detail.headers['cache-control'] == 'no-store'
+    assert api.service.calls == [('list', api.user[0], 3, 2), ('get', api.user[0], CID)]
+    response = await post(api, f'/conversations/{CID}/resume', {'revision': 7})
+    assert response.status_code == 201
+    assert response.json() == {'session_id': SID, 'conversation_id': CID}
+    assert response.headers['cache-control'] == 'no-store'
+    assert api.service.calls[-1] == ('resume', api.user[0], CID, 7)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('path', ['/conversations', f'/conversations/{CID}'])
+@pytest.mark.parametrize('principal', ['missing-cookie', 'api', 'bearer', 'session'])
+async def test_history_reads_require_human_cookie_before_service(api, path, principal):
+    headers = {}
+    if principal == 'missing-cookie':
+        api.client.cookies.clear()
+    elif principal == 'api':
+        api.user[0] = replace(api.user[0], is_api_key=True)
+    elif principal == 'session':
+        api.user[0] = replace(api.user[0], session_id=SID)
+    else:
+        headers['Authorization'] = 'Bearer fixture'
+    response = await api.client.get(BASE + path, headers=headers)
+    assert response.status_code == 403 and not api.service.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('query', ['limit=0', 'limit=101', 'offset=-1', 'offset=10001', 'limit=1.5', 'offset=bad'])
+async def test_history_query_bounds_reject_before_storage(api, query):
+    assert (await api.client.get(BASE + '/conversations?' + query)).status_code == 422
+    assert not api.service.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('body', [
+    {}, {'revision': True}, {'revision': '1'}, {'revision': 0}, {'revision': -1},
+    {'revision': 2**63}, {'revision': 1, 'model': SECRET}, {'revision': 1, 'account_id': SECRET},
+    {'revision': 1, 'permission_mode': 'acceptEdits'},
+])
+async def test_resume_requires_exact_revision_and_refuses_config_overrides(api, body):
+    response = await post(api, f'/conversations/{CID}/resume', body)
+    assert response.status_code == 422 and SECRET not in response.text
+    assert not api.service.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('origin', [None, 'null', 'https://foreign.example'])
+async def test_resume_requires_same_origin(api, origin):
+    response = await api.client.post(BASE + f'/conversations/{CID}/resume', json={'revision': 1},
+                                     headers={} if origin is None else {'Origin': origin})
+    assert response.status_code == 403 and not api.service.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('path', ['/conversations', f'/conversations/{CID}', f'/conversations/{CID}/resume'])
+@pytest.mark.parametrize('failure', ['disabled', 'private-error', 'missing'])
+async def test_history_service_failures_are_sanitized(api, path, failure):
+    from services.engines.copilot_chat import CopilotChatError
+    expected = 503
+    if failure == 'disabled':
+        api.app.state.copilot_chat = None
+    elif failure == 'private-error':
+        api.service.error = ValueError(SECRET)
+    else:
+        api.service.error = CopilotChatError(404, SECRET)
+        expected = 404
+    response = await post(api, path, {'revision': 1}) if path.endswith('/resume') else await api.client.get(BASE + path)
+    assert response.status_code == expected and SECRET not in response.text
+
+
+@pytest.mark.asyncio
+async def test_created_metadata_failure_is_sanitized_and_closes_owned_runtime(api):
+    def fail(*args):
+        raise ValueError(SECRET)
+    api.service.conversation_id = fail
+    response = await post(api)
+    assert response.status_code == 503 and SECRET not in response.text
+    assert api.service.closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_whole_history_page_deadline_is_sanitized_without_starting_runtime(api, monkeypatch):
+    from api.agents import copilot_chat
+    cancelled = asyncio.Event()
+    async def blocked(*args, **kwargs):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+    monkeypatch.setattr(copilot_chat, '_HISTORY_READ_SECONDS', 0.01)
+    api.service.list_conversations = blocked
+    response = await api.client.get(BASE + '/conversations')
+    assert response.status_code == 503 and cancelled.is_set()
+    assert api.service.calls == []
