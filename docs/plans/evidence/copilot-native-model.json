@@ -31,10 +31,10 @@
   "event_counts": {
     "assistant.idle": 2,
     "assistant.message": 4,
-    "assistant.message_delta": 55,
+    "assistant.message_delta": 65,
     "assistant.message_start": 4,
-    "assistant.reasoning": 2,
-    "assistant.streaming_delta": 97,
+    "assistant.reasoning": 1,
+    "assistant.streaming_delta": 107,
     "assistant.tool_call_delta": 42,
     "assistant.turn_end": 4,
     "assistant.turn_start": 4,
@@ -73,5 +73,5 @@
     "user.message": 2
   },
   "normal_cleanup": true,
-  "elapsed_seconds": 27.879
+  "elapsed_seconds": 31.085
 }

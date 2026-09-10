@@ -256,14 +256,14 @@ or hook alone must not be advertised as equivalent.
 The separate model-driven probe exercises two actual turns: allowed native
 creation, followed by cold resume and denied native editing, with native
 approve-all enabled in both runs. The [guarded model-driven report](evidence/copilot-native-model.json)
-records a passing run in 27.879 seconds, one authority allow and one denial,
+records a passing run in 31.085 seconds, one authority allow and one denial,
 one `DONE` per turn, no remaining host request waits, and normal cleanup.
 `cold_resume_with_reinstalled_gate=true` proves continuation of this controlled
 native-only history with the gate reinstalled; it does not prove sanitization
 of a different prior profile. This result is separate from the deterministic
 RPC probe's missing-history case.
 
-The explicit no-continuation resume option and outer catalog deadline were added
-after that recorded run; their final guarded model regression is pending until
-the evidence report is refreshed. The earlier pass must not be presented as
-validation of those subsequent changes.
+The recorded final run includes the explicit no-continuation resume option and
+outer catalog deadline. Timeout and startup-failure behavior are covered by the
+offline guarded-session tests; the live run exercises successful construction
+and cold resume.
