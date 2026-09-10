@@ -4,7 +4,6 @@ import asyncio
 from dataclasses import replace
 import json
 from types import SimpleNamespace
-import uuid
 
 from fastapi import FastAPI
 import httpx
