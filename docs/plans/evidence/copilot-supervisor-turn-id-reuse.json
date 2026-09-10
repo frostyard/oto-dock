@@ -1,0 +1,71 @@
+{
+  "result": "failed",
+  "sandboxed": true,
+  "sdk_version": "1.0.13",
+  "runtime_version": "1.0.83",
+  "live_turn_limit": 3,
+  "host_callback_has_external_side_effects": false,
+  "runtime_alive_after_start": true,
+  "normal_turn": {
+    "marker_matched": true,
+    "done_count": 1
+  },
+  "control_has_open_turn": {
+    "abort": false
+  },
+  "failure_stage": "abort",
+  "operation_error_type": "SessionSupervisorError",
+  "normal_runtime_cleanup": false,
+  "runtime_alive_after_close": false,
+  "callback_calls": 1,
+  "pending_host_callbacks": 0,
+  "permissions": {
+    "approved": 1
+  },
+  "native_event_counts": {
+    "assistant.idle": 1,
+    "assistant.message": 2,
+    "assistant.message_delta": 20,
+    "assistant.message_start": 2,
+    "assistant.reasoning": 1,
+    "assistant.streaming_delta": 21,
+    "assistant.tool_call_delta": 1,
+    "assistant.turn_end": 1,
+    "assistant.turn_start": 2,
+    "assistant.usage": 2,
+    "external_tool.requested": 1,
+    "model.call_finished": 2,
+    "model.call_start": 2,
+    "model.captured_assignment_context": 2,
+    "model.message": 2,
+    "model.messages_snapshot": 1,
+    "model.model_call_started": 2,
+    "model.model_call_success": 2,
+    "model.response": 1,
+    "model.turn_ended": 1,
+    "model.turn_started": 2,
+    "pending_messages.modified": 4,
+    "permission.completed": 1,
+    "permission.requested": 1,
+    "session.idle": 1,
+    "session.info": 1,
+    "session.mcp_server_status_changed": 2,
+    "session.mcp_servers_loaded": 2,
+    "session.shutdown": 1,
+    "session.skills_loaded": 1,
+    "session.start": 1,
+    "session.title_changed": 1,
+    "session.tools_updated": 3,
+    "session.usage_checkpoint": 2,
+    "session.usage_info": 2,
+    "system.message": 2,
+    "tool.execution_start": 1,
+    "user.message": 2
+  },
+  "model_turn_id_reused": [
+    false,
+    true
+  ],
+  "error_type": "SessionSupervisorError",
+  "elapsed_seconds": 32.148
+}

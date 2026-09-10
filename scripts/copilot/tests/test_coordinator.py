@@ -9,7 +9,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "proxy"))
 
 from core.layers.copilot.coordinator import (
-    AbortState, CopilotTurnCoordinator, EventSequenceError,
+    AbortState, CopilotTurnCoordinator, EventSequenceError, InterruptState,
     SettlementObservation, TaskObservation, TaskState,
 )
 
@@ -236,6 +236,42 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(self.coordinator.abort_state, AbortState.REQUESTED)
         self.assertTrue(self.coordinator.acknowledge_abort(ticket, accepted=True))
 
+    def test_reused_native_turn_id_reopens_second_submission_for_abort(self):
+        self.coordinator.invalidate_observation(new_submission=True)
+        self.receive("user.message", {"content": "first", "messageId": "user-one"})
+        self.start("reused-native-id")
+        self.coordinator.finish_reconciliation(self.idle(), SETTLED)
+        self.coordinator.invalidate_observation(new_submission=True)
+        self.receive("user.message", {"content": "second", "messageId": "user-two"})
+        self.start("reused-native-id")
+        ticket = self.coordinator.request_abort()
+        self.assertTrue(self.coordinator.acknowledge_abort(ticket, accepted=True))
+        done = self.coordinator.finish_reconciliation(self.idle(aborted=True), SETTLED)
+        self.assertEqual([event.type for event in done], ["done"])
+
+    def test_old_frame_replay_after_new_submission_does_not_reopen_old_turn(self):
+        old = frame("assistant.turn_start", "old-start", {"turnId": "reused"})
+        self.coordinator.receive_event(1, old)
+        self.coordinator.finish_reconciliation(self.idle(), SETTLED)
+        self.coordinator.invalidate_observation(new_submission=True)
+        self.assertEqual(self.coordinator.receive_event(3, old), [])
+        with self.assertRaises(RuntimeError):
+            self.coordinator.request_abort()
+        self.start("reused")
+        self.assertIsNotNone(self.coordinator.request_abort())
+
+    def test_repeated_boundary_within_new_submission_keeps_abort_and_idle_gate(self):
+        self.start("reused")
+        self.coordinator.finish_reconciliation(self.idle(), SETTLED)
+        self.coordinator.invalidate_observation(new_submission=True)
+        self.start("reused")
+        ticket = self.coordinator.request_abort()
+        self.assertEqual(self.receive("assistant.turn_start", {"turnId": "reused"}), [])
+        self.assertTrue(self.coordinator.acknowledge_abort(ticket, accepted=True))
+        self.assertEqual(len(self.coordinator.finish_reconciliation(self.idle(aborted=True), SETTLED)), 1)
+        self.assertEqual(self.receive("assistant.turn_start", {"turnId": "reused"}), [])
+        self.assertEqual(self.coordinator.finish_reconciliation(self.idle(), SETTLED), [])
+
     def test_idle_before_abort_request_cannot_prove_that_abort_graceful(self):
         self.start()
         self.idle(aborted=True)
@@ -294,6 +330,211 @@ class CoordinatorTests(unittest.TestCase):
         checkpoint = self.idle(aborted=True)
         proof = replace(SETTLED, cancelled_tool_ids=frozenset({"tool"}))
         self.assertEqual(self.coordinator.finish_reconciliation(checkpoint, proof), [])
+
+
+class InterruptTests(unittest.TestCase):
+    def setUp(self):
+        self.coordinator = CopilotTurnCoordinator()
+        self.receive("assistant.turn_start", {"turnId": "iteration-one"})
+
+    def receive(self, kind, data=None, **metadata):
+        seq = self.coordinator.last_sequence + 1
+        return self.coordinator.receive_event(seq, frame(kind, f"event-{seq}", data, **metadata))
+
+    def accepted(self):
+        ticket = self.coordinator.request_interrupt()
+        self.assertTrue(self.coordinator.acknowledge_interrupt(ticket, accepted=True))
+        return ticket, self.coordinator.begin_interrupt_reconciliation(ticket)
+
+    def finish(self, checkpoint, first=SETTLED, second=SETTLED, barrier=False):
+        return self.coordinator.finish_interrupt_reconciliation(
+            checkpoint, first, second, processing_barrier=barrier,
+        )
+
+    def test_settles_without_native_idle_and_does_not_claim_graceful_abort(self):
+        ticket, checkpoint = self.accepted()
+        self.assertIsNone(self.coordinator.begin_reconciliation())
+        self.assertEqual([event.type for event in self.finish(checkpoint)], ["done"])
+        self.assertEqual(self.coordinator.interrupt_state, InterruptState.SETTLED)
+        self.assertEqual(self.coordinator.abort_state, AbortState.NONE)
+        self.assertEqual(self.finish(checkpoint), [])
+        self.assertFalse(self.coordinator.acknowledge_interrupt(ticket, accepted=True))
+        with self.assertRaises(RuntimeError):
+            self.coordinator.request_interrupt()
+
+    def test_request_and_rejected_ack_do_not_authorize_reconciliation(self):
+        ticket = self.coordinator.request_interrupt()
+        self.assertIsNone(self.coordinator.begin_interrupt_reconciliation(ticket))
+        self.coordinator.acknowledge_interrupt(ticket, accepted=False)
+        self.assertEqual(self.coordinator.interrupt_state, InterruptState.REJECTED)
+        self.assertIsNone(self.coordinator.begin_interrupt_reconciliation(ticket))
+        self.assertEqual(self.finish(None), [])
+
+    def test_stale_request_ack_and_checkpoint_cannot_settle_new_request(self):
+        old_ticket, old = self.accepted()
+        current = self.coordinator.request_interrupt()
+        self.assertFalse(self.coordinator.acknowledge_interrupt(old_ticket, accepted=True))
+        self.assertEqual(self.finish(old), [])
+        self.coordinator.acknowledge_interrupt(current, accepted=True)
+        self.assertIsNone(self.coordinator.begin_interrupt_reconciliation(old_ticket))
+        self.assertEqual(self.finish(old), [])
+
+    def test_recapture_replaces_older_checkpoint_even_without_new_events(self):
+        ticket, old = self.accepted()
+        current = self.coordinator.begin_interrupt_reconciliation(ticket)
+        self.assertEqual(self.finish(old), [])
+        self.assertEqual([event.type for event in self.finish(current)], ["done"])
+
+    def test_unknown_or_busy_barrier_is_not_quiescence(self):
+        _, checkpoint = self.accepted()
+        for barrier in (None, True, 0):
+            with self.subTest(barrier=barrier):
+                self.assertEqual(self.finish(checkpoint, barrier=barrier), [])
+        self.assertEqual(len(self.finish(checkpoint)), 1)
+
+    def test_both_observations_must_have_complete_empty_pending_sources(self):
+        _, checkpoint = self.accepted()
+        blocked = [
+            replace(SETTLED, processing=None), replace(SETTLED, processing=True),
+            replace(SETTLED, tasks=None), replace(SETTLED, pending_permissions=None),
+            replace(SETTLED, pending_permissions=frozenset({"permission"})),
+            replace(SETTLED, pending_tools=None),
+            replace(SETTLED, pending_tools=frozenset({"callback"})),
+            replace(SETTLED, pending_messages=None),
+            replace(SETTLED, pending_messages=frozenset({"queued-or-steering"})),
+            replace(SETTLED, tasks=(TaskObservation("task", TaskState.UNKNOWN),)),
+            replace(SETTLED, tasks=(TaskObservation("task", TaskState.ORPHANED),)),
+            replace(SETTLED, tasks=(TaskObservation("task", TaskState.IDLE),)),
+        ]
+        for observation in blocked:
+            with self.subTest(observation=observation):
+                self.assertEqual(self.finish(checkpoint, first=observation), [])
+                self.assertEqual(self.finish(checkpoint, second=observation), [])
+
+    def test_changed_terminal_tasks_require_another_stable_pair(self):
+        _, checkpoint = self.accepted()
+        first = replace(SETTLED, tasks=(TaskObservation("task", TaskState.COMPLETED),))
+        second = replace(SETTLED, tasks=(TaskObservation("task", TaskState.CANCELLED),))
+        self.assertEqual(self.finish(checkpoint, first, second), [])
+        self.assertEqual(self.finish(checkpoint, first, SETTLED), [])
+
+    def test_stable_terminal_task_order_does_not_matter(self):
+        _, checkpoint = self.accepted()
+        tasks = (TaskObservation("a", TaskState.COMPLETED), TaskObservation("b", TaskState.CANCELLED))
+        first = replace(SETTLED, tasks=tasks)
+        second = replace(SETTLED, tasks=tuple(reversed(tasks)))
+        self.assertEqual(len(self.finish(checkpoint, first, second)), 1)
+
+    def test_event_races_invalidate_even_suppressed_or_child_activity(self):
+        for kind, data, metadata in [
+            ("session.background_tasks_changed", {}, {}),
+            ("permission.requested", {}, {}),
+            ("assistant.streaming_delta", {}, {}),
+            ("assistant.streaming_delta", {}, {"agentId": "child"}),
+            ("assistant.turn_start", {"turnId": "iteration-next"}, {}),
+        ]:
+            with self.subTest(kind=kind, metadata=metadata):
+                ticket, checkpoint = self.accepted()
+                self.receive(kind, data, **metadata)
+                self.assertEqual(self.finish(checkpoint), [])
+                # The same successful control permits fresh reads after native
+                # background changes, provided no new host submission occurred.
+                self.assertIsNotNone(self.coordinator.begin_interrupt_reconciliation(ticket))
+
+    def test_host_callback_mutation_invalidates_observation_pair(self):
+        _, checkpoint = self.accepted()
+        self.coordinator.invalidate_observation()
+        self.assertEqual(self.finish(checkpoint), [])
+
+    def test_new_submission_supersedes_control_even_after_queue_has_drained(self):
+        ticket, checkpoint = self.accepted()
+        self.coordinator.invalidate_observation(new_submission=True)
+        self.assertEqual(self.coordinator.interrupt_state, InterruptState.SUPERSEDED)
+        self.assertEqual(self.finish(checkpoint), [])
+        self.assertIsNone(self.coordinator.begin_interrupt_reconciliation(ticket))
+        self.assertFalse(self.coordinator.acknowledge_interrupt(ticket, accepted=True))
+
+    def test_abort_supersedes_interrupt_and_interrupt_supersedes_abort(self):
+        ticket, checkpoint = self.accepted()
+        abort_ticket = self.coordinator.request_abort()
+        self.assertIsNone(self.coordinator.begin_interrupt_reconciliation(ticket))
+        self.assertEqual(self.finish(checkpoint), [])
+        self.coordinator.request_interrupt()
+        self.assertFalse(self.coordinator.acknowledge_abort(abort_ticket, accepted=True))
+
+    def test_transport_loss_prevents_interrupt_settlement(self):
+        _, checkpoint = self.accepted()
+        self.coordinator.transport_lost()
+        self.assertEqual(self.finish(checkpoint), [])
+
+    def test_changed_payload_replay_prevents_interrupt_settlement(self):
+        _, checkpoint = self.accepted()
+        with self.assertRaises(EventSequenceError):
+            self.coordinator.receive_event(2, frame("session.idle", "event-1"))
+        self.assertEqual(self.finish(checkpoint), [])
+
+    def test_native_idle_winner_supersedes_explicit_interrupt_checkpoint(self):
+        ticket, checkpoint = self.accepted()
+        self.receive("session.idle")
+        native = self.coordinator.begin_reconciliation()
+        self.assertEqual(len(self.coordinator.finish_reconciliation(native, SETTLED)), 1)
+        self.assertEqual(self.finish(checkpoint), [])
+        self.assertIsNone(self.coordinator.begin_interrupt_reconciliation(ticket))
+
+    def test_known_joined_callback_cancellation_closes_badge_as_error(self):
+        self.receive("tool.execution_start", {"toolCallId": "held", "toolName": "fixture"})
+        _, checkpoint = self.accepted()
+        proof = replace(SETTLED, cancelled_tool_ids=frozenset({"held"}))
+        self.assertEqual(self.finish(checkpoint), [])  # Native idle/tasks cannot clear it.
+        self.assertEqual(self.finish(checkpoint, proof, SETTLED), [])
+        still_pending = replace(proof, pending_tools=frozenset({"held"}))
+        self.assertEqual(self.finish(checkpoint, still_pending, still_pending), [])
+        events = self.finish(checkpoint, proof, proof)
+        self.assertEqual([event.type for event in events], ["tool_result", "done"])
+        self.assertTrue(events[0].data["is_error"])
+        self.assertEqual(self.finish(checkpoint, proof, proof), [])
+
+    def test_cancellation_batch_validates_unknown_ids_without_partial_effects(self):
+        self.receive("tool.execution_start", {"toolCallId": "held", "toolName": "fixture"})
+        _, checkpoint = self.accepted()
+        wrong = replace(SETTLED, cancelled_tool_ids=frozenset({"held", "unknown"}))
+        with self.assertRaises(ValueError):
+            self.finish(checkpoint, wrong, wrong)
+        self.assertEqual(self.finish(checkpoint), [])
+        proof = replace(SETTLED, cancelled_tool_ids=frozenset({"held"}))
+        self.assertEqual(len(self.finish(checkpoint, proof, proof)), 2)
+
+    def test_unresolved_other_tool_prevents_partial_cancel_results(self):
+        for tool_id in ("cancelled", "running"):
+            self.receive("tool.execution_start", {"toolCallId": tool_id, "toolName": "fixture"})
+        _, checkpoint = self.accepted()
+        partial = replace(SETTLED, cancelled_tool_ids=frozenset({"cancelled"}))
+        self.assertEqual(self.finish(checkpoint, partial, partial), [])
+        complete = replace(SETTLED, cancelled_tool_ids=frozenset({"cancelled", "running"}))
+        self.assertEqual([e.type for e in self.finish(checkpoint, complete, complete)], ["tool_result", "tool_result", "done"])
+
+    def test_orphan_tool_completion_blocks_even_empty_runtime_snapshots(self):
+        self.receive("tool.execution_complete", {"toolCallId": "orphan", "success": True})
+        _, checkpoint = self.accepted()
+        self.assertEqual(self.finish(checkpoint), [])
+
+    def test_native_idle_and_explicit_interruption_share_one_done_gate(self):
+        ticket, checkpoint = self.accepted()
+        self.assertEqual(len(self.finish(checkpoint)), 1)
+        self.receive("session.idle")
+        native = self.coordinator.begin_reconciliation()
+        self.assertEqual(self.coordinator.finish_reconciliation(native, SETTLED), [])
+        self.assertIsNone(self.coordinator.begin_interrupt_reconciliation(ticket))
+
+    def test_new_turn_after_interruption_can_settle_once(self):
+        _, checkpoint = self.accepted()
+        self.finish(checkpoint)
+        self.coordinator.invalidate_observation(new_submission=True)
+        self.receive("assistant.turn_start", {"turnId": "next-user-iteration"})
+        self.assertEqual(self.coordinator.interrupt_state, InterruptState.NONE)
+        self.receive("session.idle")
+        checkpoint = self.coordinator.begin_reconciliation()
+        self.assertEqual(len(self.coordinator.finish_reconciliation(checkpoint, SETTLED)), 1)
 
 
 class CoordinatorConcurrencyTests(unittest.IsolatedAsyncioTestCase):

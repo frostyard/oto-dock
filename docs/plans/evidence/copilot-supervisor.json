@@ -1,0 +1,92 @@
+{
+  "result": "passed",
+  "sandboxed": true,
+  "sdk_version": "1.0.13",
+  "runtime_version": "1.0.83",
+  "live_turn_limit": 3,
+  "host_callback_has_external_side_effects": false,
+  "runtime_alive_after_start": true,
+  "normal_turn": {
+    "marker_matched": true,
+    "done_count": 1
+  },
+  "control_has_open_turn": {
+    "abort": true,
+    "interrupt": true
+  },
+  "abort": {
+    "accepted": true,
+    "callbacks_stopped": true,
+    "callback_observed_cancellation": true,
+    "done_count": 1,
+    "cancelled_tool_results": 1,
+    "new_native_idle_count": 1
+  },
+  "interrupt": {
+    "accepted": true,
+    "callbacks_stopped": true,
+    "callback_observed_cancellation": true,
+    "completion_blocked_by_background": true,
+    "done_count": 1,
+    "cancelled_tool_results": 1,
+    "new_native_idle_count": 0
+  },
+  "normal_runtime_cleanup": true,
+  "runtime_alive_after_close": false,
+  "callback_calls": 2,
+  "pending_host_callbacks": 0,
+  "permissions": {
+    "approved": 2
+  },
+  "native_event_counts": {
+    "abort": 2,
+    "agent.interrupted": 2,
+    "assistant.idle": 3,
+    "assistant.message": 3,
+    "assistant.message_delta": 52,
+    "assistant.message_start": 3,
+    "assistant.reasoning": 1,
+    "assistant.streaming_delta": 54,
+    "assistant.tool_call_delta": 2,
+    "assistant.turn_end": 3,
+    "assistant.turn_start": 3,
+    "assistant.usage": 3,
+    "external_tool.requested": 2,
+    "model.call_finished": 3,
+    "model.call_start": 3,
+    "model.captured_assignment_context": 3,
+    "model.message": 3,
+    "model.messages_snapshot": 1,
+    "model.model_call_started": 3,
+    "model.model_call_success": 3,
+    "model.response": 1,
+    "model.turn_ended": 3,
+    "model.turn_failed": 2,
+    "model.turn_started": 3,
+    "pending_messages.modified": 8,
+    "permission.completed": 2,
+    "permission.requested": 2,
+    "prompt_cache_break": 1,
+    "session.background_tasks_changed": 1,
+    "session.idle": 2,
+    "session.info": 2,
+    "session.mcp_server_status_changed": 2,
+    "session.mcp_servers_loaded": 3,
+    "session.shutdown": 1,
+    "session.skills_loaded": 1,
+    "session.start": 1,
+    "session.title_changed": 1,
+    "session.tools_updated": 4,
+    "session.usage_checkpoint": 3,
+    "session.usage_info": 3,
+    "system.message": 3,
+    "tool.execution_start": 2,
+    "user.message": 3
+  },
+  "model_turn_id_reused": [
+    false,
+    true,
+    true
+  ],
+  "elapsed_seconds": 43.994
+}

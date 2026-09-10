@@ -60,7 +60,7 @@ with bounded forced cleanup on failure. It is not a production supervisor.
 
 The event translator sees live serialized events and reports mapping failures.
 It does not declare a turn settled: background/permission reconciliation belongs
-to the future session supervisor. Event counters preserve the original type of
+to the session supervisor. Event counters preserve the original type of
 vendor events unknown to the SDK enum.
 
 ## Actual Linux sandbox
@@ -114,6 +114,36 @@ helper. It wraps every explicitly supplied stdio server, merges existing broker
 strip lists, preserves tool filters and repository credentials, and rejects
 unsupported transports. See the [configuration follow-up](../../docs/plans/copilot-mcp-results.md#configuration-follow-up).
 
+## Owned callbacks and sandbox session supervisor
+
+`callback_probe.py` isolates SDK-hosted callback cancellation and join. Its
+[recorded results](../../docs/plans/copilot-callback-results.md) distinguish host
+callback ownership from the native task registry:
+
+```bash
+python scripts/copilot/callback_probe.py \
+  --runtime /tmp/otodock-copilot-runtime/prebuilds/linux-x64/copilot-runtime \
+  --live --use-gh-token --output /tmp/copilot-callback-registry.json
+```
+
+`supervisor_probe.py` connects the source runtime owner, callback registry, SDK
+adapter and supervisor through the real Linux sandbox. It requires proxy
+dependencies, the pinned SDK, bubblewrap, pasta and Linux pidfd support:
+
+```bash
+python scripts/copilot/supervisor_probe.py \
+  --runtime-dir /tmp/otodock-copilot-runtime/prebuilds/linux-x64 \
+  --live --use-gh-token --output /tmp/copilot-supervisor.json
+```
+
+This selects the current GitHub CLI identity internally and submits three short
+prompts: normal streaming, abort with an owned callback, and interrupt with an
+owned callback plus controlled background-task metadata. The full work deadline
+is 180 seconds. Native shell/subagent work is not exercised. The trusted callback
+only waits in host Python and has no external side effects; the native runtime
+runs inside the sandbox. See the [supervisor results](../../docs/plans/copilot-supervisor-results.md)
+for exact guarantees, the runtime's minimum 30-credit ceiling, and remaining gates.
+
 ## Offline regression tests
 
 The [native terminal probe](../../docs/plans/copilot-terminal-results.md) runs a
@@ -134,6 +164,9 @@ python -m pytest scripts/copilot/tests -q
 ```
 
 These tests require neither inference credentials nor PostgreSQL. They cover
-credential isolation in the probe and adverse event ordering in the translator.
+credential isolation, adverse event ordering, callback ownership, control and
+consumer races, SDK snapshot adaptation, and exact runtime process cleanup.
+The runtime tests use fake SDK transport and real disposable processes; the SDK
+is not installed by CI.
 See the [recorded results](../../docs/plans/copilot-spike-results.md) for what has
 actually been run and what remains open.

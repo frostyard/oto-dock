@@ -71,7 +71,7 @@ stripping alone does not prove process-information or filesystem isolation.
   the type for diagnostics and discards unhandled payloads. It must not persist
   opaque vendor telemetry containing potentially sensitive prompt context.
 - Raw `session.idle` is only a candidate completion. The translator emits `DONE`
-  only after the future supervisor explicitly confirms settlement and the idle
+  only after the supervisor explicitly confirms settlement and the idle
   observation is still current. This is important for background agents/tools.
 
 ## First implementation artifact
@@ -89,7 +89,7 @@ durable replay and bounded retention remain session-layer work.
 
 ## C1 still required
 
-The next session-contract slice adds a passing native SDK → PTY → SDK history
+The session-contract slice added a passing native SDK → PTY → SDK history
 round trip, recorded control/compaction/task behavior, mandatory stdio MCP
 wrapping, and a tested completion coordinator. See the
 [terminal results](copilot-terminal-results.md),
@@ -105,9 +105,11 @@ proofs and implementation foundations, not completion of C1 or engine parity.
   and native tool/background enforcement beyond the single write denial.
 - Native terminal policy/tool-history handoff, centralized writer ownership,
   and crash/reconnect behavior beyond the passing sequential no-tool round trip.
-- Production control semantics, including interrupt settlement when no new idle
-  arrives, immediate input waiting on a tool, actual callback cancellation/join,
-  goals, and background subagent/shell recovery. Compaction preserved the short
+- Broader production control semantics: immediate input waiting on native tools,
+  goals, and background subagent/shell recovery. The
+  [combined sandbox supervisor](copilot-supervisor-results.md) now proves owned
+  callback cancellation/join and interrupt settlement without a new idle for a
+  controlled background task. Compaction preserved the short
   test history but increased tokens; do not assume every compaction saves space.
 - Credential expiry/refresh, multi-account concurrency, organization entitlement,
   and all supported satellite operating systems.
