@@ -82,6 +82,15 @@ jobs:
         working-directory: audio
         run: python -m pytest -q
 
+      - name: Optional Copilot SDK compatibility
+        # Keep the full suites above on the default dependency set. Verify the
+        # opt-in supplement against that exact proxy environment afterwards;
+        # no native runtime download, account or inference is needed.
+        run: |
+          python -m pip install --no-deps --require-hashes -r proxy/requirements-copilot.txt
+          python -m pip check
+          python -c 'from copilot import CopilotClient, RuntimeConnection; from importlib.metadata import version; assert version("github-copilot-sdk") == "1.0.13"'
+
   dashboard:
     if: github.repository == 'OtoDock/oto-dock' || github.repository == 'frostyard/oto-dock'
     runs-on: ubuntu-latest

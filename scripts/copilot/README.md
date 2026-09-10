@@ -4,6 +4,32 @@ These are development probes for C1 of the
 [parity plan](../../docs/plans/copilot-parity.md). They do not register an engine,
 change an OtoDock installation, or establish full parity.
 
+## Explicit local setup
+
+`provision_local.py` initializes a private installation from the exact official
+Linux x64 runtime archive, or verifies it with `check`. It performs no download,
+model call, service restart or engine registration. Install the optional
+`proxy/requirements-copilot.txt` supplement into the existing proxy environment
+first; this is separate from the development probe lock below.
+
+See the [setup and service contract](../../docs/plans/copilot-local-provisioning-contract.md)
+for commands, required private paths, current authorization checks and remaining
+integration gates. The verified installation can be exercised with:
+
+```bash
+python scripts/copilot/execution_layer_probe.py \
+  --provisioned-root /srv/otodock-copilot-private/local \
+  --live --use-gh-token --output /tmp/copilot-provisioned-layer.json
+```
+
+This selects the real provisioned-layer context manager and uses its durable
+storage. The third turn exits that context with a paused producer to verify
+active-session cleanup; it retains the resulting uncertain history. Every
+invocation uses new session IDs. Account and database-backed sandbox metadata
+remain controlled fixtures; the authenticated config builder is tested separately.
+The [qualification results](../../docs/plans/copilot-local-provisioning-results.md)
+distinguish those checks from live inference.
+
 ## Local ExecutionLayer adapter
 
 `execution_layer_probe.py` exercises `CopilotExecutionLayer` through the real

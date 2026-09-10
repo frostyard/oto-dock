@@ -71,7 +71,7 @@ async def run(args, report):
             ),
         )
         platform_id, aborted_id = str(uuid.uuid4()), str(uuid.uuid4())
-        runtimes, guards, homes, owners = [], [], [], []
+        runtimes, guards, homes, owners, installations = [], [], [], [], []
         reads = 0
         waiter = stream = None
         original_runtime = factory.SandboxedCopilotRuntime
@@ -104,7 +104,13 @@ async def run(args, report):
                 raise
             return guard
 
-        def new_layer():
+        async def new_layer():
+            if args.provisioned_root is not None:
+                from core.layers.copilot.provisioned_layer import open_provisioned_layer
+                installation = open_provisioned_layer(args.provisioned_root)
+                layer = await installation.__aenter__()
+                installations.append(installation)
+                return layer
             scratch = CopilotSandboxHomes(homes_root)
             homes.append(scratch)
             return CopilotExecutionLayer(
@@ -146,7 +152,7 @@ async def run(args, report):
             assert remembered and done == 1 and tools == 0
 
         async def rejected_resume(session_id):
-            candidate = new_layer()
+            candidate = await new_layer()
             before = len(runtimes)
             rejected = False
             try:
@@ -163,13 +169,13 @@ async def run(args, report):
         marker = "OTO_EXECUTION_" + secrets.token_hex(12).upper()
         try:
             async with asyncio.timeout(180):
-                first = new_layer()
+                first = await new_layer()
                 await start(first, platform_id)
                 registered = state.get_session_security(platform_id)
                 assert registered is not None
                 assert await first.is_session_alive(platform_id)
                 assert not await first.is_session_process_dead(platform_id)
-                duplicate = new_layer()
+                duplicate = await new_layer()
                 before = len(runtimes)
                 try:
                     await start(duplicate, platform_id)
@@ -190,7 +196,7 @@ async def run(args, report):
                 report["normal_close_through_owned_registry"] = True
 
                 current = replace(current, revision="revision-two")
-                second = new_layer()
+                second = await new_layer()
                 await start(second, platform_id, resume=True)
                 await marker_turn(
                     second, "Reply with only the exact marker I asked you to remember. Do not use tools.",
@@ -212,13 +218,13 @@ async def run(args, report):
                 report["revoked_history_rejected_before_runtime"] = True
 
                 current = replace(current, revision="revision-three")
-                third = new_layer()
+                third = await new_layer()
                 await start(third, aborted_id)
                 async with asyncio.timeout(60), third.session_lock(aborted_id):
                     stream = third.send_message(
                         aborted_id,
-                        "Without using tools, write 1000 numbered sentences explaining simple arithmetic. "
-                        "Start immediately with sentence one and continue until all 1000 are written.",
+                        "Without using tools, write 100 numbered short sentences explaining simple arithmetic. "
+                        "Start immediately with sentence one and continue until all 100 are written.",
                     )
                     first_text = False
                     done = tools = 0
@@ -230,10 +236,18 @@ async def run(args, report):
                             break
                     assert first_text and done == 0 and tools == 0
                     assert await third.is_session_alive(aborted_id)
+                    report["paused_producer_first_text_received"] = True
                     # Intentionally leave the producer iterator paused with its
-                    # public session lock held throughout the hard abort.
-                    result = await asyncio.wait_for(third.abort(aborted_id), 20)
-                    assert result is False
+                    # public session lock held throughout the hard stop.
+                    if args.provisioned_root is not None:
+                        installation = installations[-1]
+                        await asyncio.wait_for(installation.__aexit__(None, None, None), 20)
+                        installations.pop()
+                        report["context_exit_joined_paused_active_session"] = True
+                    else:
+                        result = await asyncio.wait_for(third.abort(aborted_id), 20)
+                        assert result is False
+                        report["paused_producer_abort_returned_false"] = True
                     await clean_closed(third, aborted_id)
                     assert not runtimes[-1].alive and not runtimes[-1].forced_cleanup
                     await stream.aclose()
@@ -242,8 +256,7 @@ async def run(args, report):
                     "generation": 3, "resumed": False, "first_text_received": first_text,
                     "done_before_abort": done, "tool_events": tools,
                 })
-                report["paused_producer_abort_returned_false"] = True
-                report["paused_producer_abort_joined_and_removed_context"] = True
+                report["paused_producer_hard_stop_joined_and_removed_context"] = True
                 await rejected_resume(aborted_id)
                 report["aborted_history_rejected_before_runtime"] = True
                 assert len(runtimes) == 3
@@ -282,6 +295,12 @@ async def run(args, report):
                     await guard.close()
                 except Exception:
                     cleanup_failed = True
+            for installation in reversed(installations):
+                try:
+                    await installation.__aexit__(None, None, None)
+                except Exception:
+                    cleanup_failed = True
+            report["provisioned_layer_contexts_closed"] = bool(installations) and not cleanup_failed
             for scratch in homes:
                 scratch.close()
             factory.SandboxedCopilotRuntime = original_runtime
@@ -301,12 +320,16 @@ async def run(args, report):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--runtime-dir", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--runtime-dir", type=Path)
+    source.add_argument("--provisioned-root", type=Path,
+                        help="Verify and open an installation made by provision_local.py")
     parser.add_argument("--live", action="store_true", required=True)
     parser.add_argument("--use-gh-token", action="store_true", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    args.runtime_dir = args.runtime_dir.resolve()
+    if args.runtime_dir is not None:
+        args.runtime_dir = args.runtime_dir.resolve()
     logging.disable(logging.CRITICAL)
     report = {
         "result": "failed", "sdk_version": "1.0.13", "runtime_version": "1.0.83",
@@ -314,6 +337,7 @@ def main():
         "per_session_credit_limit": 30, "sandboxed": True, "actual_execution_layer": True,
         "actual_sandbox_resolver": True, "platform_registration": "actual layer-owned context",
         "actual_owned_registry": True,
+        "verified_provisioning": args.provisioned_root is not None,
         "credential_store": "controlled scoped fixture", "oauth_refresh": False,
         "postgresql_account_store": False,
     }

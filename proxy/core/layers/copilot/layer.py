@@ -26,6 +26,9 @@ class CopilotLayerError(RuntimeError):
     """A sanitized lifecycle/configuration failure."""
 
 
+_PERMISSION_MODES = ("default", "acceptEdits", "plan", "dontAsk")
+
+
 @dataclass
 class CopilotAgentConfig(AgentConfig):
     execution_path: str = "copilot-cli"
@@ -80,6 +83,7 @@ class CopilotExecutionLayer(ExecutionLayer):
         self._runtime_path = Path(runtime_path).resolve(strict=True)
         self._records, self._homes = records, homes
         self._sessions: dict[str, _Entry] = {}
+        self._closing: asyncio.Task | None = None
 
     @property
     def capabilities(self):
@@ -88,11 +92,12 @@ class CopilotExecutionLayer(ExecutionLayer):
         return LayerCapabilities(
             name="copilot-cli", display_name="GitHub Copilot (local preview)",
             supports_permissions=True, supports_mcps=False,
-            permission_modes=["default", "acceptEdits", "plan", "dontAsk"],
+            permission_modes=list(_PERMISSION_MODES),
             mcp_delivery="external_config", mcp_config_format=None,
         )
 
-    def _validate(self, session_id, config):
+    @staticmethod
+    def _validate(session_id, config):
         if type(config) is not CopilotAgentConfig:
             raise CopilotLayerError("Explicit Copilot account configuration is required")
         ctx = config.security_context
@@ -107,7 +112,7 @@ class CopilotExecutionLayer(ExecutionLayer):
                     "external_home", "external_ephemeral", "external_verified", "external_claim"))
                 or config.execution_path != "copilot-cli" or config.execution_target != "local"
                 or config.client_type not in {"dashboard", "sse"}
-                or not config.user_sub or config.permission_mode not in self.capabilities.permission_modes
+                or not config.user_sub or config.permission_mode not in _PERMISSION_MODES
                 or type(config.resume) is not bool
                 or any(getattr(config, name) for name in (
                     "mcp_config_path", "credential_env", "mcp_secret_bundles", "extra_env", "effort",
@@ -123,6 +128,8 @@ class CopilotExecutionLayer(ExecutionLayer):
         )
 
     async def start_session(self, session_id, config):
+        if self._closing is not None:
+            raise CopilotLayerError("Copilot execution layer is closed")
         failed = False
         try:
             config = deepcopy(config)
@@ -140,7 +147,8 @@ class CopilotExecutionLayer(ExecutionLayer):
         entry.claim = register_owned_session(
             session_id=session_id, engine="copilot-cli", agent=config.agent_name,
             user_sub=config.user_sub, username=config.security_context.mount_username,
-            active=lambda: (entry.closing is None and entry.owner is not None and entry.owner.alive),
+            active=lambda: (self._closing is None and entry.closing is None
+                            and entry.owner is not None and entry.owner.alive),
             close=lambda: self._close_entry(entry),
         )
         _claims[session_id] = self._sessions[session_id] = entry
@@ -256,9 +264,30 @@ class CopilotExecutionLayer(ExecutionLayer):
         if entry is not None:
             await self._close_entry(entry)
 
+    async def _finish_all(self, entries):
+        results = await asyncio.gather(
+            *(self._close_entry(entry) for entry in entries), return_exceptions=True,
+        )
+        if any(isinstance(result, BaseException) for result in results):
+            raise CopilotLayerError("Copilot execution cleanup is incomplete")
+
+    async def aclose(self):
+        """Seal this instance and join every captured generation before returning.
+
+        Other layer instances keep their own sessions. A failed cleanup remains
+        claimed and this instance stays sealed; a cancelled waiter still joins
+        all cleanup before cancellation propagates to its caller.
+        """
+        if self._closing is None:
+            entries = tuple(self._sessions.values())
+            self._closing = asyncio.create_task(self._finish_all(entries))
+            self._closing.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+        await _join_cleanup(self._closing)
+
     def _live(self, session_id):
         entry = self._sessions.get(session_id)
-        if entry is None or entry.closing is not None or entry.owner is None or not entry.claim.active:
+        if (self._closing is not None or entry is None or entry.closing is not None
+                or entry.owner is None or not entry.claim.active):
             raise CopilotLayerError("Copilot execution session is unavailable")
         return entry
 

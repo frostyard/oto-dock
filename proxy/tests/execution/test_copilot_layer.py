@@ -780,3 +780,124 @@ async def test_global_close_during_startup_keeps_late_owner_claim_until_join(har
     finally:
         release.set()
         await asyncio.gather(startup, *([closing] if closing else []), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_close_all_seals_instance_and_joins_each_owner_concurrently(harness):
+    layer = harness.layer()
+    first, second = harness.identity(), harness.identity()
+    await layer.start_session(first, config())
+    await layer.start_session(second, config())
+    owners = harness.owners[:]
+    release = asyncio.Event()
+    for owner in owners:
+        owner.close_release = release
+    closing = asyncio.create_task(layer.aclose())
+    for owner in owners:
+        await asyncio.wait_for(owner.close_entered.wait(), 1)
+    with pytest.raises(module.CopilotLayerError, match="layer is closed"):
+        await layer.start_session(harness.identity(), config())
+    assert not closing.done()
+    release.set()
+    await closing
+    await layer.aclose()
+    assert all(owner.closed for owner in owners)
+    assert not layer._sessions
+    from core.session.owned_sessions import get_owned_session
+    assert get_owned_session(first) is None and get_owned_session(second) is None
+
+
+@pytest.mark.asyncio
+async def test_close_all_waiter_cancellation_still_joins_before_return(harness):
+    layer, sid, owner = await start(harness)
+    owner.close_release = asyncio.Event()
+    closing = asyncio.create_task(layer.aclose())
+    await asyncio.wait_for(owner.close_entered.wait(), 1)
+    for _ in range(3):
+        closing.cancel()
+        await asyncio.sleep(0)
+        assert not closing.done()
+    owner.close_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    assert owner.closed and await layer.is_session_process_dead(sid)
+    await layer.aclose()
+
+
+@pytest.mark.asyncio
+async def test_close_all_failure_preserves_claim_but_joins_other_entries(harness):
+    layer = harness.layer()
+    failed, healthy = harness.identity(), harness.identity()
+    await layer.start_session(failed, config())
+    await layer.start_session(healthy, config())
+    harness.owners[0].close_error = True
+    with pytest.raises(module.CopilotLayerError) as caught:
+        await layer.aclose()
+    assert "private cleanup error" not in str(caught.value)
+    assert harness.owners[1].closed
+    from core.session.owned_sessions import get_owned_session
+    assert get_owned_session(failed) is not None and not get_owned_session(failed).active
+    assert get_owned_session(healthy) is None
+    with pytest.raises(module.CopilotLayerError):
+        await layer.aclose()
+    with pytest.raises(module.CopilotLayerError, match="layer is closed"):
+        await layer.start_session(harness.identity(), config())
+
+
+@pytest.mark.asyncio
+async def test_close_all_does_not_close_another_layer(harness):
+    first, first_id, first_owner = await start(harness)
+    second, second_id, second_owner = await start(harness)
+    await first.aclose()
+    assert first_owner.closed and await first.is_session_process_dead(first_id)
+    assert second_owner.alive and await second.is_session_alive(second_id)
+    await second.aclose()
+
+
+@pytest.mark.asyncio
+async def test_close_all_cancels_and_joins_startup_before_return(harness):
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def opening(owner):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await owner.close()
+            cancelled.set()
+
+    harness.open_hook = opening
+    layer, sid = harness.layer(), harness.identity()
+    starting = asyncio.create_task(layer.start_session(sid, config()))
+    await asyncio.wait_for(entered.wait(), 1)
+    await layer.aclose()
+    assert cancelled.is_set() and harness.owners[0].closed
+    assert await layer.is_session_process_dead(sid)
+    with pytest.raises(asyncio.CancelledError):
+        await starting
+
+
+@pytest.mark.asyncio
+async def test_close_all_blocks_existing_turn_before_deferred_cleanup_runs(harness, monkeypatch):
+    layer, sid, owner = await start(harness)
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = layer._finish_all
+
+    async def deferred(entries):
+        entered.set()
+        await release.wait()
+        await original(entries)
+
+    monkeypatch.setattr(layer, "_finish_all", deferred)
+    closing = asyncio.create_task(layer.aclose())
+    await asyncio.wait_for(entered.wait(), 1)
+    assert owner.alive  # Cleanup has deliberately not reached the owner.
+    from core.session.owned_sessions import get_owned_session
+    assert not get_owned_session(sid).active
+    assert not await layer.is_session_alive(sid)
+    with pytest.raises(module.CopilotLayerError):
+        await anext(layer.send_message(sid, "must not run"))
+    assert owner.messages == []
+    release.set()
+    await closing
